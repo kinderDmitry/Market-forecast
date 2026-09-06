@@ -1,0 +1,7 @@
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="7%"
+    android:insetTop="7%"
+    android:insetRight="7%"
+    android:insetBottom="7%">
+    <bitmap android:src="@drawable/mfp_icon" android:gravity="fill" />
+</inset>
