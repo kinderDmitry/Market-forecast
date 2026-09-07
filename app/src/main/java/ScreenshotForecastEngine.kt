@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Visual pre-analysis of a chart screenshot. This is deliberately conservative:
@@ -12,21 +13,47 @@ import kotlin.math.min
  */
 data class ScreenshotForecast(
     val direction: String,
-    val horizonSeconds: Int,
+    val horizonSeconds: Long,
     val confidence: Int,
     val quality: Int,
     val momentum: Double,
     val trend: Double,
     val volatility: Double,
     val candleBias: Double,
-    val explanation: List<String>
+    val explanation: List<String>,
+    val suggestedHorizonSeconds: Long = horizonSeconds
 )
 
 object ScreenshotForecastEngine {
-    fun analyze(bitmap: Bitmap, horizonSeconds: Int): ScreenshotForecast {
+    private fun autoHorizonSeconds(unit: String, trend: Double, momentum: Double, volatility: Double, quality: Int): Long {
+        val strength = (abs(trend) * 0.45 + abs(momentum) * 0.35 + min(1.0, abs(volatility)) * 0.20).coerceIn(0.0, 1.0)
+        val qualityFactor = (quality / 100.0).coerceIn(0.35, 1.0)
+        val raw = when (unit) {
+            "SEC" -> 6.0 + 54.0 * strength * qualityFactor
+            "MIN" -> 2.0 + 58.0 * strength * qualityFactor
+            "HOUR" -> 1.0 + 23.0 * strength * qualityFactor
+            else -> 1.0 + 13.0 * strength * qualityFactor
+        }
+        return when (unit) {
+            "SEC" -> raw.roundToInt().coerceIn(3, 60).toLong()
+            "MIN" -> raw.roundToInt().coerceIn(1, 60).toLong() * 60L
+            "HOUR" -> raw.roundToInt().coerceIn(1, 24).toLong() * 3600L
+            else -> raw.roundToInt().coerceIn(1, 14).toLong() * 86400L
+        }
+    }
+
+    fun analyze(bitmap: Bitmap, unit: String): ScreenshotForecast {
+        // Unit is chosen by the user; the amount is estimated from visual persistence.
+        return analyzeInternal(bitmap, unit.uppercase(), null)
+    }
+
+    fun analyze(bitmap: Bitmap, horizonSeconds: Long): ScreenshotForecast =
+        analyzeInternal(bitmap, "AUTO", horizonSeconds)
+
+    private fun analyzeInternal(bitmap: Bitmap, unit: String, fixedHorizonSeconds: Long?): ScreenshotForecast {
         val w = bitmap.width
         val h = bitmap.height
-        if (w < 120 || h < 120) return ScreenshotForecast("NO TRADE", horizonSeconds, 0, 10, 0.0, 0.0, 0.0, 0.0, listOf("Изображение слишком маленькое для анализа."))
+        if (w < 120 || h < 120) return ScreenshotForecast("NO TRADE", (fixedHorizonSeconds ?: 60L), 0, 10, 0.0, 0.0, 0.0, 0.0, listOf("Изображение слишком маленькое для анализа."))
 
         // Ignore the outer UI/axis areas and inspect the central chart body.
         val left = (w * 0.10).toInt().coerceAtLeast(1)
@@ -81,7 +108,10 @@ object ScreenshotForecastEngine {
             }
         }
         val candleBias = if (samples == 0) 0.0 else ((green - red) / samples).coerceIn(-1.0, 1.0)
-        val combined = trend * 0.42 + momentum * 0.38 + candleBias * 0.20
+        // Multi-window visual vote. The shortest window captures immediate momentum,
+        // while longer windows reduce noise from a single candle/color artifact.
+        val micro = ((recent - previous) * 18.0 + candleBias * 0.55).coerceIn(-1.0, 1.0)
+        val combined = trend * 0.34 + momentum * 0.30 + micro * 0.21 + candleBias * 0.15
         val quality = (35 + min(35, (recentContrast * 900).toInt()) + if (samples > 30) 15 else 0 + if (w >= 720) 10 else 0 + if (h >= 500) 5 else 0).coerceIn(10, 95)
         val magnitude = abs(combined)
         val confidence = (50 + magnitude * 38 + min(7.0, max(0.0, quality.toDouble() - 50.0) / 8.0)).toInt().coerceIn(50, 88)
@@ -91,14 +121,17 @@ object ScreenshotForecastEngine {
             combined < 0 -> "SHORT"
             else -> "NO TRADE"
         }
-        val horizon = horizonSeconds.coerceIn(5, 900)
+        val autoHorizon = if (fixedHorizonSeconds != null) fixedHorizonSeconds.coerceIn(1, 30L * 86400L)
+        else autoHorizonSeconds(unit, trend, momentum, volatility, quality)
+        val horizon = autoHorizon
         val notes = listOf(
-            "Визуальный тренд: ${"%.2f".format(trend)}; импульс: ${"%.2f".format(momentum)}.",
+            "Визуальный тренд: ${"%.2f".format(trend)}; импульс: ${"%.2f".format(momentum)}; краткосрочный импульс: ${"%.2f".format(micro)}.",
             "Баланс цветных свечей: ${"%+.2f".format(candleBias)}; изменение визуальной волатильности: ${"%+.0f%%".format(volatility * 100)}.",
             "Качество изображения/выделения графика: $quality/100.",
-            if (direction == "NO TRADE") "Сигнал недостаточно устойчив — приложение не выдаёт направление." else "Сигнал прошёл консервативный визуальный фильтр для горизонта $horizon сек.",
-            "Это вероятностный анализ изображения, а не гарантия движения цены: скриншот не содержит будущих данных."
+            if (direction == "NO TRADE") "Сигнал недостаточно устойчив — приложение не выдаёт направление." else "Сигнал прошёл визуальный фильтр; автоматически оцененный горизонт: ${formatHorizonLocal(horizon)}.",
+            "Скриншот анализируется как визуальное подтверждение: направление, импульс, волатильность и свечные признаки. Будущее движение не гарантируется."
         )
-        return ScreenshotForecast(direction, horizon, confidence, quality, momentum, trend, volatility, candleBias, notes)
+        return ScreenshotForecast(direction, horizon, confidence, quality, momentum, trend, volatility, candleBias, notes, horizon)
     }
+    private fun formatHorizonLocal(seconds: Long): String = when { seconds < 60 -> "$seconds сек"; seconds < 3600 -> "${seconds/60} мин"; seconds < 86400 -> "${seconds/3600} ч"; else -> "${seconds/86400} дн" }
 }

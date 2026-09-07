@@ -43,6 +43,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 3_000L
+        private const val MAX_INTRATICK_JUMP_PCT = 0.035
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -50,7 +51,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
     }
-    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.41"
+    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.43"
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -332,9 +333,12 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         // No MT5 terminal, IP, server, login or manual network configuration is required.
         val value = when {
             isLikelyMoex(clean) -> {
-                // Russian exchange instruments: MOEX is the canonical exchange feed.
+                // Russian exchange instruments: ONLY MOEX is accepted for the canonical
+                // quote. Falling back to Yahoo here can mix currencies/sessions and is
+                // exactly the kind of source mismatch that can make a stock appear to
+                // jump unexpectedly. If MOEX is unavailable, return no quote rather than
+                // presenting a different provider as if it were the exchange price.
                 runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it > 0.0 }
-                    ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it > 0.0 }
             }
             clean.endsWith("=X") -> {
                 // FX spot: use Alfa-Forex's public real-time quote page first.
@@ -344,8 +348,20 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
             }
             else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it > 0.0 }
         }
-        if (value != null) quoteCache[clean] = System.currentTimeMillis() to value
-        return value
+        if (value != null) {
+            val now = System.currentTimeMillis()
+            val prev = quoteCache[clean]
+            // Protect the UI/analytics from provider glitches that suddenly jump several
+            // percent within a few seconds. A genuine session/opening gap is not filtered
+            // because the guard only applies to a very recent cached quote.
+            val guarded = if (prev != null && now - prev.first <= 20_000L && prev.second > 0.0) {
+                val jump = abs(value - prev.second) / prev.second
+                if (jump > MAX_INTRATICK_JUMP_PCT) prev.second else value
+            } else value
+            quoteCache[clean] = now to guarded
+            return guarded
+        }
+        return null
     }
 
     fun instrumentMeta(symbol: String): InstrumentMeta {

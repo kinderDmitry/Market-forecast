@@ -143,6 +143,62 @@ object AnalyticsEngine {
     private fun candlePressure(c:Candle):Double{
         val range=(c.high-c.low).coerceAtLeast(1e-12); return ((c.close-c.open)/range).coerceIn(-1.0,1.0)
     }
+    private data class PatternResult(val score: Double, val names: List<String>)
+
+    /**
+     * Price-action pattern engine. It works only from OHLCV, so the scanner can
+     * recognize formations instead of relying on one oscillator. Patterns are
+     * confirmations, not guarantees; conflicting formations reduce the score.
+     */
+    private fun detectPatterns(c: List<Candle>, atrValue: Double): PatternResult {
+        if (c.size < 8 || atrValue <= 0.0) return PatternResult(0.0, emptyList())
+        val last = c.last()
+        val prev = c[c.lastIndex - 1]
+        val p2 = c[c.lastIndex - 2]
+        val range = (last.high - last.low).coerceAtLeast(1e-9)
+        val body = abs(last.close - last.open)
+        val upper = last.high - max(last.open, last.close)
+        val lower = min(last.open, last.close) - last.low
+        val bodyFrac = body / range
+        val out = mutableListOf<Pair<Double,String>>()
+        if (bodyFrac <= 0.12) out += 1.2 to "Doji"
+        if (lower >= body * 2.2 && upper <= body * 0.9 && last.close > last.open) out += 2.4 to "Молот / бычий pin-bar"
+        if (upper >= body * 2.2 && lower <= body * 0.9 && last.close < last.open) out += -2.4 to "Падающая звезда / медвежий pin-bar"
+        if (last.close > last.open && prev.close < prev.open && last.open <= prev.close && last.close >= prev.open) out += 3.0 to "Бычье поглощение"
+        if (last.close < last.open && prev.close > prev.open && last.open >= prev.close && last.close <= prev.open) out += -3.0 to "Медвежье поглощение"
+        if (bodyFrac >= 0.82 && last.close > last.open) out += 1.8 to "Бычий marubozu"
+        if (bodyFrac >= 0.82 && last.close < last.open) out += -1.8 to "Медвежий marubozu"
+        val prevRange = (prev.high - prev.low).coerceAtLeast(1e-9)
+        if (range < prevRange * 0.72 && last.high <= prev.high && last.low >= prev.low) {
+            val prior = p2.close
+            out += if (last.close >= prior) 0.9 to "Inside bar / сжатие" else -0.9 to "Inside bar / сжатие"
+        }
+        if (c.size >= 4) {
+            val a = c[c.lastIndex - 3]; val b = c[c.lastIndex - 2]; val d = c[c.lastIndex - 1]; val e = c.last()
+            if (a.close < a.open && b.close > b.open && d.close > d.open && e.close > e.open &&
+                b.close > a.high && d.close >= b.close * 0.997 && e.close >= d.close * 0.997) out += 2.0 to "Серия бычьего импульса"
+            if (a.close > a.open && b.close < b.open && d.close < d.open && e.close < e.open &&
+                b.close < a.low && d.close <= b.close * 1.003 && e.close <= d.close * 1.003) out += -2.0 to "Серия медвежьего импульса"
+        }
+        val w = c.takeLast(min(30, c.size))
+        val hi = w.dropLast(1).maxOf { it.high }
+        val lo = w.dropLast(1).minOf { it.low }
+        if (last.close > hi + atrValue * 0.08 && last.close > last.open) out += 2.8 to "Пробой сопротивления"
+        if (last.close < lo - atrValue * 0.08 && last.close < last.open) out += -2.8 to "Пробой поддержки"
+        // Double top/bottom: two pivots with similar prices followed by rejection.
+        if (w.size >= 12) {
+            val left = w.dropLast(4).takeLast(8)
+            val right = w.takeLast(4)
+            val leftHi = left.maxOf { it.high }; val rightHi = right.maxOf { it.high }
+            val leftLo = left.minOf { it.low }; val rightLo = right.minOf { it.low }
+            val tolerance = max(atrValue * 0.65, last.close * 0.003)
+            if (abs(leftHi - rightHi) <= tolerance && last.close < rightHi - atrValue * 0.15) out += -2.2 to "Двойная вершина"
+            if (abs(leftLo - rightLo) <= tolerance && last.close > rightLo + atrValue * 0.15) out += 2.2 to "Двойное дно"
+        }
+        val weighted = out.sumOf { it.first }.coerceIn(-8.0, 8.0)
+        return PatternResult(weighted, out.sortedByDescending { abs(it.first) }.take(5).map { it.second })
+    }
+
     private fun atrSeries(c: List<Candle>, n: Int = 14, count: Int = 20): List<Double> {
         if (c.size <= n) return emptyList()
         // Wilder-style rolling ATR in O(N), avoiding a fresh N-element allocation
@@ -429,6 +485,7 @@ object AnalyticsEngine {
         val closes = c.map { it.close }; val price = entryOverride?.takeIf { it.isFinite() && it > 0.0 } ?: closes.last(); require(price.isFinite() && price > 0.0) { "Цена должна быть положительной и конечной" }
         val e20 = ema(closes, 20) ?: price; val e50 = ema(closes, 50) ?: price; val e200 = ema(closes, 200)
         val r = rsi(closes) ?: 50.0; val m = macd(closes) ?: 0.0; val mh = macdHistogram(closes); val a = atr(c) ?: price * 0.01
+        val patterns = detectPatterns(c, a)
         val bb = bollingerPosition(closes) ?: 0.0; val bbWidth = bollingerWidth(closes); val rsiTrend = rsiSlope(closes)
         val adxV = adx(c); val stoch = stochastic(c); val mom = momentum(closes); val rocV = roc(closes)
         val cciV = cci(c); val williamsV = williamsR(c); val mfiV = mfi(c); val cmfV = cmf(c)
@@ -534,11 +591,11 @@ object AnalyticsEngine {
         val rangeRegime = 1.0 - trendRegime
         val confirmationBoost = trendQuality * (0.08 + 0.12 * trendRegime) +
             volumePrice * 0.07 + divergence * (0.05 + 0.08 * rangeRegime)
-        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + confirmationBoost
+        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost
         val score = raw.coerceIn(-10.0, 10.0)
         // Directional confirmation is deliberately conservative: a high raw score is
         // not enough when trend, momentum and higher-timeframe structure disagree.
-        val confirmation = (trendBase.sign + agreement.sign + mtf.sign + momentumBase.sign + structure.sign + trendQuality.sign + volumePrice.sign).roundToInt()
+        val confirmation = (trendBase.sign + agreement.sign + mtf.sign + momentumBase.sign + structure.sign + trendQuality.sign + volumePrice.sign + patterns.score.sign).roundToInt()
         val directionalConflict = abs(score) >= 2.2 && confirmation * score.sign < 2.0
         val confirmationStrength = (abs(confirmation) / 7.0).coerceIn(0.0, 1.0)
         val divergenceConflict = divergence * score.sign < -1.0
@@ -656,6 +713,7 @@ object AnalyticsEngine {
             "Walk-forward edge по горизонтам: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п.; слабые и конфликтные направления отсекаются.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0),
             "Новая перекрёстная проверка: качество тренда %.2f; цена+объём %.2f; дивергенция RSI %.2f; сила подтверждения %.0f%%.".format(Locale.US, trendQuality, volumePrice, divergence, confirmationStrength * 100.0),
             "Price Action Engine: сила тела %.2f; эффективность диапазона %.2f; расширение диапазона %.2f; аномалия объёма %.2f.".format(Locale.US, bodyStrength, rangeEfficiency, rangeExpansion, volumeAnomaly),
+            "Pattern Engine: score %.2f; распознано: %s.".format(Locale.US, patterns.score, if (patterns.names.isEmpty()) "нет устойчивой формации" else patterns.names.joinToString(", ")),
             "Ключевые уровни: поддержка %.2f / %.2f; сопротивление %.2f / %.2f.".format(Locale.US, support1, support2, resistance1, resistance2),
             "Расширенный теханализ: CCI %.1f; Williams %%R %.1f; MFI %.1f; CMF %.2f; Ichimoku %.2f; Donchian %.2f; Stoch RSI %.2f.".format(Locale.US, cciV, williamsV, mfiV, cmfV, ichimoku, donchian, stochRsi),
             "Вероятность направления: %.0f%%; edge %.0f%%, gap %.1f п.п., ADX %.1f, R/R %.2f, подтверждение %d/5.".format(Locale.US, calibratedProbability, selectedEdge * 100.0, edgeGap * 100.0, adxV, rr, confirmation)
@@ -675,7 +733,7 @@ object AnalyticsEngine {
             String.format(Locale.US, "Risk Engine: SL ограничен %.2f%% цены; R/R по TP2 %.2f.", expectedLossPct, rr)
         )
         return Forecast(finalSignal, score, finalConfidence, trendBase, momentumBase, abs(a / price) * 100.0, levelBase, volumeBase, bull, base, bear,
-            price, stop, stopAggressive, stopOptimal, stopConservative, safeTp1, safeTp2, safeTp3, rr, projected, support1, support2, resistance1, resistance2, finalExplanation, quality, regime, expectedProfitPct, expectedLossPct, selectedEdge, edgeGap, confirmation, advancedTechnical, highConviction)
+            price, stop, stopAggressive, stopOptimal, stopConservative, safeTp1, safeTp2, safeTp3, rr, projected, support1, support2, resistance1, resistance2, finalExplanation, quality, regime, expectedProfitPct, expectedLossPct, selectedEdge, edgeGap, confirmation, advancedTechnical, highConviction, patterns.score, patterns.names)
     }
 
     fun backtest(c: List<Candle>): Pair<Int, Int> {

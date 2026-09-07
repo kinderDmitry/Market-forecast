@@ -79,7 +79,9 @@ data class Forecast(
     val edgeGap: Double = 0.0,
     val confirmation: Int = 0,
     val advancedTechnical: Double = 0.0,
-    val highConviction: Boolean = false
+    val highConviction: Boolean = false,
+    val patternScore: Double = 0.0,
+    val detectedPatterns: List<String> = emptyList()
 )
 data class MarketState(
     val symbol: String,
