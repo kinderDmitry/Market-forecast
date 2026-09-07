@@ -50,7 +50,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
     }
-    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.38"
+    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.40"
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -242,37 +242,42 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         }.distinct()
 
         val futures = candidates.map { symbol ->
+            // Keep the worker body as a single expression. Besides being simpler, this
+            // avoids Kotlin parser edge-cases around labelled returns inside nested
+            // ExecutorService lambdas and makes one bad instrument fully isolated.
             analysisPool.submit<MarketPick?> {
-                try {
+                runCatching {
                     val candles = load(symbol, "2y", "1d")
-                    if (candles.size < 30) return@submit null
-
-                    val live = reconcileLivePrice(symbol, candles, quote(symbol))
-                    if (!live.isFinite() || live <= 0.0) return@submit null
-
-                    val forecast = AnalyticsEngine.analyze(candles, live)
-                    val previous = candles.dropLast(1).lastOrNull()?.close ?: candles.last().open
-                    val changePct = if (previous > 0.0) {
-                        (live - previous) / previous * 100.0
+                    if (candles.size < 30) {
+                        null
                     } else {
-                        0.0
-                    }
-                    val type = if (symbol.endsWith("=X")) "FX" else "STOCK"
+                        val live = reconcileLivePrice(symbol, candles, quote(symbol))
+                        if (!live.isFinite() || live <= 0.0) {
+                            null
+                        } else {
+                            val forecast = AnalyticsEngine.analyze(candles, live)
+                            val previous = candles.dropLast(1).lastOrNull()?.close ?: candles.last().open
+                            val changePct = if (previous > 0.0) {
+                                (live - previous) / previous * 100.0
+                            } else {
+                                0.0
+                            }
+                            val type = if (symbol.endsWith("=X")) "FX" else "STOCK"
 
-                    MarketPick(
-                        symbol = symbol,
-                        name = symbol.removeSuffix(".ME"),
-                        price = live,
-                        signal = forecast.signal,
-                        confidence = forecast.confidence,
-                        score = forecast.score,
-                        type = type,
-                        changePct = changePct,
-                        volume = candles.last().volume
-                    )
-                } catch (_: Throwable) {
-                    null
-                }
+                            MarketPick(
+                                symbol = symbol,
+                                name = symbol.removeSuffix(".ME"),
+                                price = live,
+                                signal = forecast.signal,
+                                confidence = forecast.confidence,
+                                score = forecast.score,
+                                type = type,
+                                changePct = changePct,
+                                volume = candles.last().volume
+                            )
+                        }
+                    }
+                }.getOrNull()
             }
         }
 
