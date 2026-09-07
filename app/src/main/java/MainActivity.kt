@@ -74,6 +74,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -641,6 +642,27 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
     }
 }
 
+private fun mergeRealtimeCandle(raw: List<Candle>, live: Double, timeframe: String, now: Long, symbol: String): List<Candle> {
+    if (raw.isEmpty() || !live.isFinite() || live <= 0.0) return raw
+    val step = when (timeframe.uppercase(Locale.US)) {
+        "15M" -> 15L * 60_000L
+        "1H" -> 60L * 60_000L
+        "4H" -> 4L * 60L * 60_000L
+        "1W" -> 7L * 24L * 60L * 60_000L
+        else -> 24L * 60L * 60_000L
+    }
+    val bucket = (now / step) * step
+    val last = raw.last()
+    if (last.time >= bucket && last.time < bucket + step) {
+        val updated = last.copy(high = max(last.high, live), low = min(last.low, live), close = live, volume = last.volume)
+        return raw.dropLast(1) + updated
+    }
+    val open = last.close.takeIf { it.isFinite() && it > 0.0 } ?: live
+    return raw + Candle(bucket, open, max(open, live), min(open, live), live, 0.0)
+}
+
+private fun formatPrice(price: Double): String = fmt(price)
+
 private data class FavoriteTfResult(val forecast: Forecast?, val candles: List<Candle>)
 
 @Composable
@@ -655,7 +677,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
         loading = true
         val quote = withContext(Dispatchers.IO) { runCatching { repo.quote(symbol) }.getOrNull() }
         val now = System.currentTimeMillis()
-        val computed = coroutineScope {
+        val computed: List<Pair<String, FavoriteTfResult>> = coroutineScope {
             tfs.map { timeframe ->
                 async(Dispatchers.IO) {
                     val pair = timeframePair(timeframe)
@@ -670,7 +692,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
             }.awaitAll()
         }
         results = computed.toMap()
-        price = quote?.takeIf { it.isFinite() && it > 0.0 } ?: computed.asSequence().flatMap { it.second.candles.asSequence() }.lastOrNull()?.close ?: price
+        price = quote?.takeIf { it.isFinite() && it > 0.0 } ?: computed.lastOrNull()?.second?.candles?.lastOrNull()?.close ?: price
         updatedAt = now
         loading = false
     }
@@ -841,6 +863,21 @@ private fun niceStep(raw: Double): Double {
     val n = raw / p
     val base = when { n <= 1.0 -> 1.0; n <= 2.0 -> 2.0; n <= 5.0 -> 5.0; else -> 10.0 }
     return base * p
+}
+
+@Composable private fun ForecastSummary(f: Forecast, ru: Boolean) {
+    GradientCard(Modifier.fillMaxWidth()) {
+        SectionHeader(if (ru) "Итоговый прогноз" else "Final forecast", if (ru) "Сводка ансамбля технических сигналов" else "Ensemble technical-signal summary")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            SignalPill(f.signal, signalColor(f.signal))
+            Text("${f.confidence}%", fontSize = 25.sp, fontWeight = FontWeight.Black, color = Accent)
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricCard("Trend", "%.1f".format(Locale.US, f.trend), Blue, Modifier.weight(1f))
+            MetricCard("Momentum", "%.1f".format(Locale.US, f.momentum), Accent, Modifier.weight(1f))
+            MetricCard("Quality", "${f.dataQuality}/100", Positive, Modifier.weight(1f))
+        }
+    }
 }
 
 @Composable private fun Levels(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Ключевые уровни" else "Key levels", if (ru) "SL ограничен риск-движком; TP построены по R/R и структуре" else "SL is risk-engine constrained; TP uses R/R and structure"); LevelRow("Entry", f.entry, Accent); LevelRow("SL aggressive", f.stopAggressive, Negative); LevelRow("SL optimal", f.stopOptimal, Negative); LevelRow("SL conservative", f.stopConservative, Negative); LevelRow("TP1", f.tp1, Positive); LevelRow("TP2", f.tp2, Positive); LevelRow("TP3", f.tp3, Positive); LevelRow(if (ru) "Поддержки" else "Support", f.support1, Blue); LevelRow(if (ru) "Сопротивление" else "Resistance", f.resistance1, Warning) } }
