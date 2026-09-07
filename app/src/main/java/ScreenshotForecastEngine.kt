@@ -32,7 +32,20 @@ object ScreenshotForecastEngine {
             "SEC" -> 6.0 + 54.0 * strength * qualityFactor
             "MIN" -> 2.0 + 58.0 * strength * qualityFactor
             "HOUR" -> 1.0 + 23.0 * strength * qualityFactor
-            else -> 1.0 + 13.0 * strength * qualityFactor
+            "DAY" -> 1.0 + 13.0 * strength * qualityFactor
+            else -> 0.0
+        }
+        if (unit == "AUTO") {
+            // Screenshot mode has no user-selected unit. Pick the scale from
+            // persistence strength: micro-momentum -> seconds, sustained impulse
+            // -> minutes/hours, very persistent structure -> days.
+            return when {
+                strength < 0.22 -> (4.0 + 18.0 * strength * qualityFactor).roundToInt().coerceIn(3, 15).toLong()
+                strength < 0.42 -> (15.0 + 90.0 * strength * qualityFactor).roundToInt().coerceIn(15, 120).toLong()
+                strength < 0.65 -> ((2.0 + 10.0 * strength * qualityFactor) * 60.0).roundToInt().coerceIn(120, 900).toLong()
+                strength < 0.84 -> ((15.0 + 105.0 * strength * qualityFactor) * 60.0).roundToInt().coerceIn(900, 7200).toLong()
+                else -> ((4.0 + 20.0 * strength * qualityFactor) * 3600.0).roundToInt().coerceIn(14400, 86400).toLong()
+            }
         }
         return when (unit) {
             "SEC" -> raw.roundToInt().coerceIn(3, 60).toLong()

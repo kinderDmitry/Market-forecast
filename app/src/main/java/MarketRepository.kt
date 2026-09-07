@@ -43,7 +43,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 3_000L
-        private const val MAX_INTRATICK_JUMP_PCT = 0.035
+        private const val MAX_INTRATICK_JUMP_PCT = 0.025
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -356,7 +356,12 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
             // because the guard only applies to a very recent cached quote.
             val guarded = if (prev != null && now - prev.first <= 20_000L && prev.second > 0.0) {
                 val jump = abs(value - prev.second) / prev.second
-                if (jump > MAX_INTRATICK_JUMP_PCT) prev.second else value
+                if (jump > MAX_INTRATICK_JUMP_PCT) {
+                    // A quote that changes >2.5% inside the same 20-second cache window is
+                    // treated as a provider glitch unless the historical path validates it.
+                    // Never invent a replacement price: keep the last validated quote.
+                    prev.second
+                } else value
             } else value
             quoteCache[clean] = now to guarded
             return guarded

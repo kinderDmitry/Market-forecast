@@ -135,8 +135,6 @@ fun MarketForecastApp(ctx: Context) {
     var newsDetailUrl by remember { mutableStateOf<String?>(null) }
     var screenshotForecast by remember { mutableStateOf<ScreenshotForecast?>(null) }
     var screenshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var screenshotHorizonValue by remember { mutableIntStateOf(prefs.getInt("screenshot_horizon_value", 15).coerceAtLeast(1)) }
-    var screenshotHorizonUnit by remember { mutableStateOf(prefs.getString("screenshot_horizon_unit", "MIN") ?: "MIN") }
     val launchIntent = (ctx as? android.app.Activity)?.intent
     // A normal launcher start must always land on HOME. Deep-link navigation is
     // reserved for an actual notification tap; this prevents Android from reopening
@@ -204,7 +202,7 @@ fun MarketForecastApp(ctx: Context) {
             val candlesRaw = withContext(Dispatchers.IO) { runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) }
             val meta = withContext(Dispatchers.IO) { repo.instrumentMeta(selected) }
             val quoted = canonicalQuotes[selected] ?: withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
-            val live = reconcileLivePrice(selected, candlesRaw, quoted)
+            val live = validateLiveQuote(candlesRaw, reconcileLivePrice(selected, candlesRaw, quoted))
             if (live > 0.0 && live.isFinite()) canonicalQuotes[selected] = live
             // The realtime candle is part of the exact dataset used by the forecast.
             // Entry/levels use the same canonical live price across timeframes.
@@ -317,7 +315,7 @@ fun MarketForecastApp(ctx: Context) {
                 val live = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
                 if (live != null && live > 0.0 && live.isFinite()) {
                     canonicalQuotes[selected] = live
-                    val reconciled = reconcileLivePrice(selected, state.candles, live)
+                    val reconciled = validateLiveQuote(state.candles, reconcileLivePrice(selected, state.candles, live))
                     val merged = mergeRealtimeCandle(state.candles, reconciled, tf, now, selected)
                     val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled) }.getOrNull() } else state.forecast
                     state = state.copy(candles = merged, forecast = refreshed, livePrice = reconciled, updated = now)
@@ -338,7 +336,7 @@ fun MarketForecastApp(ctx: Context) {
                             runCatching { repo.load(item.symbol, pair.first, pair.second) }.getOrDefault(cached ?: emptyList()).also { trackingCandleCache[key] = it }
                         } else cached
                         val lp = runCatching { repo.quote(item.symbol) }.getOrNull()
-                        val reconciled = reconcileLivePrice(item.symbol, cs, lp)
+                        val reconciled = validateLiveQuote(cs, reconcileLivePrice(item.symbol, cs, lp))
                         val ev = TrackingEngine.evaluate(item, cs, reconciled, now)
                         if (ev == null) item to null else item.copy(
                             lastLivePrice = ev.price, lastUpdated = now,
@@ -436,8 +434,9 @@ fun MarketForecastApp(ctx: Context) {
                         Bitmap.createScaledBitmap(it, (it.width * ratio).roundToInt(), (it.height * ratio).roundToInt(), true)
                     } else it
                 }
-                val result = scaled?.let { ScreenshotForecastEngine.analyze(it, screenshotHorizonUnit) }
-                withContext(Dispatchers.Main) { screenshotBitmap = scaled; screenshotForecast = result }
+                // The screenshot engine is recalculated again from the selected
+                // value + unit below. Do not freeze the first calculated horizon.
+                withContext(Dispatchers.Main) { screenshotBitmap = scaled }
             }
         }
     }
@@ -490,6 +489,18 @@ fun MarketForecastApp(ctx: Context) {
             dismissButton = { TextButton(onClick = { showPopupPermissionPrompt = false; prefs.edit().putBoolean("popup_prompt_done", true).apply() }) { Text(if (ru) "Позже" else "Later") } }
         )
     }
+    // A screenshot forecast is stateful: changing its horizon must immediately
+    // recalculate the same attached image. This is intentionally isolated from the
+    // ordinary market scanner, whose horizon is stored in its own settings.
+    // Screenshot analysis chooses the most probable persistence horizon itself.
+    // The ordinary market scanner keeps its independent user-selected horizon.
+    LaunchedEffect(screenshotBitmap) {
+        val bmp = screenshotBitmap ?: run { screenshotForecast = null; return@LaunchedEffect }
+        screenshotForecast = withContext(Dispatchers.Default) {
+            runCatching { ScreenshotForecastEngine.analyze(bmp, "AUTO") }.getOrNull()
+        }
+    }
+
     MaterialTheme(colorScheme = scheme) {
         Scaffold(
             containerColor = Color.Transparent,
@@ -516,7 +527,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick) { row -> load(row.result.symbol, row.timeframe) }
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
-                        Screen.SCREENSHOT -> ScreenshotScreen(ru, screenshotHorizonValue, screenshotHorizonUnit, { v -> screenshotHorizonValue = v; prefs.edit().putInt("screenshot_horizon_value", v).apply() }, { u -> screenshotHorizonUnit = u; prefs.edit().putString("screenshot_horizon_unit", u).apply() }, { screenshotPicker.launch("image/*") }, screenshotForecast, screenshotBitmap)
+                        Screen.SCREENSHOT -> ScreenshotScreen(ru, { screenshotPicker.launch("image/*") }, screenshotForecast, screenshotBitmap)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
                         Screen.DIVIDENDS -> DividendScreen(ru, repo, refreshTick) { screen = Screen.HOME }
@@ -640,25 +651,6 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
         if (news.isEmpty()) { item { EmptyCard(if (ru) "Новости временно недоступны. Повторите обновление через несколько секунд." else "News are temporarily unavailable. Refresh in a few seconds.") } }
         items(news.take(20), key = { it.url.ifBlank { it.title } }) { NewsCard(it, ru, openArticle = openArticle) }
     }
-}
-
-private fun mergeRealtimeCandle(raw: List<Candle>, live: Double, timeframe: String, now: Long, symbol: String): List<Candle> {
-    if (raw.isEmpty() || !live.isFinite() || live <= 0.0) return raw
-    val step = when (timeframe.uppercase(Locale.US)) {
-        "15M" -> 15L * 60_000L
-        "1H" -> 60L * 60_000L
-        "4H" -> 4L * 60L * 60_000L
-        "1W" -> 7L * 24L * 60L * 60_000L
-        else -> 24L * 60L * 60_000L
-    }
-    val bucket = (now / step) * step
-    val last = raw.last()
-    if (last.time >= bucket && last.time < bucket + step) {
-        val updated = last.copy(high = max(last.high, live), low = min(last.low, live), close = live, volume = last.volume)
-        return raw.dropLast(1) + updated
-    }
-    val open = last.close.takeIf { it.isFinite() && it > 0.0 } ?: live
-    return raw + Candle(bucket, open, max(open, live), min(open, live), live, 0.0)
 }
 
 private fun formatPrice(price: Double): String = fmt(price)
@@ -822,10 +814,38 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
 
 @Composable private fun Analysis(state: MarketState, ru: Boolean, tf: String, favorite: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, onTf: (String) -> Unit, refresh: () -> Unit, track: () -> Boolean, tracked: List<TrackedForecast>, prefs: android.content.SharedPreferences) {
     var tab by remember { mutableStateOf("FORECAST") }
+    var tfForecasts by remember(state.symbol) { mutableStateOf<Map<String, Forecast?>>(emptyMap()) }
+    LaunchedEffect(state.symbol, state.updated) {
+        if (state.symbol.isBlank()) return@LaunchedEffect
+        val currentLive = state.livePrice.takeIf { it > 0.0 }
+        val tfs = listOf("15M", "1H", "4H", "1D", "1W")
+        tfForecasts = withContext(Dispatchers.IO) {
+            tfs.mapNotNull { timeframe ->
+                val pair = timeframePair(timeframe)
+                val c = runCatching { MarketRepository().load(state.symbol, pair.first, pair.second) }.getOrNull()
+                val live = currentLive ?: c?.lastOrNull()?.close
+                val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, timeframe, System.currentTimeMillis(), state.symbol) else c.orEmpty()
+                val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live) }.getOrNull() else null
+                timeframe to f
+            }.toMap()
+        }
+    }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(11.dp), contentPadding = PaddingValues(bottom = 30.dp)) {
         item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 22.sp, fontWeight = FontWeight.Black); Text("${state.symbol} • ${state.meta.currency}", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) fmt(state.livePrice) else "—", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Accent) }; IconButton({ save(if (favorite) favs - state.symbol else favs + state.symbol) }) { Icon(if (favorite) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }; IconButton(refresh) { Icon(Icons.Default.Refresh, null, tint = Accent) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("OVERVIEW", "FORECAST", "FINANCE").forEach { FilterChip(selected = tab == it, onClick = { tab = it }, label = { Text(if (ru) when (it) { "OVERVIEW" -> "Обзор"; "FORECAST" -> "Прогноз"; else -> "Финансы" } else it, fontSize = 8.sp) }) } } }
-        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("15M", "1H", "4H", "1D", "1W").forEach { FilterChip(selected = tf == it, onClick = { onTf(it) }, label = { Text(it, fontSize = 9.sp) }) } } }
+        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("15M", "1H", "4H", "1D", "1W").forEach { timeframe ->
+                val tfForecast = if (timeframe == tf && state.forecast != null) state.forecast else tfForecasts[timeframe]
+                val tc = forecastTimeframeColor(tfForecast)
+                val label = when (tfForecast?.signal) {
+                    "LONG" -> "$timeframe • L ${tfForecast.confidence}%"
+                    "SHORT" -> "$timeframe • S ${tfForecast.confidence}%"
+                    "NO TRADE" -> "$timeframe • N ${tfForecast.confidence}%"
+                    else -> timeframe
+                }
+                FilterChip(selected = tf == timeframe, onClick = { onTf(timeframe) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = tc.copy(alpha = .18f), selectedLabelColor = tc, containerColor = Color.Transparent, labelColor = tc.copy(alpha = .82f), disabledContainerColor = Color.Transparent), label = { Text(label, fontSize = 8.sp, fontWeight = FontWeight.Black) })
+            }
+        } }
         if (state.loading) item { Loading(ru) } else if (state.forecast != null) {
             val f = state.forecast
             when (tab) {
@@ -893,36 +913,22 @@ private fun niceStep(raw: Double): Double {
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
 @Composable private fun TrackedForSymbol(tracked: List<TrackedForecast>, symbol: String, ru: Boolean) { val items = tracked.filter { it.symbol == symbol }.take(6); if (items.isEmpty()) return; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Отслеживание" else "Monitoring", "${items.size} • ${if (ru) "без дублей по TF" else "unique by timeframe"}"); items.forEach { t -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("${t.signal} • ${t.timeframe}", fontWeight = FontWeight.Bold, fontSize = 10.sp); Text("Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(t.result, fontWeight = FontWeight.Black, fontSize = 9.sp, color = when(t.result){"PENDING"->Warning;"FLAT"->Warning;"FAIL"->Negative;else->Positive}) } } } }
 
-private fun screenshotHorizonSeconds(value: Int, unit: String): Long = when (unit) {
-    "SEC" -> value.coerceIn(1, 3600).toLong()
-    "MIN" -> value.coerceIn(1, 1440).toLong() * 60L
-    "HOUR" -> value.coerceIn(1, 168).toLong() * 3600L
-    else -> value.coerceIn(1, 30).toLong() * 86400L
-}
-
-@Composable private fun ScreenshotScreen(ru: Boolean, value: Int, unit: String, setValue: (Int) -> Unit, setUnit: (String) -> Unit, pick: () -> Unit, result: ScreenshotForecast?, bitmap: Bitmap?) {
+@Composable private fun ScreenshotScreen(ru: Boolean, pick: () -> Unit, result: ScreenshotForecast?, bitmap: Bitmap?) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(11.dp), contentPadding = PaddingValues(bottom = 30.dp)) {
         item { GradientCard(Modifier.fillMaxWidth()) {
             Text(if (ru) "СКРИНШОТ-ПРОГНОЗ" else "SCREENSHOT FORECAST", fontWeight = FontWeight.Black, fontSize = 18.sp, color = Accent)
-            Text(if (ru) "Загрузите свечной график. Выберите только единицу времени — количество времени приложение оценит автоматически по устойчивости импульса и качеству изображения. Гарантировать будущую цену по одному изображению невозможно." else "Upload a candlestick chart. Choose only the time unit; the engine estimates the duration from persistence, momentum and image quality. A single image cannot guarantee a future price.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 5.dp))
-            Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("SEC" to if (ru) "Секунды" else "Seconds", "MIN" to if (ru) "Минуты" else "Minutes", "HOUR" to if (ru) "Часы" else "Hours", "DAY" to if (ru) "Дни" else "Days").forEach { (u,label) -> FilterChip(selected = unit == u, onClick = { setUnit(u) }, label = { Text(label, fontSize = 8.sp) }) }
-            }
-            Button(onClick = pick, modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(50.dp), shape = RoundedCornerShape(15.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(7.dp)); Text(if (ru) "Загрузить скриншот" else "Upload screenshot", fontWeight = FontWeight.Black) }
+            Text(if (ru) "Загрузите свечной график. Ничего выбирать не нужно: движок сам определяет направление и наиболее вероятную длительность движения по визуальному тренду, импульсу, волатильности и свечным признакам." else "Upload a candlestick chart. Nothing needs to be selected: the engine determines direction and the most probable persistence horizon from visual trend, momentum, volatility and candle features.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 5.dp))
+            Button(onClick = pick, modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(50.dp), shape = RoundedCornerShape(15.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(7.dp)); Text(if (ru) "Загрузить / заменить скриншот" else "Upload / replace screenshot", fontWeight = FontWeight.Black) }
         } }
         if (bitmap != null) item { Image(bitmap.asImageBitmap(), null, Modifier.fillMaxWidth().heightIn(max = 260.dp).clip(RoundedCornerShape(14.dp)), contentScale = ContentScale.Fit) }
         result?.let { r -> item { GradientCard(Modifier.fillMaxWidth()) {
             val c = when (r.direction) { "LONG" -> Positive; "SHORT" -> Negative; else -> Warning }
             Text(if (ru) "Результат" else "Result", fontWeight = FontWeight.Black)
             Row(Modifier.fillMaxWidth().padding(top = 9.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) { MetricCard(if (ru) "Направление" else "Direction", r.direction, c, Modifier.weight(1f)); MetricCard(if (ru) "Уверенность" else "Confidence", "${r.confidence}%", Accent, Modifier.weight(1f)); MetricCard(if (ru) "Качество" else "Quality", "${r.quality}/100", Warning, Modifier.weight(1f)) }
-            Text(if (ru) "Горизонт: ${formatHorizon(r.horizonSeconds, ru)}" else "Horizon: ${formatHorizon(r.horizonSeconds, false)}", fontWeight = FontWeight.Bold, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp))
+            Text(if (ru) "Авто-горизонт: ${formatHorizon(r.horizonSeconds, ru)}" else "Auto horizon: ${formatHorizon(r.horizonSeconds, false)}", fontWeight = FontWeight.Bold, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp))
             r.explanation.forEach { Text("• $it", fontSize = 9.sp, modifier = Modifier.padding(top = 5.dp)) }
         } } }
     }
-}
-
-private fun formatHorizon(seconds: Long, ru: Boolean): String {
-    return when { seconds < 60 -> if (ru) "$seconds сек" else "$seconds sec"; seconds < 3600 -> if (ru) "${seconds/60} мин" else "${seconds/60} min"; seconds < 86400 -> if (ru) "${seconds/3600} ч" else "${seconds/3600} h"; else -> if (ru) "${seconds/86400} дн" else "${seconds/86400} d" }
 }
 
 @Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
@@ -1138,6 +1144,8 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
     var tf by remember { mutableStateOf(prefs.getString("scanner_tf","1D") ?: "1D") }
     var type by remember { mutableStateOf(prefs.getString("scanner_type","ALL") ?: "ALL") }
     var scope by remember { mutableStateOf(prefs.getString("scanner_scope","ALL") ?: "ALL") }
+    var horizonValue by remember { mutableIntStateOf(prefs.getInt("scanner_horizon_value", 15).coerceAtLeast(1)) }
+    var horizonUnit by remember { mutableStateOf(prefs.getString("scanner_horizon_unit", "SEC") ?: "SEC") }
     var busy by remember { mutableStateOf(false) }; var progress by remember { mutableFloatStateOf(0f) }; var results by remember { mutableStateOf(loadAutoScanResults(prefs)) }
     var scannerStatus by remember { mutableStateOf(prefs.getString("scanner_status", "") ?: "") }
     LaunchedEffect(refreshTick) {
@@ -1158,6 +1166,11 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
         }
         Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("ALL","STOCKS","FX").forEach { k -> FilterChip(selected=type==k,onClick={type=k;prefs.edit().putString("scanner_type",k).apply()},label={Text(if(ru) when(k){"ALL"->"Все";"STOCKS"->"Акции";else->"Валюты"} else k,fontSize=8.sp)}) } }
         Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("15M","1H","4H","1D","1W","ANY").forEach { k -> FilterChip(selected=tf==k,onClick={tf=k;prefs.edit().putString("scanner_tf",k).apply()},label={Text(if(ru&&k=="ANY")"Любой" else k,fontSize=8.sp)}) } }
+        Text(if (ru) "Горизонт сигнала — срок действия прогноза" else "Signal horizon — forecast validity", fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            OutlinedTextField(value = horizonValue.toString(), onValueChange = { horizonValue = it.filter(Char::isDigit).take(4).toIntOrNull()?.coerceAtLeast(1) ?: horizonValue; prefs.edit().putInt("scanner_horizon_value", horizonValue).apply() }, modifier = Modifier.width(92.dp), singleLine = true, label = { Text(if (ru) "Срок" else "Value", fontSize = 8.sp) })
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) { listOf("SEC","MIN","HOUR","DAY").forEach { u -> FilterChip(selected = horizonUnit == u, onClick = { horizonUnit = u; prefs.edit().putString("scanner_horizon_unit", u).apply() }, label = { Text(if (ru) when(u){"SEC"->"сек";"MIN"->"мин";"HOUR"->"ч";else->"дни"} else u, fontSize=8.sp) }) } }
+        }
         Spacer(Modifier.height(8.dp))
         if (busy) { GradientCard(Modifier.fillMaxWidth()) { Row(verticalAlignment=Alignment.CenterVertically){CircularProgressIndicator(Modifier.size(24.dp),color=Accent);Column(Modifier.padding(start=10.dp)){Text(if(ru)"Идёт сканирование рыночных данных…" else "Scanning live market…",fontWeight=FontWeight.Bold,fontSize=10.sp);LinearProgressIndicator(progress={progress},Modifier.fillMaxWidth().padding(top=6.dp),color=Accent)}} } }
         LaunchedEffect(refreshTick) {
@@ -1188,14 +1201,17 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
                     .putExtra(ScannerForegroundService.EXTRA_SCOPE, scope)
                     .putExtra(ScannerForegroundService.EXTRA_TYPE, type)
                     .putExtra(ScannerForegroundService.EXTRA_TF, tf)
+                    .putExtra(ScannerForegroundService.EXTRA_HORIZON_VALUE, horizonValue)
+                    .putExtra(ScannerForegroundService.EXTRA_HORIZON_UNIT, horizonUnit)
                 if (Build.VERSION.SDK_INT >= 26) androidx.core.content.ContextCompat.startForegroundService(ctx, intent) else ctx.startService(intent)
             }
         }, Modifier.fillMaxWidth(), enabled=true, colors=ButtonDefaults.buttonColors(containerColor=if (busy) Negative else Accent)) {
             Text(if (busy) (if (ru) "ОСТАНОВИТЬ СКАНЕР" else "STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
         }
         if(scannerStatus.isNotBlank()&&!busy) Text(scannerStatus,fontSize=9.sp,color=Positive,modifier=Modifier.padding(top=6.dp))
+        if (results.isNotEmpty()) Text(if (ru) "Сигналы действуют только до указанного времени. После окончания горизонта они автоматически исчезают и ждут нового подтверждения." else "Signals are valid only until the shown expiry. After the horizon they disappear automatically and wait for a new confirmation.", fontSize=8.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, modifier=Modifier.padding(top=5.dp))
         if (results.isNotEmpty()) { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "Удалить все" else "Delete all") } } }
-        LazyColumn(verticalArrangement=Arrangement.spacedBy(8.dp)) { items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row -> GradientCard(Modifier.fillMaxWidth().clickable{open(row)}) { Row(verticalAlignment=Alignment.CenterVertically){Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black);Text("${row.timeframe} • ${row.signal}",color=signalColor(row.signal),fontWeight=FontWeight.Bold,fontSize=9.sp);Spacer(Modifier.width(7.dp));Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black);IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}} } } }
+        LazyColumn(verticalArrangement=Arrangement.spacedBy(8.dp)) { items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row -> GradientCard(Modifier.fillMaxWidth().clickable{open(row)}) { Row(verticalAlignment=Alignment.CenterVertically){Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black);Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }; Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black); val left=(row.expiresAt-System.currentTimeMillis()).coerceAtLeast(0L); Text(if(left>0) "• ${formatElapsed(left)}" else "• истёк", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp); IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}} } } }
     }
 }
 
@@ -1351,7 +1367,7 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
 @Composable private fun ErrorCard(s:String,ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Данные временно недоступны" else "Data temporarily unavailable",color=Negative,fontWeight=FontWeight.Bold);Text(s,fontSize=9.sp,modifier=Modifier.padding(top=5.dp))}}
 
 @Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier, shape = RoundedCornerShape(12.dp), color = Color.Black, contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
-private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a -> val x=a.split("|",limit=6); if(x.size<6) null else ScanRow(SearchResult(x[0],x[0],"",""),x[1],x[2],x[3].toIntOrNull()?:0,x[4].toDoubleOrNull()?:0.0,x[5].toDoubleOrNull()?:0.0) }.sortedByDescending{it.confidence}
+private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a -> val x=a.split("|",limit=9); if(x.size<6) null else { val created=x.getOrNull(7)?.toLongOrNull()?:0L; val expires=x.getOrNull(8)?.toLongOrNull()?:0L; ScanRow(SearchResult(x[0],x[0],"",""),x[1],x[2],x[3].toIntOrNull()?:0,x[4].toDoubleOrNull()?:0.0,x[5].toDoubleOrNull()?:0.0,x.getOrNull(6)?.toLongOrNull()?:0L,created,expires) } }.filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }.sortedByDescending{it.confidence}
 private fun loadFavoriteOrder(p: android.content.SharedPreferences, favs: Set<String>): List<String> = (p.getString("favorite_order", "").orEmpty().split("\n").filter { it.isNotBlank() }.filter { it in favs } + favs.filter { it !in p.getString("favorite_order", "").orEmpty().split("\n") }).distinct()
 private fun loadSearchHistory(p: android.content.SharedPreferences): List<String> = p.getString("search_history", "").orEmpty().split("\n").filter { it.isNotBlank() }.take(20)
 private fun saveSearchHistory(p: android.content.SharedPreferences, q: String): List<String> { val out = (listOf(q) + loadSearchHistory(p).filterNot { it.equals(q, true) }).take(20); p.edit().putString("search_history", out.joinToString("\n")).apply(); return out }

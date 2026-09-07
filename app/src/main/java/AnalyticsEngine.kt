@@ -603,11 +603,27 @@ object AnalyticsEngine {
         // markets; ordinary directional setups are allowed when several independent
         // blocks agree.  This prevents the previous over-filtering from turning the
         // application into a permanent NO TRADE dashboard.
-        val weakEdge = edgeGap < 0.035
-        val precisionLong = longEdge >= 0.53 && longEdge - shortEdge >= 0.035
-        val precisionShort = shortEdge >= 0.53 && shortEdge - longEdge >= 0.035
-        val efficiencyGate = efficiency >= 0.08
-        val scoreGate = abs(score) >= 4.0
+        // Adaptive gates: thresholds depend on market regime instead of a single
+        // hard NO-TRADE wall. This preserves the precision filters while allowing
+        // strong, well-confirmed trends through when the recent walk-forward sample
+        // is simply inconclusive.
+        val trendRegimeStrong = adxV >= 25.0 && efficiency >= 0.16
+        val rangeMarketRegime = adxV < 18.0
+        val edgeThreshold = when {
+            trendRegimeStrong -> 0.018
+            rangeMarketRegime -> 0.030
+            else -> 0.022
+        }
+        val scoreThreshold = when {
+            trendRegimeStrong -> 3.0
+            rangeMarketRegime -> 3.8
+            else -> 3.3
+        }
+        val weakEdge = edgeGap < edgeThreshold && abs(score) < scoreThreshold + 0.9
+        val precisionLong = longEdge >= 0.515 && longEdge - shortEdge >= edgeThreshold
+        val precisionShort = shortEdge >= 0.515 && shortEdge - longEdge >= edgeThreshold
+        val efficiencyGate = if (trendRegimeStrong) efficiency >= 0.12 else efficiency >= 0.055
+        val scoreGate = abs(score) >= scoreThreshold
         val confirmationGate = abs(confirmation) >= 2
         val rrGate = run {
             val provisionalRisk = maxOf(price * 0.006, a * 0.8)
@@ -617,9 +633,13 @@ object AnalyticsEngine {
             abs(provisionalTp - price) / abs(price - provisionalStop) >= 1.35
         }
         val signal = when {
-            directionalConflict || divergenceConflict || weakEdge || !efficiencyGate || !scoreGate || !confirmationGate || !rrGate -> "NO TRADE"
-            score >= 4.0 && adxV >= 18.0 && precisionLong -> "LONG"
-            score <= -4.0 && adxV >= 18.0 && precisionShort -> "SHORT"
+            directionalConflict || divergenceConflict || !efficiencyGate || !scoreGate || !confirmationGate || !rrGate -> "NO TRADE"
+            score > 0 && precisionLong && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "LONG"
+            score < 0 && precisionShort && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "SHORT"
+            // If historical edge is inconclusive, a very strong current ensemble
+            // can still produce a directional call. Confidence is capped below.
+            score >= scoreThreshold + 1.5 && confirmation >= 3 && !divergenceConflict -> "LONG"
+            score <= -(scoreThreshold + 1.5) && confirmation <= -3 && !divergenceConflict -> "SHORT"
             else -> "NO TRADE"
         }
         val direction = when { signal.contains("LONG") -> 1.0; signal.contains("SHORT") -> -1.0; else -> if (score >= 0) 1.0 else -1.0 }
@@ -690,7 +710,9 @@ object AnalyticsEngine {
             efficiency * 5.0 +
             edgeGap.coerceIn(0.0, 0.20) * 20.0).coerceIn(50.0, 94.0)
         val edgeCeiling = (58.0 + (selectedEdge - 0.50) * 105.0).coerceIn(58.0, 94.0)
-        val confidence = min(max(rawConfidence, calibratedProbability), edgeCeiling).roundToInt().coerceIn(50, 94)
+        val edgeInformative = abs(selectedEdge - 0.50) >= 0.025
+        val confidenceCeiling = if (edgeInformative) edgeCeiling else 78.0
+        val confidence = min(max(rawConfidence, calibratedProbability), confidenceCeiling).roundToInt().coerceIn(50, 94)
         val wLong = exp(score / 3.0); val wShort = exp(-score / 3.0); val wBase = 1.35
         val wSum = wLong + wBase + wShort
         var bull = (wLong / wSum * 100.0).roundToInt().coerceIn(5, 90)
