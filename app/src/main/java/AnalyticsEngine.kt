@@ -443,6 +443,27 @@ object AnalyticsEngine {
         val trendQuality = trendQuality(c, price, a)
         val atrs = atrSeries(c); val atrPctile = if(atrs.isEmpty()) .5 else atrs.count{it<=a}.toDouble()/atrs.size
         val volatilityRegimeBase = ((atrPctile-.5)*4.0).coerceIn(-2.0,2.0)
+        // Higher-order price-action features. These use only the available OHLCV path
+        // and are intentionally bounded to reduce overreaction to a single candle.
+        val recent20 = c.takeLast(minOf(20, c.size))
+        val bodyStrength = recent20.map {
+            val range = (it.high - it.low).coerceAtLeast(1e-12)
+            ((it.close - it.open) / range).coerceIn(-1.0, 1.0)
+        }.average()
+        val rangeEfficiency = run {
+            val path = recent20.zipWithNext().sumOf { abs(it.second.close - it.first.close) }.coerceAtLeast(1e-9)
+            val net = abs((recent20.lastOrNull()?.close ?: price) - (recent20.firstOrNull()?.close ?: price))
+            (net / path).coerceIn(0.0, 1.0)
+        }
+        val rangeExpansion = run {
+            val short = recent20.takeLast(minOf(5, recent20.size)).map { it.high - it.low }.average()
+            val long = recent20.map { it.high - it.low }.average().coerceAtLeast(1e-9)
+            (short / long - 1.0).coerceIn(-1.0, 2.0)
+        }
+        val localAvgVolume = recent20.map { it.volume }.average().coerceAtLeast(1e-9)
+        val volumeAnomaly = ((c.last().volume / localAvgVolume - 1.0) / 1.5).coerceIn(-1.0, 1.0)
+        val priceActionQuality = (bodyStrength * 2.2 + rangeEfficiency * agreement.sign * 1.4 + rangeExpansion * pressure.sign * 0.8 + volumeAnomaly * pressure.sign * 0.7).coerceIn(-5.0, 5.0)
+
         val advancedTechnical = (
             (cciV / 100.0).coerceIn(-2.5, 2.5) * 0.9 +
             ((williamsV + 50.0) / 25.0).coerceIn(-2.0, 2.0) * 0.45 +
@@ -513,7 +534,7 @@ object AnalyticsEngine {
         val rangeRegime = 1.0 - trendRegime
         val confirmationBoost = trendQuality * (0.08 + 0.12 * trendRegime) +
             volumePrice * 0.07 + divergence * (0.05 + 0.08 * rangeRegime)
-        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + confirmationBoost
+        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + confirmationBoost
         val score = raw.coerceIn(-10.0, 10.0)
         // Directional confirmation is deliberately conservative: a high raw score is
         // not enough when trend, momentum and higher-timeframe structure disagree.
@@ -634,6 +655,7 @@ object AnalyticsEngine {
             "Пробойный импульс: %.2f; объёмный импульс: %.2f; режим волатильности: %.2f%%.".format(Locale.US, breakout, volumeImpulse, volatilityPct),
             "Walk-forward edge по горизонтам: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п.; слабые и конфликтные направления отсекаются.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0),
             "Новая перекрёстная проверка: качество тренда %.2f; цена+объём %.2f; дивергенция RSI %.2f; сила подтверждения %.0f%%.".format(Locale.US, trendQuality, volumePrice, divergence, confirmationStrength * 100.0),
+            "Price Action Engine: сила тела %.2f; эффективность диапазона %.2f; расширение диапазона %.2f; аномалия объёма %.2f.".format(Locale.US, bodyStrength, rangeEfficiency, rangeExpansion, volumeAnomaly),
             "Ключевые уровни: поддержка %.2f / %.2f; сопротивление %.2f / %.2f.".format(Locale.US, support1, support2, resistance1, resistance2),
             "Расширенный теханализ: CCI %.1f; Williams %%R %.1f; MFI %.1f; CMF %.2f; Ichimoku %.2f; Donchian %.2f; Stoch RSI %.2f.".format(Locale.US, cciV, williamsV, mfiV, cmfV, ichimoku, donchian, stochRsi),
             "Вероятность направления: %.0f%%; edge %.0f%%, gap %.1f п.п., ADX %.1f, R/R %.2f, подтверждение %d/5.".format(Locale.US, calibratedProbability, selectedEdge * 100.0, edgeGap * 100.0, adxV, rr, confirmation)

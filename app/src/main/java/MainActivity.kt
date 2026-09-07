@@ -3,6 +3,8 @@ package com.marketforecast.prox
 import android.Manifest
 import android.content.Context
 import android.graphics.Paint
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -48,6 +50,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -129,6 +132,9 @@ fun MarketForecastApp(ctx: Context) {
     var history by remember { mutableStateOf(loadHistory(prefs)) }
     var historyTab by remember { mutableStateOf("TRACKING") }
     var newsDetailUrl by remember { mutableStateOf<String?>(null) }
+    var screenshotForecast by remember { mutableStateOf<ScreenshotForecast?>(null) }
+    var screenshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var screenshotHorizon by remember { mutableIntStateOf(15) }
     val launchIntent = (ctx as? android.app.Activity)?.intent
     // A normal launcher start must always land on HOME. Deep-link navigation is
     // reserved for an actual notification tap; this prevents Android from reopening
@@ -417,6 +423,23 @@ fun MarketForecastApp(ctx: Context) {
         }
     }
 
+    val screenshotPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            scope.launch(Dispatchers.Default) {
+                val bmp = runCatching { ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } }.getOrNull()
+                val scaled = bmp?.let {
+                    val maxSide = 1400
+                    if (max(it.width, it.height) > maxSide) {
+                        val ratio = maxSide.toFloat() / max(it.width, it.height).toFloat()
+                        Bitmap.createScaledBitmap(it, (it.width * ratio).roundToInt(), (it.height * ratio).roundToInt(), true)
+                    } else it
+                }
+                val result = scaled?.let { ScreenshotForecastEngine.analyze(it, screenshotHorizon) }
+                withContext(Dispatchers.Main) { screenshotBitmap = scaled; screenshotForecast = result }
+            }
+        }
+    }
+
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         notifications = ok; prefs.edit().putBoolean("notifications_enabled", ok).apply()
         if (ok) { createNotificationChannel(ctx); showPopupPermissionPrompt = !prefs.getBoolean("popup_prompt_done", false); schedule(); runMonitorNow(); sendTestNotification(ctx, ru) }
@@ -490,7 +513,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.HISTORY -> History(history, tracked, ru, repo, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick) { row -> load(row.result.symbol, row.timeframe) }
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow)
-                        Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
+                        Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs, screenshotHorizon, { screenshotHorizon = it; screenshotForecast = screenshotForecast?.copy(horizonSeconds = it) }, { screenshotPicker.launch("image/*") }, screenshotForecast, screenshotBitmap)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
                         Screen.DIVIDENDS -> DividendScreen(ru, repo, refreshTick) { screen = Screen.HOME }
@@ -814,11 +837,12 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
 @Composable private fun FavoriteChip(sym: String, repo: MarketRepository, onOpen: () -> Unit) { var p by remember(sym) { mutableStateOf<Double?>(null) }; LaunchedEffect(sym) { p = withContext(Dispatchers.IO) { repo.quote(sym) } }; GradientCard(Modifier.width(150.dp).clickable(onClick = onOpen)) { Text(sym.removeSuffix(".ME"), fontWeight = FontWeight.Black); Text(if (p != null) fmt(p!!) else "—", fontSize = 17.sp, color = Accent, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 4.dp)); Text("Открыть прогноз →", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
 @Composable private fun MarketCard(state: MarketState, ru: Boolean, onOpen: () -> Unit) { GradientCard(Modifier.fillMaxWidth().clickable(onClick = onOpen)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Column { Text(state.meta.shortName.ifBlank { state.symbol }, fontWeight = FontWeight.Black); Text(state.symbol, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) fmt(state.livePrice) else "—", fontSize = 27.sp, fontWeight = FontWeight.Black, color = Accent) }; state.forecast?.let { SignalPill(it.signal, signalColor(it.signal)) } }; state.forecast?.let { Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) { StatBlock(if (ru) "Уверенность" else "Confidence", "${it.confidence}%", Accent); StatBlock("Score", "%.1f".format(Locale.US, it.score), Blue); StatBlock("R/R", "%.2f".format(Locale.US, it.rr), Warning); StatBlock(if (ru) "Режим" else "Regime", it.regime, Positive) } } } }
 
-@Composable private fun Analysis(state: MarketState, ru: Boolean, tf: String, favorite: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, onTf: (String) -> Unit, refresh: () -> Unit, track: () -> Boolean, tracked: List<TrackedForecast>, prefs: android.content.SharedPreferences) {
+@Composable private fun Analysis(state: MarketState, ru: Boolean, tf: String, favorite: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, onTf: (String) -> Unit, refresh: () -> Unit, track: () -> Boolean, tracked: List<TrackedForecast>, prefs: android.content.SharedPreferences, screenshotHorizon: Int, onScreenshotHorizon: (Int) -> Unit, onPickScreenshot: () -> Unit, screenshot: ScreenshotForecast?, screenshotBitmap: Bitmap?) {
     var tab by remember { mutableStateOf("FORECAST") }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(11.dp), contentPadding = PaddingValues(bottom = 30.dp)) {
         item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 22.sp, fontWeight = FontWeight.Black); Text("${state.symbol} • ${state.meta.currency}", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) fmt(state.livePrice) else "—", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Accent) }; IconButton({ save(if (favorite) favs - state.symbol else favs + state.symbol) }) { Icon(if (favorite) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }; IconButton(refresh) { Icon(Icons.Default.Refresh, null, tint = Accent) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("OVERVIEW", "FORECAST", "FINANCE").forEach { FilterChip(selected = tab == it, onClick = { tab = it }, label = { Text(if (ru) when (it) { "OVERVIEW" -> "Обзор"; "FORECAST" -> "Прогноз"; else -> "Финансы" } else it, fontSize = 8.sp) }) } } }
+        item { ScreenshotForecastCard(ru, screenshotHorizon, onScreenshotHorizon, onPickScreenshot, screenshot, screenshotBitmap) }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("15M", "1H", "4H", "1D", "1W").forEach { FilterChip(selected = tf == it, onClick = { onTf(it) }, label = { Text(it, fontSize = 9.sp) }) } } }
         if (state.loading) item { Loading(ru) } else if (state.forecast != null) {
             val f = state.forecast
@@ -1112,6 +1136,42 @@ private fun mergeRealtimeCandle(candles: List<Candle>, live: Double, timeframe: 
         Text("${if (ru) "Адаптивный режим" else "Adaptive regime"}: ${f.regime} • Edge ${String.format(Locale.US, "%.0f", f.historicalEdge * 100)}% • Gap ${String.format(Locale.US, "%.1f", f.edgeGap * 100)} п.п. • Confirm ${f.confirmation}/5", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = if (f.highConviction) Positive else Warning, modifier = Modifier.padding(top = 5.dp)) } }
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
 @Composable private fun TrackedForSymbol(tracked: List<TrackedForecast>, symbol: String, ru: Boolean) { val items = tracked.filter { it.symbol == symbol }.take(6); if (items.isEmpty()) return; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Отслеживание" else "Monitoring", "${items.size} • ${if (ru) "без дублей по TF" else "unique by timeframe"}"); items.forEach { t -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("${t.signal} • ${t.timeframe}", fontWeight = FontWeight.Bold, fontSize = 10.sp); Text("Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(t.result, fontWeight = FontWeight.Black, fontSize = 9.sp, color = when(t.result){"PENDING"->Warning;"FLAT"->Warning;"FAIL"->Negative;else->Positive}) } } } }
+
+@Composable private fun ScreenshotForecastCard(ru: Boolean, horizon: Int, setHorizon: (Int) -> Unit, pick: () -> Unit, result: ScreenshotForecast?, bitmap: Bitmap?) {
+    GradientCard(Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.PhotoCamera, null, tint = Accent, modifier = Modifier.size(24.dp))
+            Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                Text(if (ru) "Прогноз по скриншоту графика" else "Chart screenshot forecast", fontWeight = FontWeight.Black, fontSize = 13.sp)
+                Text(if (ru) "Загрузите свечной график — визуальный движок проверит тренд, импульс и качество изображения." else "Upload a candlestick chart — the visual engine checks trend, momentum and image quality.", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Spacer(Modifier.height(9.dp))
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            listOf(5, 10, 15, 30, 60, 120, 300).forEach { sec ->
+                FilterChip(selected = horizon == sec, onClick = { setHorizon(sec) }, label = { Text(if (sec < 60) "${sec}с" else "${sec / 60}м", fontSize = 8.sp) })
+            }
+        }
+        Button(onClick = pick, modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(46.dp), shape = RoundedCornerShape(15.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
+            Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(7.dp)); Text(if (ru) "Загрузить скриншот" else "Upload screenshot", fontWeight = FontWeight.Black)
+        }
+        if (bitmap != null) {
+            Spacer(Modifier.height(8.dp))
+            Image(bitmap.asImageBitmap(), null, Modifier.fillMaxWidth().heightIn(max = 220.dp).clip(RoundedCornerShape(13.dp)), contentScale = ContentScale.Fit)
+        }
+        result?.let { r ->
+            Spacer(Modifier.height(9.dp))
+            val c = when (r.direction) { "LONG" -> Positive; "SHORT" -> Negative; else -> Warning }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                MetricCard(if (ru) "Сигнал" else "Signal", r.direction, c, Modifier.weight(1f))
+                MetricCard(if (ru) "Горизонт" else "Horizon", if (r.horizonSeconds < 60) "${r.horizonSeconds}с" else "${r.horizonSeconds / 60}м", Accent, Modifier.weight(1f))
+                MetricCard(if (ru) "Уверенность" else "Confidence", "${r.confidence}%", Warning, Modifier.weight(1f))
+            }
+            Text(if (ru) "Качество анализа: ${r.quality}/100" else "Analysis quality: ${r.quality}/100", fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+            r.explanation.forEach { Text("• $it", fontSize = 9.sp, modifier = Modifier.padding(top = 4.dp)) }
+        }
+    }
+}
 
 @Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
     val ctx = LocalContext.current
