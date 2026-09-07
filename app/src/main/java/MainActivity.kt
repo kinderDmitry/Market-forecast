@@ -655,6 +655,13 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
 
 private fun formatPrice(price: Double): String = fmt(price)
 
+private fun formatHorizon(seconds: Long, ru: Boolean): String = when {
+    seconds < 60L -> if (ru) "$seconds сек" else "$seconds sec"
+    seconds < 3600L -> { val m = seconds / 60L; if (ru) "$m мин" else "$m min" }
+    seconds < 86400L -> { val h = seconds / 3600L; if (ru) "$h ч" else "$h h" }
+    else -> { val d = seconds / 86400L; if (ru) "$d дн" else "$d d" }
+}
+
 private data class FavoriteTfResult(val forecast: Forecast?, val candles: List<Candle>)
 
 @Composable
