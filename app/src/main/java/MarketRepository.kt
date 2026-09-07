@@ -41,9 +41,9 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         // cache prevents repeated timeframe switches/scans from hammering the same provider.
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
+        private val quoteLocks = ConcurrentHashMap<String, Any>()
         private const val CANDLE_CACHE_MS = 120_000L
-        private const val QUOTE_CACHE_MS = 3_000L
-        private const val MAX_INTRATICK_JUMP_PCT = 0.025
+        private const val QUOTE_CACHE_MS = 8_000L
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -51,7 +51,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
     }
-    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
+    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.50"
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -61,20 +61,28 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
             return cached.second
         }
         val moex = clean.removeSuffix(".ME")
-        // 4H is a derived timeframe: providers supply source 1H candles, then we aggregate
-        // exactly four contiguous candles without crossing a large market-session gap.
+        // SOURCE INTEGRITY: a MOEX instrument must never mix MOEX history with a
+        // Yahoo/other-provider history. Mixing feeds is a direct cause of apparent
+        // price jumps and of forecasts whose reference price differs from the quote.
+        // MOEX is therefore authoritative for Russian exchange instruments.
         val providerInterval = if (interval == "4h") "1h" else interval
-        // 15m is taken from Yahoo first because MOEX candle intervals are not a true 15-minute series.
-        if (providerInterval != "15m" && isLikelyMoex(clean)) runCatching { loadMoex(moex, providerInterval) }.getOrNull()?.let { raw ->
-            val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
+        if (isLikelyMoex(clean)) {
+            val raw = if (providerInterval == "15m") {
+                val oneMinute = runCatching { loadMoex(moex, "1m") }.getOrNull().orEmpty()
+                aggregateMinutes(oneMinute, 15)
+            } else {
+                runCatching { loadMoex(moex, providerInterval) }.getOrNull().orEmpty()
+            }
+            val normalized = normalizeInterval(raw, interval)
+            if (normalized.isNotEmpty()) {
+                candleCache[cacheKey] = System.currentTimeMillis() to normalized
+                return normalized
+            }
+            throw IllegalStateException("MOEX не вернул свечи для $symbol ($interval)")
         }
         runCatching { loadYahoo(clean, range, providerInterval) }.getOrNull()?.let { raw ->
             val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
         }
-        // Never relabel MOEX 10-minute candles as 15-minute candles. If Yahoo
-        // cannot supply a real 15m series, fail this timeframe rather than feeding
-        // analytics with a mislabeled interval. A wrong timeframe is worse than
-        // temporarily having no intraday forecast.
         if (!interval.contains("m") && !interval.contains("h")) {
             runCatching { loadStooq(clean, range) }.getOrNull()?.let { raw ->
                 val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
@@ -325,48 +333,41 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
 
     fun quote(symbol: String): Double? {
         val clean = symbol.trim().uppercase(Locale.US)
-        val cached = quoteCache[clean]
-        if (cached != null && System.currentTimeMillis() - cached.first <= QUOTE_CACHE_MS && cached.second > 0.0) return cached.second
-        val moex = clean.removeSuffix(".ME")
-        // Canonical source rule: Russian exchange instruments stay on MOEX for both
-        // candles and spot. Global stocks/FX use the automatic public quote feed.
-        // No MT5 terminal, IP, server, login or manual network configuration is required.
-        val value = when {
-            isLikelyMoex(clean) -> {
-                // Russian exchange instruments: ONLY MOEX is accepted for the canonical
-                // quote. Falling back to Yahoo here can mix currencies/sessions and is
-                // exactly the kind of source mismatch that can make a stock appear to
-                // jump unexpectedly. If MOEX is unavailable, return no quote rather than
-                // presenting a different provider as if it were the exchange price.
-                runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it > 0.0 }
+        val lock = quoteLocks.computeIfAbsent(clean) { Any() }
+        synchronized(lock) {
+            val now0 = System.currentTimeMillis()
+            val cached = quoteCache[clean]
+            if (cached != null && now0 - cached.first <= QUOTE_CACHE_MS && cached.second.isFinite() && cached.second > 0.0) {
+                return cached.second
             }
-            clean.endsWith("=X") -> {
-                // FX spot: use Alfa-Forex's public real-time quote page first.
-                // No account, MT5 terminal, IP, port or user configuration is needed.
-                runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it > 0.0 }
-                    ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it > 0.0 }
+
+            val moex = clean.removeSuffix(".ME")
+            // Canonical source rule: Russian exchange instruments stay on MOEX for both
+            // candles and spot. Global stocks/FX use the automatic public quote feed.
+            // A per-symbol lock prevents concurrent requests from completing out of order
+            // and overwriting a newer quote with an older network response.
+            val value = when {
+                isLikelyMoex(clean) -> {
+                    runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                }
+                clean.endsWith("=X") -> {
+                    runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                        ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                }
+                else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
             }
-            else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it > 0.0 }
+
+            if (value != null) {
+                val now = System.currentTimeMillis()
+                // This is a short-lived canonical snapshot, not price smoothing. Every
+                // timeframe, forecast card, scanner row and favorite card therefore sees
+                // exactly the same quote during one UI refresh window. Real market moves are
+                // never artificially clamped or replaced by an old price.
+                quoteCache[clean] = now to value
+                return value
+            }
+            return cached?.second?.takeIf { it.isFinite() && it > 0.0 }
         }
-        if (value != null) {
-            val now = System.currentTimeMillis()
-            val prev = quoteCache[clean]
-            // Protect the UI/analytics from provider glitches that suddenly jump several
-            // percent within a few seconds. A genuine session/opening gap is not filtered
-            // because the guard only applies to a very recent cached quote.
-            val guarded = if (prev != null && now - prev.first <= 20_000L && prev.second > 0.0) {
-                val jump = abs(value - prev.second) / prev.second
-                if (jump > MAX_INTRATICK_JUMP_PCT) {
-                    // A quote that changes >2.5% inside the same 20-second cache window is
-                    // treated as a provider glitch unless the historical path validates it.
-                    // Never invent a replacement price: keep the last validated quote.
-                    prev.second
-                } else value
-            } else value
-            quoteCache[clean] = now to guarded
-            return guarded
-        }
-        return null
     }
 
     fun instrumentMeta(symbol: String): InstrumentMeta {
@@ -405,6 +406,29 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
 
     fun bcsDividendCalendarUrl(): String = BCS_DIVIDEND_CALENDAR_URL
 
+    private fun aggregateMinutes(candles: List<Candle>, minutes: Int): List<Candle> {
+        if (candles.isEmpty()) return emptyList()
+        val step = minutes * 60_000L
+        val out = mutableListOf<Candle>()
+        var bucketStart = Long.MIN_VALUE
+        var group = mutableListOf<Candle>()
+        fun flush() {
+            if (group.isNotEmpty()) {
+                val first = group.first(); val last = group.last()
+                out += Candle(bucketStart, first.open, group.maxOf { it.high }, group.minOf { it.low }, last.close, group.sumOf { it.volume })
+            }
+            group = mutableListOf()
+        }
+        for (c in candles.sortedBy { it.time }) {
+            val b = (c.time / step) * step
+            if (bucketStart != Long.MIN_VALUE && b != bucketStart) flush()
+            if (bucketStart != b) bucketStart = b
+            group += c
+        }
+        flush()
+        return out
+    }
+
     private fun normalizeInterval(candles: List<Candle>, interval: String): List<Candle> {
         val sorted = candles.sortedBy { it.time }
         if (interval != "4h" || sorted.size < 4) return sorted
@@ -422,8 +446,8 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
     private fun isLikelyMoex(symbol: String): Boolean = symbol.endsWith(".ME") || symbol in setOf("SBER","GAZP","LKOH","NVTK","TATN","TATNP","MGNT","MOEX","ROSN","PHOR","MTSS","IRAO","TRMK","GMKN","NLMK","HYDR","CHMF","PLZL","ALRS","SNGS","SNGSP","RTKM","VTBR","AFLT","PIKK","RUAL","OZON","YDEX","HEAD")
 
     private fun loadMoex(secid: String, interval: String): List<Candle> {
-        val moexInterval = when (interval) { "15m" -> 10; "1h" -> 60; "1wk" -> 7; else -> 24 }
-        val days = if (interval == "15m") 60 else 3650
+        val moexInterval = when (interval) { "1m" -> 1; "1h" -> 60; "1wk" -> 7; else -> 24 }
+        val days = if (interval == "1m") 10 else 3650
         val from = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(System.currentTimeMillis() - days * 86400000L))
         val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/${enc(secid)}/candles.json?interval=$moexInterval&from=$from&iss.meta=off"
         val root = JSONObject(getText(url, 12000)); val candles = root.optJSONObject("candles") ?: return emptyList()
@@ -514,7 +538,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it })
         val row = data.optJSONArray(0) ?: return null
         fun d(name: String) = row.optDouble(idx[name] ?: -1, Double.NaN)
-        return listOf(d("LAST"), d("LCURRENTPRICE"), d("PREVPRICE")).firstOrNull { it.isFinite() && it > 0 }
+        return d("LAST").takeIf { it.isFinite() && it > 0 }
     }
 
     private fun mentionsInstrument(n: NewsItem, q: String): Boolean {

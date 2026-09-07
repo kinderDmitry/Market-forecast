@@ -201,8 +201,8 @@ fun MarketForecastApp(ctx: Context) {
             val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; else -> "5y" to "1d" }
             val candlesRaw = withContext(Dispatchers.IO) { runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) }
             val meta = withContext(Dispatchers.IO) { repo.instrumentMeta(selected) }
-            val quoted = canonicalQuotes[selected] ?: withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
-            val live = validateLiveQuote(candlesRaw, reconcileLivePrice(selected, candlesRaw, quoted))
+            val quoted = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
+            val live = reconcileLivePrice(selected, candlesRaw, quoted)
             if (live > 0.0 && live.isFinite()) canonicalQuotes[selected] = live
             // The realtime candle is part of the exact dataset used by the forecast.
             // Entry/levels use the same canonical live price across timeframes.
@@ -315,7 +315,7 @@ fun MarketForecastApp(ctx: Context) {
                 val live = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
                 if (live != null && live > 0.0 && live.isFinite()) {
                     canonicalQuotes[selected] = live
-                    val reconciled = validateLiveQuote(state.candles, reconcileLivePrice(selected, state.candles, live))
+                    val reconciled = reconcileLivePrice(selected, state.candles, live)
                     val merged = mergeRealtimeCandle(state.candles, reconciled, tf, now, selected)
                     val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled) }.getOrNull() } else state.forecast
                     state = state.copy(candles = merged, forecast = refreshed, livePrice = reconciled, updated = now)
@@ -336,7 +336,7 @@ fun MarketForecastApp(ctx: Context) {
                             runCatching { repo.load(item.symbol, pair.first, pair.second) }.getOrDefault(cached ?: emptyList()).also { trackingCandleCache[key] = it }
                         } else cached
                         val lp = runCatching { repo.quote(item.symbol) }.getOrNull()
-                        val reconciled = validateLiveQuote(cs, reconcileLivePrice(item.symbol, cs, lp))
+                        val reconciled = reconcileLivePrice(item.symbol, cs, lp)
                         val ev = TrackingEngine.evaluate(item, cs, reconciled, now)
                         if (ev == null) item to null else item.copy(
                             lastLivePrice = ev.price, lastUpdated = now,

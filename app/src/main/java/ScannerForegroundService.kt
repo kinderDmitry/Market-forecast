@@ -90,7 +90,7 @@ class ScannerForegroundService : Service() {
                                             val candles = repo.load(symbol, pair.first, pair.second)
                                             if (candles.size < 30) null else {
                                                 val rawQuote = repo.quote(symbol)
-                                                val live = validateLiveQuote(candles, reconcileLivePrice(symbol, candles, rawQuote))
+                                                val live = reconcileLivePrice(symbol, candles, rawQuote)
                                                 val merged = mergeRealtimeCandle(candles, live, currentTf, System.currentTimeMillis(), symbol)
                                                 val f = AnalyticsEngine.analyze(merged, live)
                                                 if (f.signal == "NO TRADE") null else {
