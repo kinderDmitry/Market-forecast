@@ -1,4 +1,4 @@
-name: Build MarketForecast PROX 4.8.51 APK
+name: Build MarketForecast PROX 4.8.52 APK
 
 on:
   workflow_dispatch:
@@ -131,17 +131,18 @@ jobs:
           check_file TZ_MASTER_RU.md
           check_file signing/mfp-debug.keystore
           check_absent app/src/main/java/DividendUpdateWorker.kt
+          check_absent app/src/main/java/ScreenshotForecastEngine.kt
           check_file app/src/main/java/NotificationHelper.kt
           check_grep 'android:icon="@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml
           check_grep 'import kotlin.math.abs' app/src/main/java/TrackingEngine.kt
           check_grep 'val monitorMinConf = p.getInt("alert_min_confidence", 60)' app/src/main/java/MarketMonitorWorker.kt
-          check_grep 'versionCode = 93' app/build.gradle.kts
-          check_grep 'versionName = "4.8.51"' app/build.gradle.kts
+          check_grep 'versionCode = 94' app/build.gradle.kts
+          check_grep 'versionName = "4.8.52"' app/build.gradle.kts
           check_no_grep 'interval == "15m".*loadMoex(moex, "15m")' app/src/main/java/MarketRepository.kt
           check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.tp2?.toString() ?: "105")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.stop?.toString() ?: "98")' app/src/main/java/MainActivity.kt
-          check_grep 'ONLY MOEX is accepted for the canonical' app/src/main/java/MarketRepository.kt
+          check_grep 'Forecast integrity rule: when BCS is configured' app/src/main/java/MarketRepository.kt
           check_grep 'detectPatterns' app/src/main/java/AnalyticsEngine.kt
           echo 'Documentation/terminology verification: skipped; user-facing branding is intentionally Market Forecast.'
           echo 'Project verification: OK'
@@ -154,7 +155,7 @@ jobs:
       - name: Rename APK
         run: |
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.51.apk
+          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.52.apk
 
       # GitHub Actions artifact storage can be exhausted independently of the
       # repository. Do NOT publish the APK as a workflow artifact here. Publish the APK as a GitHub
@@ -165,8 +166,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.51 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.51.apk \
+          TITLE="MarketForecast PROX 4.8.52 build ${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" release/MarketForecast_PROX_4.8.52.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.51. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.52. Commit: ${GITHUB_SHA}"
