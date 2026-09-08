@@ -18,7 +18,7 @@
 - Проверены паритет скобок в Kotlin-файлах.
 - Проверено отсутствие runtime-вызовов MOEX/Yahoo/Stooq/Alpha Vantage в `MarketRepository` для market-data.
 - Проверен Gradle-конфиг: `versionCode=95`, `versionName=4.8.53`.
-- Полную Android Gradle сборку в текущем sandbox выполнить невозможно: в окружении отсутствуют Android SDK/Gradle wrapper, а внешняя сеть недоступна. Финальная проверка `:app:assembleDebug` должна выполняться GitHub Actions из архива.
+- Полную Android Gradle сборку в текущем sandbox выполнить невозможно: в окружении отсутствуют Android SDK/Gradle wrapper. GitHub Actions использует Gradle 8.11.1 и Android SDK 36; перед публикацией APK сборка должна пройти без ошибок.
 
 ## Важное ограничение
 БКС API требует действующий refresh-token. Без него приложение намеренно не переключается на другой источник и показывает, что БКС не подключён.
