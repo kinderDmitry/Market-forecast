@@ -20,7 +20,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
         // normal periodic schedule when it finishes.
         if (p.getBoolean("scanner_priority_active", false)) return@withContext Result.success()
         val ru = p.getBoolean("ru", true)
-        val repo = MarketRepository()
+        val repo = MarketRepository(bcsRefreshToken = applicationContext.getSharedPreferences("mfprefs", android.content.Context.MODE_PRIVATE).getString("bcs_refresh_token", "")?.ifBlank { null })
         val tracked = readTracked(p).toMutableList()
         val history = readHistory(p).toMutableList()
         val now = System.currentTimeMillis()

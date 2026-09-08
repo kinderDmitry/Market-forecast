@@ -56,7 +56,7 @@ class ScannerForegroundService : Service() {
         try {
             while (currentCoroutineContext().isActive && running.get()) {
                 prefs.edit().putString("scanner_status", "Подготовка полного сканирования…").putFloat("scanner_progress", 0f).apply()
-                val repo = MarketRepository()
+                val repo = MarketRepository(bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null })
                 val symbols = withContext(Dispatchers.IO) { resolveSymbols(repo, scopeMode, type) }
                 val tfs = if (tf == "ANY") listOf("15M", "1H", "4H", "1D", "1W") else listOf(tf)
                 // Do not materialize one Deferred per instrument/timeframe: a full-market

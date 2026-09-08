@@ -15,6 +15,7 @@ import android.util.Xml
 import org.xmlpull.v1.XmlPullParser
 import java.io.StringReader
 import kotlin.math.abs
+import kotlin.math.ceil
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
@@ -35,7 +36,7 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
 }
 
 /** Market-data repository. Market news/dividends are restricted to Russian financial sources; prices may use market-data fallbacks. */
-class MarketRepository(private val alphaVantageKey: String? = null) {
+class MarketRepository(private val alphaVantageKey: String? = null, private val bcsRefreshToken: String? = null) {
     companion object {
         const val BCS_DIVIDEND_CALENDAR_URL = "https://bcs-express.ru/dividednyj-kalendar"
         // Historical candles change slowly compared with live quotes. A short process-wide
@@ -43,7 +44,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
-        private const val QUOTE_CACHE_MS = 1_000L
+        private const val QUOTE_CACHE_MS = 500L
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -61,6 +62,18 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
             return cached.second
         }
         val moex = clean.removeSuffix(".ME")
+        // BCS is the optional canonical broker feed. When configured, both live
+        // quotes and historical candles come from the same feed, preventing
+        // cross-provider/timeframe price drift.
+        if (!bcsRefreshToken.isNullOrBlank() && bcsSupported(clean)) {
+            runCatching { loadBcs(clean, range, interval) }.getOrNull()?.let { raw ->
+                val normalized = normalizeInterval(raw, interval)
+                if (normalized.isNotEmpty()) {
+                    candleCache[cacheKey] = System.currentTimeMillis() to normalized
+                    return normalized
+                }
+            }
+        }
         // SOURCE INTEGRITY: a MOEX instrument must never mix MOEX history with a
         // Yahoo/other-provider history. Mixing feeds is a direct cause of apparent
         // price jumps and of forecasts whose reference price differs from the quote.
@@ -342,6 +355,13 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         }
         val moex = clean.removeSuffix(".ME")
         val value = when {
+            !bcsRefreshToken.isNullOrBlank() && bcsSupported(clean) -> runCatching { quoteBcs(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                ?: when {
+                    isLikelyMoex(clean) -> runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                    clean.endsWith("=X") -> runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                        ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                    else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                }
             isLikelyMoex(clean) -> runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
             clean.endsWith("=X") -> runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
                 ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
@@ -423,6 +443,116 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         }
         return out
     }
+
+    private fun bcsSupported(symbol: String): Boolean = isLikelyMoex(symbol) || bcsFx(symbol) != null
+
+    private fun bcsInstrument(symbol: String): Pair<String, String> {
+        val clean = symbol.uppercase(Locale.US).removeSuffix(".ME")
+        val fx = bcsFx(symbol)
+        return if (fx != null) fx to "CETS" else clean to "TQBR"
+    }
+
+    private fun bcsFx(symbol: String): String? = when (symbol.uppercase(Locale.US)) {
+        "USDRUB=X", "USD/RUB", "USDRUB" -> "USD000UTSTOM"
+        "EURRUB=X", "EUR/RUB", "EURRUB" -> "EUR_RUB__TOM"
+        "CNYRUB=X", "CNY/RUB", "CNYRUB" -> "CNYRUB_TOM"
+        else -> null
+    }
+
+    @Volatile private var bcsAccessToken: String? = null
+    @Volatile private var bcsAccessExpiresAt: Long = 0L
+    @Volatile private var bcsAccessRefreshFingerprint: Int = 0
+
+    private fun bcsAccessToken(): String? {
+        val refresh = bcsRefreshToken?.trim().orEmpty()
+        if (refresh.isBlank()) return null
+        val now = System.currentTimeMillis()
+        val fingerprint = refresh.hashCode()
+        val cached = bcsAccessToken
+        if (bcsAccessRefreshFingerprint == fingerprint && !cached.isNullOrBlank() && now < bcsAccessExpiresAt - 60_000L) return cached
+        val body = "client_id=trade-api-read&refresh_token=${enc(refresh)}&grant_type=refresh_token"
+        val text = postForm("https://be.broker.ru/trade-api-keycloak/realms/tradeapi/protocol/openid-connect/token", body, 12000)
+        val json = JSONObject(text)
+        val token = json.optString("access_token").takeIf { it.isNotBlank() } ?: return null
+        bcsAccessToken = token
+        bcsAccessRefreshFingerprint = fingerprint
+        bcsAccessExpiresAt = now + json.optLong("expires_in", 86400L) * 1000L
+        return token
+    }
+
+    private fun bcsHeaders(): Map<String,String> = mapOf("Authorization" to "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось получить access token")}", "Accept" to "application/json")
+
+    private fun loadBcs(symbol: String, range: String, interval: String): List<Candle> {
+        val (ticker, classCode) = bcsInstrument(symbol)
+        val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W1"; else -> "D1" }
+        val days = when (range) { "60d" -> 60; "2y" -> 730; "10y" -> 3650; else -> 3650 }
+        val end = System.currentTimeMillis()
+        val start = end - days * 86_400_000L
+        // BCS limits a single candle response to 1440 bars. Keep requests bounded.
+        val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D1" -> 1440; else -> 10080 }
+        val chunks = maxOf(1, ((days * 1440.0) / maxSpan / 1440.0).ceil().toInt())
+        val out = mutableListOf<Candle>()
+        val chunkMs = maxOf(86_400_000L, (1440L * maxSpan) * 60_000L)
+        var cursor = start
+        while (cursor < end && out.size < 5000) {
+            val chunkEnd = minOf(end, cursor + chunkMs)
+            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(classCode)}&timeFrame=$tf&startDate=${enc(isoUtc(cursor))}&endDate=${enc(isoUtc(chunkEnd))}"
+            val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
+            out += parseBcsCandles(root)
+            cursor = chunkEnd + 1000L
+        }
+        return out.distinctBy { it.time }.sortedBy { it.time }.takeLast(5000)
+    }
+
+    private fun parseBcsCandles(root: JSONObject): List<Candle> {
+        val arrays = mutableListOf<JSONArray>()
+        fun walk(v: Any?) {
+            when (v) {
+                is JSONObject -> v.keys().forEach { k -> walk(v.opt(k)) }
+                is JSONArray -> { arrays += v; for (i in 0 until v.length()) walk(v.opt(i)) }
+            }
+        }
+        walk(root)
+        val arr = arrays.sortedByDescending { it.length() }.firstOrNull() ?: return emptyList()
+        val out = mutableListOf<Candle>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val open = num(o, "open", "Open"); val high = num(o, "high", "High"); val low = num(o, "low", "Low"); val close = num(o, "close", "Close")
+            if (open == null || high == null || low == null || close == null) continue
+            val time = dateValue(o, "time", "dateTime", "begin", "timestamp") ?: continue
+            val volume = num(o, "volume", "Volume", "value") ?: 0.0
+            out += Candle(time, open, high, low, close, volume)
+        }
+        return out
+    }
+
+    private fun quoteBcs(symbol: String): Double? {
+        val (ticker, classCode) = bcsInstrument(symbol)
+        val body = "{\"instruments\":[{\"ticker\":\"${ticker.replace("\"", "") }\",\"classCode\":\"${classCode}\"}]}"
+        val root = JSONObject(postJson("https://be.broker.ru/trade-api-market-data-connector/api/v1/quotes", body, 10000, bcsHeaders()))
+        val candidates = mutableListOf<Double>()
+        fun walk(v: Any?, key: String = "") {
+            when (v) {
+                is JSONObject -> v.keys().forEach { k -> walk(v.opt(k), k.lowercase(Locale.US)) }
+                is JSONArray -> for (i in 0 until v.length()) walk(v.opt(i), key)
+                is Number -> if (key in setOf("last","lastprice","last_price","price","currentprice","current_price")) candidates += v.toDouble()
+            }
+        }
+        walk(root)
+        return candidates.firstOrNull { it.isFinite() && it > 0.0 }
+    }
+
+    private fun num(o: JSONObject, vararg names: String): Double? = names.firstNotNullOfOrNull { n -> if (o.has(n) && !o.isNull(n)) o.optDouble(n, Double.NaN).takeIf { it.isFinite() } else null }
+    private fun dateValue(o: JSONObject, vararg names: String): Long? {
+        for (n in names) if (o.has(n) && !o.isNull(n)) {
+            val v = o.opt(n)
+            if (v is Number) return if (v.toLong() < 10_000_000_000L) v.toLong() * 1000L else v.toLong()
+            val s = v.toString()
+            runCatching { java.time.Instant.parse(s).toEpochMilli() }.getOrNull()?.let { return it }
+        }
+        return null
+    }
+    private fun isoUtc(ms: Long): String = java.time.Instant.ofEpochMilli(ms).toString()
 
     private fun isLikelyMoex(symbol: String): Boolean = symbol.endsWith(".ME") || symbol in setOf("SBER","GAZP","LKOH","NVTK","TATN","TATNP","MGNT","MOEX","ROSN","PHOR","MTSS","IRAO","TRMK","GMKN","NLMK","HYDR","CHMF","PLZL","ALRS","SNGS","SNGSP","RTKM","VTBR","AFLT","PIKK","RUAL","OZON","YDEX","HEAD")
 
@@ -650,5 +780,32 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
     private fun parseMoexTime(s:String):Long=runCatching{SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.US).apply{timeZone=TimeZone.getTimeZone("Europe/Moscow")}.parse(s)!!.time}.getOrDefault(System.currentTimeMillis())
     private fun parseIso(s:String):Long=runCatching{SimpleDateFormat("yyyyMMdd'T'HHmmss",Locale.US).parse(s)!!.time}.getOrDefault(0L)
     private fun enc(s:String)=URLEncoder.encode(s,"UTF-8")
+    private fun postForm(url: String, body: String, timeout: Int): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"; c.connectTimeout = timeout; c.readTimeout = timeout; c.doOutput = true
+        c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        return readResponse(c)
+    }
+    private fun postJson(url: String, body: String, timeout: Int, headers: Map<String,String>): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"; c.connectTimeout = timeout; c.readTimeout = timeout; c.doOutput = true
+        c.setRequestProperty("Content-Type", "application/json"); headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        return readResponse(c)
+    }
+    private fun getTextAuth(url: String, timeout: Int, headers: Map<String,String>): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "GET"; c.connectTimeout = timeout; c.readTimeout = timeout; headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+        return readResponse(c)
+    }
+    private fun readResponse(c: HttpURLConnection): String {
+        val code = c.responseCode
+        val stream = if (code in 200..299) c.inputStream else c.errorStream
+        val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        c.disconnect()
+        if (code !in 200..299) throw IllegalStateException("HTTP $code: ${text.take(240)}")
+        return text
+    }
     private fun getText(url:String,timeout:Int):String{val c=URL(url).openConnection() as HttpURLConnection; c.requestMethod="GET";c.connectTimeout=timeout;c.readTimeout=timeout;c.setRequestProperty("User-Agent",ua);c.setRequestProperty("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");c.setRequestProperty("Accept-Language","ru-RU,ru;q=0.9,en;q=0.5");c.setRequestProperty("Accept-Encoding","gzip");try{if(c.responseCode !in 200..299)throw IllegalStateException("HTTP ${c.responseCode}");val raw=c.inputStream;val input=if(c.contentEncoding?.contains("gzip",true)==true) GZIPInputStream(raw) else raw;return input.bufferedReader(Charsets.UTF_8).use{it.readText()}}finally{c.disconnect()}}
 }
