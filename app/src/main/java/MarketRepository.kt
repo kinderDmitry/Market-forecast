@@ -33,7 +33,7 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
     return q
 }
 
-/** Market-data repository. Market news/dividends are restricted to Russian financial sources; prices may use market-data fallbacks. */
+/** Market-data repository. BCS is the sole market-data provider; news/dividends are separate informational feeds. */
 class MarketRepository(private val alphaVantageKey: String? = null, private val bcsRefreshToken: String? = null) {
     companion object {
         const val BCS_DIVIDEND_CALENDAR_URL = "https://bcs-express.ru/dividednyj-kalendar"
@@ -42,7 +42,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
-        private const val QUOTE_CACHE_MS = 750L
+        private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -64,7 +64,6 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         // dataset, otherwise the same instrument can have different prices/levels
         // between screens and timeframes.
         if (!bcsRefreshToken.isNullOrBlank()) {
-            if (!bcsSupported(clean)) throw IllegalStateException("БКС не поддерживает инструмент $symbol для прогнозов")
             val raw = runCatching { loadBcs(clean, range, interval) }.getOrElse {
                 throw IllegalStateException("БКС: не удалось получить свечи для $symbol: ${it.message ?: "ошибка источника"}")
             }
@@ -129,21 +128,29 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         }
         val out = LinkedHashMap<String, SearchResult>()
         // BCS documents these instrument types in the Information Service.
-        val types = listOf("STOCK", "FOREIGN_STOCK", "CURRENCY", "ETF", "FUTURES", "INDICES")
+        val types = listOf(
+            "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY",
+            "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS", "BONDS"
+        )
         for (type in types) {
-            runCatching {
-                val root = JSONObject(getTextAuth(
-                    "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}",
-                    15000, bcsHeaders()
-                ))
-                val arr = root.optJSONArray("instruments") ?: return@runCatching
+            var page = 0
+            var pages = 0
+            while (pages++ < 100) {
+                val before = out.size
+                val arr = runCatching {
+                    val root = JSONObject(getTextAuth(
+                        "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
+                        15000, bcsHeaders()
+                    ))
+                    root.optJSONArray("instruments")
+                }.getOrNull() ?: break
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     val ticker = o.optString("ticker").trim()
                     if (ticker.isBlank()) continue
                     val boards = o.optJSONArray("boards")
-                    val board = boards?.optJSONObject(0)?.optString("classCode").orEmpty()
-                    val exchange = boards?.optJSONObject(0)?.optString("exchange").orEmpty().ifBlank { "BCS" }
+                    val boardObj = boards?.let { chooseBoard(it) }
+                    val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "BCS" }
                     val name = o.optString("displayName")
                         .ifBlank { o.optString("shortName") }
                         .ifBlank { o.optString("issuerName") }
@@ -152,6 +159,8 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
                     val item = SearchResult(ticker, name, exchange, typeName, "БКС")
                     out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
                 }
+                if (arr.length() < 100 || out.size == before) break
+                page++
             }
         }
         val result = out.values.toList()
@@ -333,7 +342,6 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             return cached.second
         }
         val value = if (!bcsRefreshToken.isNullOrBlank()) {
-            if (!bcsSupported(clean)) throw IllegalStateException("БКС не поддерживает инструмент $symbol для прогнозов")
             runCatching { quoteBcs(clean) }.getOrElse {
                 throw IllegalStateException("БКС: не удалось получить котировку $symbol: ${it.message ?: "ошибка источника"}")
             }?.takeIf { it.isFinite() && it > 0.0 }
@@ -349,10 +357,11 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     fun isBcsConfigured(): Boolean = !bcsRefreshToken.isNullOrBlank()
 
     fun forecastSource(symbol: String): String {
-        val clean = symbol.trim().uppercase(Locale.US)
-        return if (!isBcsConfigured()) "БКС не подключен"
-        else if (!bcsSupported(clean)) "БКС: инструмент не поддерживается"
-        else "БКС • единственный источник"
+        // Never perform a network/catalog lookup from the Compose/UI thread.
+        // A temporary BCS catalog timeout must not be rendered as
+        // "instrument unsupported". Actual support is resolved when candles/quote
+        // are requested, and the resulting error is shown in the data-status card.
+        return if (!isBcsConfigured()) "БКС не подключен" else "БКС • единственный источник"
     }
 
     fun instrumentMeta(symbol: String): InstrumentMeta {
@@ -425,7 +434,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     // Russian-equity board; the information service is still preferred whenever
     // it can provide a more specific class.
     private val bcsRuEquityTickers = setOf(
-        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT",
+        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT", "CIAN",
         "MOEX", "YDEX", "OZON", "PHOR", "MTSS", "IRAO", "GMKN", "NLMK",
         "CHMF", "ALRS", "SNGS", "SNGSP", "RTKM", "RTKMP", "VTBR", "AFLT",
         "RUAL", "PLZL", "HYDR", "ENPG", "PIKK", "MAGN", "CBOM", "AFKS",
@@ -460,7 +469,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         // as "not supported".  This is still 100% BCS data; there is no fallback
         // quote provider here.
         val info = runCatching { bcsInstrumentInfo(ticker) }.getOrNull()
-        val infoBoard = info?.optJSONArray("boards")?.optJSONObject(0)?.optString("classCode").orEmpty()
+        val infoBoard = info?.optJSONArray("boards")?.let { chooseBoard(it)?.optString("classCode").orEmpty() }.orEmpty()
         val board = infoBoard.ifBlank {
             if (ticker in bcsRuEquityTickers) "TQBR"
             else throw IllegalStateException("БКС: инструмент $ticker не найден в каталоге")
@@ -468,6 +477,21 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         val pair = ticker to board
         bcsInstrumentCache[ticker] = pair
         return pair
+    }
+
+    private fun chooseBoard(boards: JSONArray): JSONObject? {
+        if (boards.length() == 0) return null
+        val preferred = listOf("TQBR", "TQPI", "TQIF", "TQTF", "CETS", "SPB")
+        for (code in preferred) {
+            for (i in 0 until boards.length()) {
+                val o = boards.optJSONObject(i) ?: continue
+                if (o.optString("classCode").equals(code, true)) return o
+            }
+        }
+        return (0 until boards.length()).asSequence()
+            .mapNotNull { boards.optJSONObject(it) }
+            .firstOrNull { it.optString("classCode").isNotBlank() }
+            ?: boards.optJSONObject(0)
     }
 
     private fun bcsInstrumentInfo(symbol: String): JSONObject {
@@ -553,18 +577,43 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     private fun quoteBcs(symbol: String): Double? {
         val (ticker, classCode) = bcsInstrument(symbol)
-        val body = "{\"instruments\":[{\"ticker\":\"${ticker.replace("\"", "") }\",\"classCode\":\"${classCode}\"}]}"
-        val root = JSONObject(postJson("https://be.broker.ru/trade-api-market-data-connector/api/v1/quotes", body, 10000, bcsHeaders()))
-        val candidates = mutableListOf<Double>()
-        fun walk(v: Any?, key: String = "") {
+        val body = JSONObject().put(
+            "instruments", JSONArray().put(
+                JSONObject().put("ticker", ticker).put("classCode", classCode)
+            )
+        ).toString()
+        val root = JSONObject(postJson(
+            "https://be.broker.ru/trade-api-market-data-connector/api/v1/quotes",
+            body, 10000, bcsHeaders()
+        ))
+
+        // BCS defines `last` as the last executed trade. Do not walk arbitrary
+        // numeric fields: that can accidentally select bid/offer/open/close and
+        // produces the apparent price jumps that were visible in the app.
+        fun findQuoteObject(v: Any?): JSONObject? {
             when (v) {
-                is JSONObject -> v.keys().forEach { k -> walk(v.opt(k), k.lowercase(Locale.US)) }
-                is JSONArray -> for (i in 0 until v.length()) walk(v.opt(i), key)
-                is Number -> if (key in setOf("last","lastprice","last_price","price","currentprice","current_price")) candidates += v.toDouble()
+                is JSONObject -> {
+                    if (v.has("last") || v.has("bid") || v.has("offer")) return v
+                    val keys = v.keys()
+                    while (keys.hasNext()) {
+                        findQuoteObject(v.opt(keys.next()))?.let { return it }
+                    }
+                }
+                is JSONArray -> {
+                    for (i in 0 until v.length()) {
+                        findQuoteObject(v.opt(i))?.let { return it }
+                    }
+                }
             }
+            return null
         }
-        walk(root)
-        return candidates.firstOrNull { it.isFinite() && it > 0.0 }
+
+        val q = findQuoteObject(root)
+        val last = q?.optDouble("last", Double.NaN)?.takeIf { it.isFinite() && it > 0.0 }
+        if (last != null) return last
+        val lastPrice = q?.optDouble("lastPrice", Double.NaN)?.takeIf { it.isFinite() && it > 0.0 }
+        if (lastPrice != null) return lastPrice
+        return null
     }
 
     private fun num(o: JSONObject, vararg names: String): Double? = names.firstNotNullOfOrNull { n -> if (o.has(n) && !o.isNull(n)) o.optDouble(n, Double.NaN).takeIf { it.isFinite() } else null }
