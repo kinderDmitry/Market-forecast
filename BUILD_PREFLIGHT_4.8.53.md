@@ -1,4 +1,4 @@
-# Market Forecast PRO X 4.8.53 — BCS ONLY preflight
+# Market Forecast PRO X 4.8.54 — BCS ONLY preflight
 
 ## Что изменено
 - БКС стал **единственным источником рыночных данных** для котировок, свечей, каталога инструментов, прогнозов и сканера.
@@ -17,7 +17,7 @@
 - Проверена структура ZIP и исходников.
 - Проверены паритет скобок в Kotlin-файлах.
 - Проверено отсутствие runtime-вызовов MOEX/Yahoo/Stooq/Alpha Vantage в `MarketRepository` для market-data.
-- Проверен Gradle-конфиг: `versionCode=95`, `versionName=4.8.53`.
+- Проверен Gradle-конфиг: `versionCode=96`, `versionName=4.8.54`.
 - Полную Android Gradle сборку в текущем sandbox выполнить невозможно: в окружении отсутствуют Android SDK/Gradle wrapper. GitHub Actions использует Gradle 8.11.1 и Android SDK 36; перед публикацией APK сборка должна пройти без ошибок.
 
 ## Важное ограничение
