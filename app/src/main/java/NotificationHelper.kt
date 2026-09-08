@@ -163,6 +163,9 @@ object NotificationHelper {
         return when {
             text.contains("stop") || text.contains("стоп") || text.contains("loss") -> 0xFFFF304F.toInt()
             text.contains("tp1") || text.contains("tp2") || text.contains("tp3") || text.contains("достигнут") -> 0xFF00D084.toInt()
+            text.contains("short") || text.contains("шорт") -> 0xFFFF4757.toInt()
+            text.contains("long") || text.contains("лонг") -> 0xFF00D084.toInt()
+            text.contains("no trade") || text.contains("no-trade") || text.contains("нет сделки") -> 0xFFFFA502.toInt()
             channel == CHANNEL_SYSTEM -> 0xFF0066D6.toInt()
             channel == CHANNEL_MARKET -> 0xFF00A8FF.toInt()
             else -> 0xFF0066D6.toInt()

@@ -103,5 +103,6 @@ data class MarketState(
     val timeframe: String = "1D",
     val news: List<NewsItem> = emptyList(),
     val livePrice: Double = 0.0,
-    val meta: InstrumentMeta = InstrumentMeta(symbol)
+    val meta: InstrumentMeta = InstrumentMeta(symbol),
+    val dataSource: String = ""
 )

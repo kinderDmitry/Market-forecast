@@ -7,15 +7,12 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.zip.GZIPInputStream
 import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
 import java.util.regex.Pattern
 import android.util.Xml
 import org.xmlpull.v1.XmlPullParser
 import java.io.StringReader
 import kotlin.math.abs
-import kotlin.math.ceil
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
@@ -27,8 +24,8 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
     if (q == null) return last ?: 0.0
     if (last == null) return q
 
-    // ONLY MOEX is accepted for the canonical realtime price on MOEX instruments.
-    // The quote is the single canonical "now" price. Do not substitute a previous
+    // BCS is the single canonical market-data source. The quote is the single
+    // canonical "now" price. Do not substitute a previous candle.
     // candle merely because it is far from the live quote: sessions, corporate
     // actions and stale candles can legitimately create large gaps. A valid quote
     // must remain identical for every timeframe of the same instrument.
@@ -44,7 +41,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
-        private const val QUOTE_CACHE_MS = 500L
+        private const val QUOTE_CACHE_MS = 750L
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -56,57 +53,31 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
-        val cacheKey = "$clean|$range|$interval"
+        val cacheKey = "${if (bcsRefreshToken.isNullOrBlank()) "LEGACY" else "BCS"}|$clean|$range|$interval"
         val cached = candleCache[cacheKey]
         if (cached != null && System.currentTimeMillis() - cached.first <= CANDLE_CACHE_MS && cached.second.isNotEmpty()) {
             return cached.second
         }
-        val moex = clean.removeSuffix(".ME")
-        // BCS is the optional canonical broker feed. When configured, both live
-        // quotes and historical candles come from the same feed, preventing
-        // cross-provider/timeframe price drift.
-        if (!bcsRefreshToken.isNullOrBlank() && bcsSupported(clean)) {
-            runCatching { loadBcs(clean, range, interval) }.getOrNull()?.let { raw ->
-                val normalized = normalizeInterval(raw, interval)
-                if (normalized.isNotEmpty()) {
-                    candleCache[cacheKey] = System.currentTimeMillis() to normalized
-                    return normalized
-                }
-            }
-        }
-        // SOURCE INTEGRITY: a MOEX instrument must never mix MOEX history with a
-        // Yahoo/other-provider history. Mixing feeds is a direct cause of apparent
-        // price jumps and of forecasts whose reference price differs from the quote.
-        // MOEX is therefore authoritative for Russian exchange instruments.
-        val providerInterval = if (interval == "4h") "1h" else interval
-        if (isLikelyMoex(clean)) {
-            val raw = if (providerInterval == "15m") {
-                val oneMinute = runCatching { loadMoex(moex, "1m") }.getOrNull().orEmpty()
-                aggregateMinutes(oneMinute, 15)
-            } else {
-                runCatching { loadMoex(moex, providerInterval) }.getOrNull().orEmpty()
+        // Forecast integrity rule: ALL forecast candles come from BCS. Never
+        // silently fall back to another provider for a forecast dataset.
+        // dataset, otherwise the same instrument can have different prices/levels
+        // between screens and timeframes.
+        if (!bcsRefreshToken.isNullOrBlank()) {
+            if (!bcsSupported(clean)) throw IllegalStateException("БКС не поддерживает инструмент $symbol для прогнозов")
+            val raw = runCatching { loadBcs(clean, range, interval) }.getOrElse {
+                throw IllegalStateException("БКС: не удалось получить свечи для $symbol: ${it.message ?: "ошибка источника"}")
             }
             val normalized = normalizeInterval(raw, interval)
             if (normalized.isNotEmpty()) {
                 candleCache[cacheKey] = System.currentTimeMillis() to normalized
                 return normalized
             }
-            throw IllegalStateException("MOEX не вернул свечи для $symbol ($interval)")
+            throw IllegalStateException("БКС не вернул свечи для $symbol ($interval)")
         }
-        runCatching { loadYahoo(clean, range, providerInterval) }.getOrNull()?.let { raw ->
-            val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
-        }
-        if (!interval.contains("m") && !interval.contains("h")) {
-            runCatching { loadStooq(clean, range) }.getOrNull()?.let { raw ->
-                val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
-            }
-        }
-        if (!alphaVantageKey.isNullOrBlank()) {
-            runCatching { loadAlpha(clean, providerInterval) }.getOrNull()?.let { raw ->
-                val normalized = normalizeInterval(raw, interval); if (normalized.isNotEmpty()) { candleCache[cacheKey] = System.currentTimeMillis() to normalized; return normalized }
-            }
-        }
-        throw IllegalStateException("Нет данных для $symbol. Проверь тикер или доступность поставщиков.")
+        // Forecasts are intentionally fail-closed: without BCS credentials there is
+        // no fallback provider. This prevents a hidden secondary price source from entering
+        // a forecast and reintroducing cross-screen/timeframe price divergence.
+        throw IllegalStateException("БКС не подключен. Подключите refresh-токен БКС для получения прогнозов.")
     }
 
     /** Priority prefetch for the Analytics Center. Historical candles are cached
@@ -135,70 +106,75 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     fun search(query: String): List<SearchResult> {
         val q = query.trim()
-        if (q.length < 2) return emptyList()
-        val merged = linkedMapOf<String, SearchResult>()
-        val fx = normalizeFx(q)
-        if (fx != null) merged[fx.symbol] = fx
-        runCatching { searchMoex(q) }.getOrDefault(emptyList()).forEach { merged[it.symbol.uppercase(Locale.US)] = it }
-        runCatching { searchYahoo(q) }.getOrDefault(emptyList()).forEach { merged.putIfAbsent(it.symbol.uppercase(Locale.US), it) }
-        if (!alphaVantageKey.isNullOrBlank()) runCatching { searchAlpha(q) }.getOrDefault(emptyList()).forEach { merged.putIfAbsent(it.symbol.uppercase(Locale.US), it) }
-        return merged.values.take(30)
+        if (q.length < 2 || !isBcsConfigured()) return emptyList()
+        // BCS is the only market-data/catalog provider. Search is performed against
+        // the BCS instrument directory, so a symbol cannot silently switch to MOEX,
+        // Yahoo or another quote source.
+        val universe = runCatching { catalog() }.getOrDefault(emptyList())
+        val needle = q.lowercase(Locale.ROOT)
+        return universe.filter {
+            it.symbol.lowercase(Locale.ROOT).contains(needle) ||
+            it.name.lowercase(Locale.ROOT).contains(needle)
+        }.take(30)
     }
 
-    /** Full dynamic MOEX catalogue. Pagination is used so the scanner never truncates the universe. */
+    /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
     fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> {
+        if (!isBcsConfigured()) return emptyList()
         val now = System.currentTimeMillis()
         val cached = catalogCache
         if (cached.isNotEmpty() && now - catalogCacheAt <= CATALOG_CACHE_MS) {
             return if (limit == Int.MAX_VALUE) cached else cached.take(limit)
         }
         val out = LinkedHashMap<String, SearchResult>()
-        var start = 0
-        val pageSize = 1000
-        while (true) {
-            val url = "https://iss.moex.com/iss/securities.json?iss.meta=off&iss.only=securities&securities.columns=secid,shortname,emitent_title&start=$start&limit=$pageSize"
-            val root = runCatching { JSONObject(getText(url, 15000)) }.getOrNull() ?: break
-            val block = root.optJSONObject("securities") ?: break
-            val cols = block.optJSONArray("columns") ?: break
-            val data = block.optJSONArray("data") ?: break
-            val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it })
-            if (data.length() == 0) break
-            for (i in 0 until data.length()) {
-                val r = data.optJSONArray(i) ?: continue
-                val symbol = r.optString(idx["secid"] ?: -1).trim()
-                val name = r.optString(idx["shortname"] ?: -1).ifBlank { r.optString(idx["emitent_title"] ?: -1) }
-                if (symbol.isNotBlank() && symbol.length <= 20 && name.isNotBlank()) {
-                    val item = SearchResult("${symbol}.ME", name, "MOEX", "EQUITY", "MOEX")
+        // BCS documents these instrument types in the Information Service.
+        val types = listOf("STOCK", "FOREIGN_STOCK", "CURRENCY", "ETF", "FUTURES", "INDICES")
+        for (type in types) {
+            runCatching {
+                val root = JSONObject(getTextAuth(
+                    "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}",
+                    15000, bcsHeaders()
+                ))
+                val arr = root.optJSONArray("instruments") ?: return@runCatching
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val ticker = o.optString("ticker").trim()
+                    if (ticker.isBlank()) continue
+                    val boards = o.optJSONArray("boards")
+                    val board = boards?.optJSONObject(0)?.optString("classCode").orEmpty()
+                    val exchange = boards?.optJSONObject(0)?.optString("exchange").orEmpty().ifBlank { "BCS" }
+                    val name = o.optString("displayName")
+                        .ifBlank { o.optString("shortName") }
+                        .ifBlank { o.optString("issuerName") }
+                        .ifBlank { ticker }
+                    val typeName = o.optString("instrumentType").ifBlank { type }
+                    val item = SearchResult(ticker, name, exchange, typeName, "БКС")
                     out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
                 }
             }
-            if (data.length() < pageSize || out.size >= limit) break
-            start += pageSize
         }
-        popularSeeds().forEach { out.putIfAbsent(it.symbol.uppercase(Locale.US), it) }
         val result = out.values.toList()
         catalogCache = result
         catalogCacheAt = System.currentTimeMillis()
         return if (limit == Int.MAX_VALUE) result else result.take(limit)
     }
 
-    /** Complete practical FX universe supported by Yahoo Finance symbol convention. */
-    fun fxCatalog(): List<SearchResult> {
-        val fiat = listOf("USD","EUR","GBP","JPY","CHF","CAD","AUD","NZD","CNY","HKD","SGD","SEK","NOK","DKK","PLN","CZK","HUF","TRY","RUB","ZAR","MXN","BRL","INR","KRW","ILS")
-        return fiat.flatMap { base -> fiat.filter { it != base }.map { quote ->
-            SearchResult("${base}${quote}=X", "$base/$quote", "FOREX", "CURRENCY", "Yahoo Finance")
-        }}
-    }
+    /** BCS-only FX catalogue. */
+    fun fxCatalog(): List<SearchResult> = if (!isBcsConfigured()) emptyList() else
+        catalog(Int.MAX_VALUE).filter { it.type.contains("CURRENCY", true) }
 
-    private fun popularSeeds(): List<SearchResult> = listOf("SBER.ME","GAZP.ME","LKOH.ME","ROSN.ME","NVTK.ME","TATN.ME","MGNT.ME","MOEX.ME","YDEX.ME","OZON.ME","AAPL","MSFT","NVDA","AMZN","TSLA","EURUSD=X","GBPUSD=X","USDJPY=X","USDRUB=X").map { SearchResult(it, it.removeSuffix(".ME"), "", "", "seed") }
+    private fun popularSeeds(): List<SearchResult> = listOf(
+        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "MGNT", "MOEX", "YDEX", "OZON",
+        "USDRUB=X", "EURRUB=X", "CNYRUB=X"
+    ).map { SearchResult(it, it, "BCS", "", "БКС") }
 
     private fun normalizeFx(q: String): SearchResult? {
         val x = q.uppercase(Locale.US).replace("/", "").replace("-", "").replace(" ", "")
         if (x.length != 6 || !x.all { it.isLetter() }) return null
         val base = x.take(3); val quote = x.takeLast(3)
-        val fiat = setOf("USD","EUR","GBP","JPY","CHF","CAD","AUD","NZD","CNY","HKD","SGD","SEK","NOK","DKK","PLN","CZK","HUF","TRY","RUB","ZAR","MXN","BRL","INR","KRW","ILS")
-        if (base !in fiat || quote !in fiat || base == quote) return null
-        return SearchResult("${base}${quote}=X", "$base/$quote", "FOREX", "CURRENCY", "Yahoo Finance")
+        return if (bcsFx("${base}${quote}=X") != null)
+            SearchResult("${base}${quote}=X", "$base/$quote", "BCS", "CURRENCY", "БКС")
+        else null
     }
 
     /** Multi-source market news. The UI must still receive a feed if one provider is unavailable. */
@@ -333,13 +309,14 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     }
 
     fun marketIndices(): List<MarketIndex> {
-        val specs = listOf("^IMOEX" to "IMOEX", "^GSPC" to "S&P 500", "^IXIC" to "NASDAQ")
-        return specs.mapNotNull { (symbol, name) ->
+        if (!isBcsConfigured()) return emptyList()
+        return catalog(Int.MAX_VALUE).filter { it.type.contains("INDEX", true) }.take(12).mapNotNull { item ->
             runCatching {
-                val candles = loadYahoo(symbol, "1mo", "1d")
+                val candles = load(item.symbol, "1y", "1d")
                 val last = candles.lastOrNull() ?: return@runCatching null
                 val prev = candles.dropLast(1).lastOrNull()?.close ?: last.close
-                MarketIndex(symbol, name, last.close, if (prev == 0.0) 0.0 else (last.close - prev) / prev * 100.0, "Yahoo Finance")
+                val live = quote(item.symbol) ?: last.close
+                MarketIndex(item.symbol, item.name, live, if (prev == 0.0) 0.0 else (live - prev) / prev * 100.0, "БКС")
             }.getOrNull()
         }
     }
@@ -347,62 +324,56 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     fun quote(symbol: String): Double? {
         val clean = symbol.trim().uppercase(Locale.US)
         val now = System.currentTimeMillis()
-        val cached = quoteCache[clean]
+        val quoteKey = "${if (bcsRefreshToken.isNullOrBlank()) "LEGACY" else "BCS"}|$clean"
+        val cached = quoteCache[quoteKey]
         // A quote is the canonical "now" price. It is shared by every timeframe;
         // timeframe candles are never allowed to become the displayed live price.
         if (cached != null && now - cached.first <= QUOTE_CACHE_MS && cached.second.isFinite() && cached.second > 0.0) {
             return cached.second
         }
-        val moex = clean.removeSuffix(".ME")
-        val value = when {
-            !bcsRefreshToken.isNullOrBlank() && bcsSupported(clean) -> runCatching { quoteBcs(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                ?: when {
-                    isLikelyMoex(clean) -> runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                    clean.endsWith("=X") -> runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                        ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                    else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                }
-            isLikelyMoex(clean) -> runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-            clean.endsWith("=X") -> runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-            else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+        val value = if (!bcsRefreshToken.isNullOrBlank()) {
+            if (!bcsSupported(clean)) throw IllegalStateException("БКС не поддерживает инструмент $symbol для прогнозов")
+            runCatching { quoteBcs(clean) }.getOrElse {
+                throw IllegalStateException("БКС: не удалось получить котировку $symbol: ${it.message ?: "ошибка источника"}")
+            }?.takeIf { it.isFinite() && it > 0.0 }
+                ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
+        } else {
+            throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
         }
-        if (value != null) quoteCache[clean] = now to value
+        if (value != null) quoteCache[quoteKey] = now to value
         return value
+    }
+
+
+    fun isBcsConfigured(): Boolean = !bcsRefreshToken.isNullOrBlank()
+
+    fun forecastSource(symbol: String): String {
+        val clean = symbol.trim().uppercase(Locale.US)
+        return if (!isBcsConfigured()) "БКС не подключен"
+        else if (!bcsSupported(clean)) "БКС: инструмент не поддерживается"
+        else "БКС • единственный источник"
     }
 
     fun instrumentMeta(symbol: String): InstrumentMeta {
         val clean = symbol.trim().uppercase(Locale.US)
-        val secid = clean.removeSuffix(".ME")
-        if (isLikelyMoex(clean)) runCatching { moexMeta(secid) }.getOrNull()?.let { return it }
-        val unit = if (clean.contains("^") || clean.contains("=X")) "points" else "price"
-        return InstrumentMeta(clean, clean, if (clean.endsWith("=X")) "" else "USD", 1, unit)
-    }
-
-    private fun moexMeta(secid:String):InstrumentMeta {
-        val url="https://iss.moex.com/iss/securities/${enc(secid)}.json?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME,LOTSIZE,CURRENCYID"
-        val root=JSONObject(getText(url,9000)); val b=root.optJSONObject("securities")?:return InstrumentMeta(secid)
-        val cols=b.optJSONArray("columns")?:return InstrumentMeta(secid); val data=b.optJSONArray("data")?:return InstrumentMeta(secid); if(data.length()==0)return InstrumentMeta(secid)
-        val idx=(0 until cols.length()).associateBy({cols.getString(it)},{it}); val r=data.optJSONArray(0)?:return InstrumentMeta(secid)
-        fun s(n:String)=r.optString(idx[n]?:-1)
-         fun i(n:String)=r.optInt(idx[n]?:-1,1).coerceAtLeast(1)
-        return InstrumentMeta(secid,s("SHORTNAME").ifBlank{secid},s("CURRENCYID").ifBlank{"RUB"},i("LOTSIZE"),"price")
+        if (!isBcsConfigured()) return InstrumentMeta(clean, clean, "RUB", 1, "price")
+        runCatching { bcsInstrumentInfo(clean) }.getOrNull()?.let { o ->
+            val ticker = o.optString("ticker").ifBlank { clean.removeSuffix(".ME") }
+            val name = o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker }
+            val currency = o.optString("tradingCurrency").ifBlank { o.optString("currency") }.ifBlank { "RUB" }
+            val lot = o.optDouble("lotSize", 1.0).toInt().coerceAtLeast(1)
+            return InstrumentMeta(ticker, name, currency, lot, if (clean.contains("=X")) "price" else "price")
+        }
+        return InstrumentMeta(clean.removeSuffix(".ME"), clean.removeSuffix(".ME"), "RUB", 1, "price")
     }
 
     fun dividendCalendar(query: String? = null, limit: Int = 100): List<DividendEvent> {
-        val all = mutableListOf<DividendEvent>()
-        // Primary machine-readable Russian exchange data: current dividend fields from MOEX ISS.
-        runCatching { all += moexBulkDividends(limit * 3) }
-        // Secondary Russian sources. BCS is retained as requested, but is no longer the single point of failure.
-        runCatching { all += finamDividendCalendar(limit * 2) }
-        runCatching { all += bcsDividendCalendar(limit * 2) }
-        if (all.size < limit) {
-            val symbols = if (!query.isNullOrBlank()) listOf(query.trim().removeSuffix(".ME")) else popularSeeds().map { it.symbol.removeSuffix(".ME") }.distinct()
-            for (symbol in symbols) { runCatching { all += moexDividends(symbol) }; if (all.size >= limit * 2) break }
-        }
-        return all.filter { query.isNullOrBlank() || it.symbol.contains(query, true) }
+        if (!isBcsConfigured()) return emptyList()
+        return runCatching { bcsDividendCalendar(limit * 2) }.getOrDefault(emptyList())
+            .filter { query.isNullOrBlank() || it.symbol.contains(query, true) }
             .filter { it.date > 0 && it.amount > 0 }
-            .distinctBy { "${it.symbol}|${it.date}|${it.amount}" }.sortedBy { it.date }.take(limit)
+            .distinctBy { "${it.symbol}|${it.date}|${it.amount}" }
+            .sortedBy { it.date }.take(limit)
     }
 
     fun bcsDividendCalendarUrl(): String = BCS_DIVIDEND_CALENDAR_URL
@@ -444,12 +415,37 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         return out
     }
 
-    private fun bcsSupported(symbol: String): Boolean = isLikelyMoex(symbol) || bcsFx(symbol) != null
+    private val bcsInstrumentCache = ConcurrentHashMap<String, Pair<String, String>>()
+
+    private fun bcsSupported(symbol: String): Boolean {
+        if (!isBcsConfigured()) return false
+        if (bcsFx(symbol) != null) return true
+        val clean = symbol.uppercase(Locale.US).removeSuffix(".ME").substringBefore("@")
+        return runCatching { bcsInstrument(clean) }.isSuccess
+    }
 
     private fun bcsInstrument(symbol: String): Pair<String, String> {
         val clean = symbol.uppercase(Locale.US).removeSuffix(".ME")
+        val explicitBoard = clean.substringAfter("@", "")
+        val ticker = clean.substringBefore("@")
         val fx = bcsFx(symbol)
-        return if (fx != null) fx to "CETS" else clean to "TQBR"
+        if (fx != null) return fx to "CETS"
+        bcsInstrumentCache[ticker]?.let { return it }
+        if (explicitBoard.isNotBlank()) return ticker to explicitBoard
+        val info = bcsInstrumentInfo(ticker)
+        val boards = info.optJSONArray("boards")
+        val board = boards?.optJSONObject(0)?.optString("classCode").orEmpty().ifBlank { "TQBR" }
+        val pair = ticker to board
+        bcsInstrumentCache[ticker] = pair
+        return pair
+    }
+
+    private fun bcsInstrumentInfo(symbol: String): JSONObject {
+        val ticker = symbol.uppercase(Locale.US).removeSuffix(".ME").substringBefore("@")
+        val body = JSONObject().put("tickers", JSONArray().put(ticker)).toString()
+        val root = JSONObject(postJson("https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-tickers", body, 12000, bcsHeaders()))
+        val arr = root.optJSONArray("instruments") ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
+        return arr.optJSONObject(0) ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
     }
 
     private fun bcsFx(symbol: String): String? = when (symbol.uppercase(Locale.US)) {
@@ -484,13 +480,12 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     private fun loadBcs(symbol: String, range: String, interval: String): List<Candle> {
         val (ticker, classCode) = bcsInstrument(symbol)
-        val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W1"; else -> "D1" }
+        val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
         val days = when (range) { "60d" -> 60; "2y" -> 730; "10y" -> 3650; else -> 3650 }
         val end = System.currentTimeMillis()
         val start = end - days * 86_400_000L
         // BCS limits a single candle response to 1440 bars. Keep requests bounded.
-        val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D1" -> 1440; else -> 10080 }
-        val chunks = maxOf(1, kotlin.math.ceil((days * 1440.0) / maxSpan / 1440.0).toInt())
+        val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D" -> 1440; "W" -> 10080; else -> 43200 }
         val out = mutableListOf<Candle>()
         val chunkMs = maxOf(86_400_000L, (1440L * maxSpan) * 60_000L)
         var cursor = start
@@ -554,105 +549,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     }
     private fun isoUtc(ms: Long): String = java.time.Instant.ofEpochMilli(ms).toString()
 
-    private fun isLikelyMoex(symbol: String): Boolean = symbol.endsWith(".ME") || symbol in setOf("SBER","GAZP","LKOH","NVTK","TATN","TATNP","MGNT","MOEX","ROSN","PHOR","MTSS","IRAO","TRMK","GMKN","NLMK","HYDR","CHMF","PLZL","ALRS","SNGS","SNGSP","RTKM","VTBR","AFLT","PIKK","RUAL","OZON","YDEX","HEAD")
-
-    private fun loadMoex(secid: String, interval: String): List<Candle> {
-        val moexInterval = when (interval) { "1m" -> 1; "1h" -> 60; "1wk" -> 7; else -> 24 }
-        val days = if (interval == "1m") 10 else 3650
-        val from = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(System.currentTimeMillis() - days * 86400000L))
-        val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/${enc(secid)}/candles.json?interval=$moexInterval&from=$from&iss.meta=off"
-        val root = JSONObject(getText(url, 12000)); val candles = root.optJSONObject("candles") ?: return emptyList()
-        val cols = candles.optJSONArray("columns") ?: return emptyList(); val data = candles.optJSONArray("data") ?: return emptyList()
-        val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it })
-        fun d(row: JSONArray, name: String): Double = row.optDouble(idx[name] ?: -1, Double.NaN)
-        fun s(row: JSONArray, name: String): String = row.optString(idx[name] ?: -1)
-        val out = mutableListOf<Candle>()
-        for (i in 0 until data.length()) {
-            val r = data.optJSONArray(i) ?: continue
-            val o=d(r,"open"); val h=d(r,"high"); val l=d(r,"low"); val c=d(r,"close"); if (!o.isFinite()||!h.isFinite()||!l.isFinite()||!c.isFinite()) continue
-            val time = parseMoexTime(s(r,"begin"))
-            out += Candle(time, o,h,l,c,d(r,"value"))
-        }
-        return out
-    }
-
-    private fun loadYahoo(symbol: String, range: String, interval: String): List<Candle> {
-        val bases = listOf("https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/")
-        var last: Exception? = null
-        for (base in bases) try { return parseYahoo(getText("$base${enc(symbol)}?range=$range&interval=$interval&events=history", 12000)) } catch (e: Exception) { last=e }
-        throw last ?: IllegalStateException("Yahoo Finance unavailable")
-    }
-
-    private fun loadStooq(symbol: String, range: String): List<Candle> {
-        val s = when { symbol.endsWith(".ME") -> symbol.removeSuffix(".ME").lowercase(Locale.US)+".ru"; symbol.contains("=") -> return emptyList(); else -> symbol.lowercase(Locale.US)+".us" }
-        val days = if (range.contains("5y")) 1900 else if (range.contains("2y")) 800 else 400
-        val d1 = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date(System.currentTimeMillis()-days*86400000L))
-        val d2 = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-        val lines=getText("https://stooq.com/q/d/l/?s=${enc(s)}&d1=$d1&d2=$d2&i=d",12000).lines().drop(1)
-        return lines.mapNotNull { line ->
-            val p=line.split(','); if(p.size<6) null else runCatching { Candle(SimpleDateFormat("yyyy-MM-dd",Locale.US).parse(p[0])!!.time,p[1].toDouble(),p[2].toDouble(),p[3].toDouble(),p[4].toDouble(),p[5].toDouble()) }.getOrNull()
-        }
-    }
-
-    private fun loadAlpha(symbol: String, interval: String): List<Candle> {
-        val key=alphaVantageKey ?: return emptyList(); val func=if(interval=="1d"||interval=="1wk") "TIME_SERIES_DAILY" else "TIME_SERIES_INTRADAY"
-        val iv=if(func=="TIME_SERIES_INTRADAY") "&interval=60min" else ""
-        val root=JSONObject(getText("https://www.alphavantage.co/query?function=$func&symbol=${enc(symbol.removeSuffix(".ME"))}$iv&outputsize=compact&apikey=${enc(key)}",12000))
-        val series=root.keys().asSequence().firstOrNull { it.startsWith("Time Series") } ?: return emptyList(); val obj=root.optJSONObject(series) ?: return emptyList(); val out=mutableListOf<Candle>()
-        val keys=obj.keys(); while(keys.hasNext()){val k=keys.next(); val r=obj.optJSONObject(k)?:continue; val dt=runCatching{SimpleDateFormat(if(k.length>10)"yyyy-MM-dd HH:mm:ss" else "yyyy-MM-dd",Locale.US).parse(k)!!.time}.getOrDefault(0L); out+=Candle(dt,r.optDouble("1. open"),r.optDouble("2. high"),r.optDouble("3. low"),r.optDouble("4. close"),r.optDouble("5. volume"))}; return out.sortedBy{it.time}
-    }
-
-    private fun searchMoex(q:String):List<SearchResult>{
-        val root=JSONObject(getText("https://iss.moex.com/iss/securities.json?q=${enc(q)}&iss.meta=off&iss.only=securities&securities.columns=secid,shortname,emitent_title",12000)); val block=root.optJSONObject("securities")?:return emptyList(); val cols=block.optJSONArray("columns")?:return emptyList(); val data=block.optJSONArray("data")?:return emptyList(); val idx=(0 until cols.length()).associateBy({cols.getString(it)},{it}); val out=mutableListOf<SearchResult>(); for(i in 0 until data.length()){val r=data.optJSONArray(i)?:continue; val sym=r.optString(idx["secid"]?:-1); val name=r.optString(idx["shortname"]?:-1); val emit=r.optString(idx["emitent_title"]?:-1); if(sym.isNotBlank()) out+=SearchResult("${sym.removeSuffix(".ME")}.ME",if(name.isBlank())emit else name,"MOEX","EQUITY", "MOEX")}; return out
-    }
-
-    private fun searchYahoo(q:String):List<SearchResult>{val root=JSONObject(getText("https://query1.finance.yahoo.com/v1/finance/search?q=${enc(q)}&quotesCount=20&newsCount=0",10000)); val arr=root.optJSONArray("quotes")?:return emptyList(); return (0 until arr.length()).mapNotNull{val x=arr.optJSONObject(it)?:return@mapNotNull null; val s=x.optString("symbol"); if(s.isBlank())null else SearchResult(s,x.optString("longname",x.optString("shortname",s)),x.optString("exchange"),x.optString("quoteType"),"Yahoo Finance")}}
-    private fun searchAlpha(q:String):List<SearchResult>{val key=alphaVantageKey?:return emptyList(); val root=JSONObject(getText("https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${enc(q)}&apikey=${enc(key)}",12000)); val arr=root.optJSONArray("bestMatches")?:return emptyList(); return (0 until arr.length()).mapNotNull{val x=arr.optJSONObject(it)?:return@mapNotNull null; val s=x.optString("1. symbol"); if(s.isBlank())null else SearchResult(s,x.optString("2. name",s),x.optString("4. region"),x.optString("3. type"),"Alpha Vantage")}}
-
     private fun translate(text:String,target:String):String{if(text.isBlank())return text; if(target=="en" && text.all{it.code<128})return text; return runCatching{val root=JSONArray(getText("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=$target&dt=t&q=${enc(text)}",9000)); val parts=root.optJSONArray(0)?:return@runCatching text; buildString{for(i in 0 until parts.length()){append(parts.optJSONArray(i)?.optString(0).orEmpty())}}.ifBlank{text}}.getOrDefault(text)}
-
-    private fun parseYahoo(text:String):List<Candle>{val root=JSONObject(text); val r=root.getJSONObject("chart").getJSONArray("result").getJSONObject(0); val ts=r.getJSONArray("timestamp"); val q=r.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0); val o=q.getJSONArray("open"); val h=q.getJSONArray("high"); val l=q.getJSONArray("low"); val c=q.getJSONArray("close"); val v=q.optJSONArray("volume"); val out=mutableListOf<Candle>(); for(i in 0 until ts.length()){if(o.isNull(i)||h.isNull(i)||l.isNull(i)||c.isNull(i))continue;out+=Candle(ts.getLong(i)*1000,o.getDouble(i),h.getDouble(i),l.getDouble(i),c.getDouble(i),if(v!=null&&!v.isNull(i))v.getDouble(i)else 0.0)};return out}
-    private fun quoteYahoo(symbol: String): Double? {
-        val text = getText("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=1d&interval=1m", 9000)
-        val root = JSONObject(text)
-        val result = root.optJSONObject("chart")?.optJSONArray("result")?.optJSONObject(0) ?: return null
-        val meta = result.optJSONObject("meta")
-        // Never label a previous close as LIVE. If the provider has no current quote,
-        // return null so the UI can keep the last candle without pretending it is live.
-        return meta?.optDouble("regularMarketPrice", Double.NaN)?.takeIf { it.isFinite() && it > 0 }
-    }
-
-    private fun quoteAlfaForex(symbol: String): Double? {
-        val pair = symbol.removeSuffix("=X").uppercase(Locale.US)
-        if (pair.length != 6) return null
-        val label = "${pair.take(3)} / ${pair.takeLast(3)}"
-        val html = getText("https://alfaforex.ru/analytics/analytics-currencies/", 9000)
-        // The public Alfa-Forex page renders the current FX quotes in the HTML.
-        // Extract only the numeric value immediately following the requested pair.
-        val plain = stripHtml(html)
-        val pattern = Pattern.compile(
-            Pattern.quote(label) + "\\s+[^0-9]{0,120}([0-9]{1,6}(?:[.,][0-9]{1,6})?)",
-            Pattern.CASE_INSENSITIVE
-        )
-        val m = pattern.matcher(plain)
-        if (!m.find()) return null
-        return m.group(1).replace(',', '.').toDoubleOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-    }
-
-    private fun quoteMoex(secid: String): Double? {
-        val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/${enc(secid)}.json?iss.meta=off&iss.only=marketdata&marketdata.columns=SECID,LAST,LCURRENTPRICE,PREVPRICE"
-        val root = JSONObject(getText(url, 9000))
-        val block = root.optJSONObject("marketdata") ?: return null
-        val cols = block.optJSONArray("columns") ?: return null
-        val data = block.optJSONArray("data") ?: return null
-        if (data.length() == 0) return null
-        val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it })
-        val row = data.optJSONArray(0) ?: return null
-        fun d(name: String) = row.optDouble(idx[name] ?: -1, Double.NaN)
-        val last = d("LAST").takeIf { it.isFinite() && it > 0 }
-        val current = d("LCURRENTPRICE").takeIf { it.isFinite() && it > 0 }
-        return current ?: last
-    }
 
     private fun mentionsInstrument(n: NewsItem, q: String): Boolean {
         val clean=q.removeSuffix(".ME").replace("=X","").uppercase(Locale.US)
@@ -712,73 +609,6 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         return runCatching { java.util.Calendar.getInstance().apply { set(year, month - 1, day, 12, 0, 0); set(java.util.Calendar.MILLISECOND, 0) }.timeInMillis }.getOrNull()
     }
 
-    private fun finamDividendCalendar(limit: Int): List<DividendEvent> {
-        val html = getText("https://www.finam.ru/dividends/calendar/rus/", 15000)
-        val clean = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", "\"")
-        val rowPattern = Pattern.compile("<tr[^>]*>(.*?)</tr>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
-        val cellPattern = Pattern.compile("<(?:td|th)[^>]*>(.*?)</(?:td|th)>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
-        val out = mutableListOf<DividendEvent>(); val rows = rowPattern.matcher(clean)
-        while (rows.find() && out.size < limit * 3) {
-            val cells = mutableListOf<String>(); val cm = cellPattern.matcher(rows.group(1) ?: "")
-            while (cm.find()) cells += stripHtml(cm.group(1).orEmpty())
-            if (cells.size < 3) continue
-            val dateIndex = cells.indexOfFirst { it.matches(Regex(".*\\b\\d{1,2}\\.\\d{1,2}\\.\\d{4}\\b.*")) }
-            val amountIndex = cells.indexOfFirst { it.replace(',', '.').matches(Regex(".*\\b\\d+[.,]\\d+\\b.*")) }
-            if (dateIndex < 0 || amountIndex < 0) continue
-            val date = parseDividendDate(cells[dateIndex]) ?: continue
-            val amount = Regex("[-+]?\\d+[.,]\\d+").find(cells[amountIndex])?.value?.replace(',', '.')?.toDoubleOrNull() ?: continue
-            val symbol = cells.firstOrNull { it.matches(Regex(".*\\([A-Z]{2,6}P?\\).*")) }?.let { Regex("\\b[A-Z]{2,6}P?\\b").find(it)?.value }
-                ?: Regex("\\b[A-Z]{2,6}P?\\b").find(cells.joinToString(" "))?.value ?: continue
-            out += DividendEvent(symbol, date, amount, "Финам")
-        }
-        if (out.isEmpty()) {
-            // Finam currently renders the Russian calendar as a table/SSR payload. Keep a tolerant
-            // text parser as a second path because markup classes can change without notice.
-            val text = stripHtml(clean)
-            val p2 = Pattern.compile("""([^\n]{0,180})\(([A-Z][A-Z0-9]{1,7})\)(?s).*?(\d{1,4}(?:[.,]\d+)?)\s*(?:Rub|руб).*?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})""", Pattern.CASE_INSENSITIVE)
-            val m2 = p2.matcher(text)
-            while (m2.find() && out.size < limit) {
-                val date = parseDividendDate(m2.group(4)) ?: continue
-                val amount = m2.group(3).replace(',','.').toDoubleOrNull() ?: continue
-                out += DividendEvent(m2.group(2).uppercase(Locale.US), date, amount, "Финам")
-            }
-        }
-        return out.distinctBy { "${it.symbol}|${it.date}|${it.amount}" }.take(limit)
-    }
-
-    private fun moexBulkDividends(limit: Int): List<DividendEvent> {
-        val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off&securities.columns=SECID,SHORTNAME,DIVIDENDVALUE,DIVIDENDDATE"
-        val root = JSONObject(getText(url, 15000)); val block = root.optJSONObject("securities") ?: return emptyList()
-        val cols = block.optJSONArray("columns") ?: return emptyList(); val data = block.optJSONArray("data") ?: return emptyList()
-        val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it }); val out = mutableListOf<DividendEvent>()
-        for (i in 0 until data.length()) {
-            val r = data.optJSONArray(i) ?: continue
-            val sec = r.optString(idx["SECID"] ?: -1).trim(); val amount = r.optDouble(idx["DIVIDENDVALUE"] ?: -1, Double.NaN); val dateText = r.optString(idx["DIVIDENDDATE"] ?: -1)
-            if (sec.isBlank() || !amount.isFinite() || amount <= 0 || dateText.isBlank()) continue
-            val date = runCatching { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(dateText)?.time ?: 0L }.getOrDefault(0L)
-            if (date > 0) out += DividendEvent(sec, date, amount, "MOEX ISS")
-            if (out.size >= limit) break
-        }
-        return out
-    }
-
-    private fun moexDividends(secid: String): List<DividendEvent> {
-        val url = "https://iss.moex.com/iss/securities/${enc(secid)}/dividends.json?iss.meta=off&dividends.columns=secid,registryclosedate,value,currencyid"
-        val root = JSONObject(getText(url, 10000)); val block = root.optJSONObject("dividends") ?: return emptyList()
-        val cols = block.optJSONArray("columns") ?: return emptyList(); val data = block.optJSONArray("data") ?: return emptyList()
-        val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it }); val out = mutableListOf<DividendEvent>()
-        for (i in 0 until data.length()) {
-            val r = data.optJSONArray(i) ?: continue; val dateText = r.optString(idx["registryclosedate"] ?: -1)
-            val value = r.optDouble(idx["value"] ?: -1, Double.NaN); if (dateText.isBlank() || !value.isFinite() || value <= 0) continue
-            val date = runCatching { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(dateText)?.time ?: 0L }.getOrDefault(0L); if (date <= 0) continue
-            out += DividendEvent(secid, date, value, "MOEX")
-        }
-        return out
-    }
-
-    private fun yahooDividends(symbol:String):List<DividendEvent>{val root=JSONObject(getText("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=2y&interval=1d&events=div",10000)); val r=root.optJSONObject("chart")?.optJSONArray("result")?.optJSONObject(0)?:return emptyList(); val ev=r.optJSONObject("events")?.optJSONObject("dividends")?:return emptyList(); val out=mutableListOf<DividendEvent>(); val keys=ev.keys();while(keys.hasNext()){val d=ev.optJSONObject(keys.next())?:continue;val ts=d.optLong("date")*1000;val a=d.optDouble("amount",Double.NaN);if(ts>0&&a.isFinite()&&a>0)out+=DividendEvent(symbol,ts,a,"Yahoo Finance")};return out}
-    private fun parseMoexTime(s:String):Long=runCatching{SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.US).apply{timeZone=TimeZone.getTimeZone("Europe/Moscow")}.parse(s)!!.time}.getOrDefault(System.currentTimeMillis())
-    private fun parseIso(s:String):Long=runCatching{SimpleDateFormat("yyyyMMdd'T'HHmmss",Locale.US).parse(s)!!.time}.getOrDefault(0L)
     private fun enc(s:String)=URLEncoder.encode(s,"UTF-8")
     private fun postForm(url: String, body: String, timeout: Int): String {
         val c = URL(url).openConnection() as HttpURLConnection

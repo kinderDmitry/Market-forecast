@@ -44,15 +44,16 @@ class ScannerForegroundService : Service() {
         val scopeMode = intent?.getStringExtra(EXTRA_SCOPE) ?: prefs.getString("scanner_scope", "ALL") ?: "ALL"
         val type = intent?.getStringExtra(EXTRA_TYPE) ?: prefs.getString("scanner_type", "ALL") ?: "ALL"
         val tf = intent?.getStringExtra(EXTRA_TF) ?: prefs.getString("scanner_tf", "1D") ?: "1D"
-        val horizonValue = intent?.getIntExtra(EXTRA_HORIZON_VALUE, -1)?.takeIf { it > 0 } ?: prefs.getInt("scanner_horizon_value", 15).coerceAtLeast(1)
-        val horizonUnit = intent?.getStringExtra(EXTRA_HORIZON_UNIT) ?: prefs.getString("scanner_horizon_unit", "SEC") ?: "SEC"
-        prefs.edit().putString("scanner_scope", scopeMode).putString("scanner_type", type).putString("scanner_tf", tf).putInt("scanner_horizon_value", horizonValue).putString("scanner_horizon_unit", horizonUnit).putBoolean("scanner_running", true).putBoolean("scanner_priority_active", scopeMode == "ALL").apply()
+        // Ordinary scanner has no user-entered horizon. The validity window is
+        // derived from the actual forecast timeframe, so a 15M signal lives for
+        // 15 minutes, a 1H signal for 1 hour, etc. Screenshot scanner is separate.
+        prefs.edit().putString("scanner_scope", scopeMode).putString("scanner_type", type).putString("scanner_tf", tf).remove("scanner_horizon_value").remove("scanner_horizon_unit").putBoolean("scanner_running", true).putBoolean("scanner_priority_active", scopeMode == "ALL").apply()
         startForeground(NOTIFICATION_ID, notification("Сканер работает", "Подготовка данных…", false))
-        if (!running.getAndSet(true)) job = scope.launch { scanLoop(scopeMode, type, tf, horizonValue, horizonUnit) }
+        if (!running.getAndSet(true)) job = scope.launch { scanLoop(scopeMode, type, tf) }
         return START_STICKY
     }
 
-    private suspend fun scanLoop(scopeMode: String, type: String, tf: String, horizonValue: Int, horizonUnit: String) {
+    private suspend fun scanLoop(scopeMode: String, type: String, tf: String) {
         try {
             while (currentCoroutineContext().isActive && running.get()) {
                 prefs.edit().putString("scanner_status", "Подготовка полного сканирования…").putFloat("scanner_progress", 0f).apply()
@@ -68,6 +69,10 @@ class ScannerForegroundService : Service() {
                 val parallelism = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(6, 32)
                 val gate = Semaphore(parallelism)
                 val out = mutableListOf<ScanRow>()
+                val resultLock = Any()
+                val previousKeys = loadScanRows(prefs).filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }
+                    .map { "${it.result.symbol}|${it.timeframe}|${it.signal}" }.toMutableSet()
+                val emittedKeys = mutableSetOf<String>()
                 val batchSize = (parallelism * 4).coerceAtLeast(24)
 
                 for (start in symbols.indices step batchSize) {
@@ -95,17 +100,30 @@ class ScannerForegroundService : Service() {
                                                 val f = AnalyticsEngine.analyze(merged, live)
                                                 if (f.signal == "NO TRADE") null else {
                                                     val created = System.currentTimeMillis()
-                                                    val hs = horizonSeconds(horizonValue, horizonUnit)
-                                                    ScanRow(SearchResult(symbol, symbol, "", ""), currentTf, f.signal, f.confidence, f.score, f.rr, hs, created, created + hs * 1000L)
+                                                    val hs = timeframeHorizonSeconds(currentTf)
+                                                    ScanRow(SearchResult(symbol, symbol, "", "", "БКС"), currentTf, f.signal, f.confidence, f.score, f.rr, hs, created, created + hs * 1000L)
                                                 }
                                             }
                                         }
                                     }.getOrNull()
+                                    result?.let { row ->
+                                        val key = "${row.result.symbol}|${row.timeframe}|${row.signal}"
+                                        synchronized(resultLock) {
+                                            if (emittedKeys.add(key)) {
+                                                val current = loadScanRows(prefs).filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }
+                                                    .filterNot { "${it.result.symbol}|${it.timeframe}|${it.signal}" == key }
+                                                val mergedRows = (current + row).sortedWith(compareByDescending<ScanRow> { it.confidence }.thenByDescending { abs(it.score) })
+                                                val encodedNow = mergedRows.map { listOf(it.result.symbol, it.timeframe, it.signal, it.confidence, it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt).joinToString("|") }.toSet()
+                                                prefs.edit().putStringSet("auto_scan_results", encodedNow).putInt("scanner_last_found", mergedRows.size).apply()
+                                                if (key !in previousKeys) {
+                                                    val body = "${row.result.symbol.removeSuffix(".ME")} • ${row.signal} • ${row.confidence}%\nГоризонт: ${formatHorizonSeconds(row.horizonSeconds)}\nОсталось: ${formatHorizonSeconds((row.expiresAt - System.currentTimeMillis()).coerceAtLeast(0L))}"
+                                                    NotificationHelper.notifyMarket(applicationContext, "scanner|${row.result.symbol}|${row.timeframe}|${row.signal}|${row.createdAt}", "Новый сигнал: ${row.signal}", body, "SCANNER", row.result.symbol)
+                                                }
+                                            }
+                                        }
+                                    }
                                     val done = completed.incrementAndGet()
-                                    // SharedPreferences writes are relatively expensive. Do not
-                                    // write once per instrument; UI/notification progress remains
-                                    // responsive while the analysis threads stay focused on data.
-                                    if (done % 25L == 0L || done == total) {
+                                    if (done % 10L == 0L || done == total) {
                                         val progress = (done.toDouble() / total.toDouble()).toFloat()
                                         prefs.edit().putFloat("scanner_progress", progress).putString("scanner_status", "Сканирование: $done / $total").apply()
                                         updateForeground("Сканирование", "$done / $total", progress)
@@ -121,22 +139,22 @@ class ScannerForegroundService : Service() {
                 val now = System.currentTimeMillis()
                 val sorted = out.filter { it.expiresAt <= 0L || it.expiresAt > now }
                     .sortedWith(compareByDescending<ScanRow> { it.confidence }.thenByDescending { abs(it.score) })
-                val previous = loadScanRows(prefs).filter { it.expiresAt <= 0L || it.expiresAt > now }
-                val previousKeys = previous.map { "${it.result.symbol}|${it.timeframe}|${it.signal}" }.toSet()
                 val encoded = sorted.map { listOf(it.result.symbol, it.timeframe, it.signal, it.confidence, it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt).joinToString("|") }.toSet()
-                prefs.edit().putStringSet("auto_scan_results", encoded).putLong("scanner_last_run", now).putInt("scanner_last_found", sorted.size).putFloat("scanner_progress", 1f).putString("scanner_status", "Сигналы обновлены: ${sorted.size} • горизонт ${formatHorizon(horizonValue, horizonUnit)}").apply()
-                sorted.filter { "${it.result.symbol}|${it.timeframe}|${it.signal}" !in previousKeys }.take(20).forEach { row ->
-                    val body = "${row.result.symbol.removeSuffix(".ME")} • ${row.signal} • ${row.confidence}%\nГоризонт: ${formatHorizonSeconds(row.horizonSeconds)}\nСигнал действителен до: ${formatClock(row.expiresAt)}"
-                    NotificationHelper.notifyMarket(applicationContext, "scanner|${row.result.symbol}|${row.timeframe}|${row.signal}|${row.createdAt}", "Новый сигнал: ${row.signal}", body, "SCANNER", row.result.symbol)
-                }
-                updateForeground("Сканер обновлён", "Новых сигналов: ${sorted.count { "${it.result.symbol}|${it.timeframe}|${it.signal}" !in previousKeys }}", 1f)
+                prefs.edit().putStringSet("auto_scan_results", encoded).putLong("scanner_last_run", now).putInt("scanner_last_found", sorted.size).putFloat("scanner_progress", 1f).putString("scanner_status", "Сигналы обновлены: ${sorted.size} • срок действия зависит от таймфрейма").apply()
+                updateForeground("Сканер обновлён", "Сигналы выдаются сразу по мере подтверждения", 1f)
 
                 // The next scan is tied to the selected signal horizon. Very short horizons
                 // are useful for a selected/liquid universe; a full-market scan has a safety
                 // floor so it does not create an impossible network/CPU load.
-                val horizonMs = horizonSeconds(horizonValue, horizonUnit) * 1000L
                 val floorMs = if (scopeMode == "ALL") 15_000L else 5_000L
-                var remaining = max(floorMs, min(horizonMs, 60_000L)) / 1000L
+                val cycleMs = when (tf) {
+                    "15M" -> 15_000L
+                    "1H" -> 20_000L
+                    "4H" -> 30_000L
+                    "1W" -> 45_000L
+                    else -> 20_000L
+                }
+                var remaining = max(floorMs, cycleMs) / 1000L
                 while (remaining > 0 && currentCoroutineContext().isActive && running.get()) {
                     delay(1_000L)
                     remaining--
@@ -154,15 +172,12 @@ class ScannerForegroundService : Service() {
         }
     }
 
-    private fun horizonSeconds(value: Int, unit: String): Long = when (unit.uppercase(Locale.US)) {
-        "SEC" -> value.coerceIn(1, 3600).toLong()
-        "MIN" -> value.coerceIn(1, 1440).toLong() * 60L
-        "HOUR" -> value.coerceIn(1, 168).toLong() * 3600L
-        "DAY" -> value.coerceIn(1, 30).toLong() * 86400L
-        else -> value.coerceIn(1, 1440).toLong() * 60L
-    }
-    private fun formatHorizon(value: Int, unit: String): String = when (unit.uppercase(Locale.US)) {
-        "SEC" -> "$value сек"; "MIN" -> "$value мин"; "HOUR" -> "$value ч"; "DAY" -> "$value дн"; else -> "$value"
+    private fun timeframeHorizonSeconds(tf: String): Long = when (tf) {
+        "15M" -> 15L * 60L
+        "1H" -> 60L * 60L
+        "4H" -> 4L * 60L * 60L
+        "1W" -> 7L * 24L * 60L * 60L
+        else -> 24L * 60L * 60L
     }
     private fun formatHorizonSeconds(s: Long): String = when { s < 60 -> "$s сек"; s < 3600 -> "${s / 60} мин"; s < 86400 -> "${s / 3600} ч"; else -> "${s / 86400} дн" }
     private fun formatClock(ms: Long): String = java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(java.util.Date(ms))
@@ -174,9 +189,12 @@ class ScannerForegroundService : Service() {
     private fun resolveSymbols(repo: MarketRepository, scopeMode: String, type: String): List<String> {
         if (scopeMode == "SELECTED") {
             val favs = prefs.getStringSet("favorites", emptySet()).orEmpty().toList()
+            if (type == "FX") {
+                val fx = repo.fxCatalog().map { it.symbol }.toSet()
+                return favs.filter { it in fx || it.contains("/") || it.contains("=") }.distinct()
+            }
             return when (type) {
                 "STOCKS" -> favs.filterNot { it.contains("/") || it.contains("=") }.distinct()
-                "FX" -> favs.filter { it.contains("/") || it.contains("=") }.distinct()
                 else -> favs.distinct()
             }
         }
@@ -242,8 +260,6 @@ class ScannerForegroundService : Service() {
         const val EXTRA_SCOPE = "scope"
         const val EXTRA_TYPE = "type"
         const val EXTRA_TF = "tf"
-        const val EXTRA_HORIZON_VALUE = "horizon_value"
-        const val EXTRA_HORIZON_UNIT = "horizon_unit"
         const val CHANNEL = "mfp_scanner"
         const val NOTIFICATION_ID = 78032
     }
