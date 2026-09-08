@@ -26,7 +26,7 @@ jobs:
           if [ -f "settings.gradle.kts" ]; then
             echo "Gradle project is already at repository root."
           else
-            ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' -print -quit || true)"
+            ZIP_FILE="$(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './.mfp_unpack/*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2- | head -n1 || true)"
             if [ -z "$ZIP_FILE" ]; then
               echo "ERROR: No settings.gradle.kts at repository root and no ZIP found."
               echo "Repository contents:"
