@@ -418,6 +418,22 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     private val bcsInstrumentCache = ConcurrentHashMap<String, Pair<String, String>>()
 
+    // BCS identifies Russian shares by ticker + classCode.  Older versions of the
+    // app stored them as Yahoo-style symbols (for example SBER.ME).  The BCS API
+    // itself uses SBER/TQBR.  Do not let the legacy .ME suffix make a valid BCS
+    // instrument look unsupported.  TQBR is the documented class for the normal
+    // Russian-equity board; the information service is still preferred whenever
+    // it can provide a more specific class.
+    private val bcsRuEquityTickers = setOf(
+        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT",
+        "MOEX", "YDEX", "OZON", "PHOR", "MTSS", "IRAO", "GMKN", "NLMK",
+        "CHMF", "ALRS", "SNGS", "SNGSP", "RTKM", "RTKMP", "VTBR", "AFLT",
+        "RUAL", "PLZL", "HYDR", "ENPG", "PIKK", "MAGN", "CBOM", "AFKS",
+        "FEES", "LSRG", "TRMK", "UPRO", "VKCO", "HEAD", "X5", "BELU",
+        "SMLT", "MTLR", "MTLRP", "SELG", "FLOT", "POSI", "ASTR", "SVCB",
+        "SIBN", "T", "FIXP", "HHRU", "RENI", "SOFL", "GECO", "BSPB", "ROLO"
+    )
+
     private fun bcsSupported(symbol: String): Boolean {
         if (!isBcsConfigured()) return false
         if (bcsFx(symbol) != null) return true
@@ -432,10 +448,23 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         val fx = bcsFx(symbol)
         if (fx != null) return fx to "CETS"
         bcsInstrumentCache[ticker]?.let { return it }
-        if (explicitBoard.isNotBlank()) return ticker to explicitBoard
-        val info = bcsInstrumentInfo(ticker)
-        val boards = info.optJSONArray("boards")
-        val board = boards?.optJSONObject(0)?.optString("classCode").orEmpty().ifBlank { "TQBR" }
+        if (explicitBoard.isNotBlank()) {
+            val pair = ticker to explicitBoard
+            bcsInstrumentCache[ticker] = pair
+            return pair
+        }
+
+        // First use the authoritative BCS instrument directory.  If that request
+        // is temporarily unavailable (for example HTTP 429), use the deterministic
+        // class for known Russian equities instead of reporting a valid instrument
+        // as "not supported".  This is still 100% BCS data; there is no fallback
+        // quote provider here.
+        val info = runCatching { bcsInstrumentInfo(ticker) }.getOrNull()
+        val infoBoard = info?.optJSONArray("boards")?.optJSONObject(0)?.optString("classCode").orEmpty()
+        val board = infoBoard.ifBlank {
+            if (ticker in bcsRuEquityTickers) "TQBR"
+            else throw IllegalStateException("БКС: инструмент $ticker не найден в каталоге")
+        }
         val pair = ticker to board
         bcsInstrumentCache[ticker] = pair
         return pair
