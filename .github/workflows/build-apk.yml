@@ -142,7 +142,7 @@ jobs:
           check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.tp2?.toString() ?: "105")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.stop?.toString() ?: "98")' app/src/main/java/MainActivity.kt
-          check_grep 'Forecast integrity rule: when BCS is configured' app/src/main/java/MarketRepository.kt
+          check_grep 'Forecast integrity rule: ALL forecast candles come from BCS.' app/src/main/java/MarketRepository.kt
           check_grep 'detectPatterns' app/src/main/java/AnalyticsEngine.kt
           echo 'Documentation/terminology verification: skipped; user-facing branding is intentionally Market Forecast.'
           echo 'Project verification: OK'
