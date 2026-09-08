@@ -983,7 +983,8 @@ private fun niceStep(raw: Double): Double {
         rows = rows.map { r ->
             val c = runCatching { repo.load(r.symbol, "5y", "1d") }.getOrNull()
             val live = r.price ?: c?.lastOrNull()?.close
-            val conf = if (c != null && c.size >= 30) runCatching { AnalyticsEngine.analyze(c, live ?: c.last().close).confidence }.getOrDefault(0) else 0
+            val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, "1D", System.currentTimeMillis(), r.symbol) else c
+            val conf = if (merged != null && merged.size >= 30 && live != null && live > 0.0) runCatching { AnalyticsEngine.analyze(merged, live).confidence }.getOrDefault(0) else 0
             r.copy(price = live, confidence = conf)
         }
     }

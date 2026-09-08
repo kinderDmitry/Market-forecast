@@ -26,6 +26,7 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
     if (q == null) return last ?: 0.0
     if (last == null) return q
 
+    // ONLY MOEX is accepted for the canonical realtime price on MOEX instruments.
     // The quote is the single canonical "now" price. Do not substitute a previous
     // candle merely because it is far from the live quote: sessions, corporate
     // actions and stale candles can legitimately create large gaps. A valid quote
@@ -41,9 +42,8 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         // cache prevents repeated timeframe switches/scans from hammering the same provider.
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
-        private val quoteLocks = ConcurrentHashMap<String, Any>()
         private const val CANDLE_CACHE_MS = 120_000L
-        private const val QUOTE_CACHE_MS = 8_000L
+        private const val QUOTE_CACHE_MS = 1_000L
         private const val CATALOG_CACHE_MS = 900_000L
         @Volatile private var catalogCacheAt = 0L
         @Volatile private var catalogCache: List<SearchResult> = emptyList()
@@ -51,7 +51,7 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
     }
-    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.50"
+    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -333,41 +333,22 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
 
     fun quote(symbol: String): Double? {
         val clean = symbol.trim().uppercase(Locale.US)
-        val lock = quoteLocks.computeIfAbsent(clean) { Any() }
-        synchronized(lock) {
-            val now0 = System.currentTimeMillis()
-            val cached = quoteCache[clean]
-            if (cached != null && now0 - cached.first <= QUOTE_CACHE_MS && cached.second.isFinite() && cached.second > 0.0) {
-                return cached.second
-            }
-
-            val moex = clean.removeSuffix(".ME")
-            // Canonical source rule: Russian exchange instruments stay on MOEX for both
-            // candles and spot. Global stocks/FX use the automatic public quote feed.
-            // A per-symbol lock prevents concurrent requests from completing out of order
-            // and overwriting a newer quote with an older network response.
-            val value = when {
-                isLikelyMoex(clean) -> {
-                    runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                }
-                clean.endsWith("=X") -> {
-                    runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                        ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-                }
-                else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-            }
-
-            if (value != null) {
-                val now = System.currentTimeMillis()
-                // This is a short-lived canonical snapshot, not price smoothing. Every
-                // timeframe, forecast card, scanner row and favorite card therefore sees
-                // exactly the same quote during one UI refresh window. Real market moves are
-                // never artificially clamped or replaced by an old price.
-                quoteCache[clean] = now to value
-                return value
-            }
-            return cached?.second?.takeIf { it.isFinite() && it > 0.0 }
+        val now = System.currentTimeMillis()
+        val cached = quoteCache[clean]
+        // A quote is the canonical "now" price. It is shared by every timeframe;
+        // timeframe candles are never allowed to become the displayed live price.
+        if (cached != null && now - cached.first <= QUOTE_CACHE_MS && cached.second.isFinite() && cached.second > 0.0) {
+            return cached.second
         }
+        val moex = clean.removeSuffix(".ME")
+        val value = when {
+            isLikelyMoex(clean) -> runCatching { quoteMoex(moex) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+            clean.endsWith("=X") -> runCatching { quoteAlfaForex(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+                ?: runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+            else -> runCatching { quoteYahoo(clean) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+        }
+        if (value != null) quoteCache[clean] = now to value
+        return value
     }
 
     fun instrumentMeta(symbol: String): InstrumentMeta {
@@ -538,7 +519,9 @@ class MarketRepository(private val alphaVantageKey: String? = null) {
         val idx = (0 until cols.length()).associateBy({ cols.getString(it) }, { it })
         val row = data.optJSONArray(0) ?: return null
         fun d(name: String) = row.optDouble(idx[name] ?: -1, Double.NaN)
-        return d("LAST").takeIf { it.isFinite() && it > 0 }
+        val last = d("LAST").takeIf { it.isFinite() && it > 0 }
+        val current = d("LCURRENTPRICE").takeIf { it.isFinite() && it > 0 }
+        return current ?: last
     }
 
     private fun mentionsInstrument(n: NewsItem, q: String): Boolean {
