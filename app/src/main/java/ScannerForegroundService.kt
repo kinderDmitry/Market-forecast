@@ -97,7 +97,7 @@ class ScannerForegroundService : Service() {
                                                 val rawQuote = repo.quote(symbol)
                                                 val live = reconcileLivePrice(symbol, candles, rawQuote)
                                                 val merged = mergeRealtimeCandle(candles, live, currentTf, System.currentTimeMillis(), symbol)
-                                                val f = AnalyticsEngine.analyze(merged, live)
+                                                val f = AnalyticsEngine.analyzeForScanner(merged, live)
                                                 if (f.signal == "NO TRADE") null else {
                                                     val created = System.currentTimeMillis()
                                                     val hs = timeframeHorizonSeconds(currentTf)
@@ -140,7 +140,7 @@ class ScannerForegroundService : Service() {
                 val sorted = out.filter { it.expiresAt <= 0L || it.expiresAt > now }
                     .sortedWith(compareByDescending<ScanRow> { it.confidence }.thenByDescending { abs(it.score) })
                 val encoded = sorted.map { listOf(it.result.symbol, it.timeframe, it.signal, it.confidence, it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt).joinToString("|") }.toSet()
-                prefs.edit().putStringSet("auto_scan_results", encoded).putLong("scanner_last_run", now).putInt("scanner_last_found", sorted.size).putFloat("scanner_progress", 1f).putString("scanner_status", "Сигналы обновлены: ${sorted.size} • срок действия зависит от таймфрейма").apply()
+                prefs.edit().putStringSet("auto_scan_results", encoded).putLong("scanner_last_run", now).putInt("scanner_last_found", sorted.size).putFloat("scanner_progress", 1f).putString("scanner_status", if (sorted.isEmpty()) "Сканирование завершено: подходящих подтверждённых сигналов пока нет • проверено ${completed.get()} инструментов" else "Сигналы обновлены: ${sorted.size} • проверено ${completed.get()} инструментов • срок действия зависит от таймфрейма").apply()
                 updateForeground("Сканер обновлён", "Сигналы выдаются сразу по мере подтверждения", 1f)
 
                 // The next scan is tied to the selected signal horizon. Very short horizons
@@ -198,8 +198,12 @@ class ScannerForegroundService : Service() {
                 else -> favs.distinct()
             }
         }
-        val stocks = if (type == "STOCKS" || type == "ALL") repo.catalog().map { it.symbol }.filter { it.endsWith(".ME") || !it.contains("/") } else emptyList()
-        val fx = if (type == "FX" || type == "ALL") repo.fxCatalog().map { it.symbol } else emptyList()
+        val catalog = if (type == "FX") emptyList() else runCatching { repo.catalog() }.getOrDefault(emptyList())
+        val stocks = if (type == "STOCKS" || type == "ALL") catalog.filter {
+            val t = it.type.uppercase(Locale.US)
+            t.contains("STOCK") || t.contains("EQUITY") || t.contains("ETF") || t.contains("DEPOSITARY") || t.contains("FUND")
+        }.map { it.symbol } else emptyList()
+        val fx = if (type == "FX" || type == "ALL") runCatching { repo.fxCatalog().map { it.symbol } }.getOrDefault(emptyList()) else emptyList()
         return (stocks + fx).distinct()
     }
 

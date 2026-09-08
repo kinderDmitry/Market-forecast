@@ -480,6 +480,21 @@ object AnalyticsEngine {
         return result
     }
 
+    /** Scanner admission: keep the normal forecast conservative, but allow a
+     * clearly directional ensemble to surface as a scanner signal when the
+     * historical-edge gate is inconclusive. This never invents a direction: the
+     * direction must already be supported by the calculated score and confirmations. */
+    fun analyzeForScanner(c: List<Candle>, entryOverride: Double? = null): Forecast {
+        val f = analyze(c, entryOverride)
+        if (f.signal != "NO TRADE") return f
+        val direction = when {
+            f.score >= 4.2 && f.confirmation >= 3 -> "LONG"
+            f.score <= -4.2 && f.confirmation <= -3 -> "SHORT"
+            else -> return f
+        }
+        return f.copy(signal = direction, highConviction = false)
+    }
+
     private fun analyzeInternal(c: List<Candle>, entryOverride: Double? = null, calibrate: Boolean): Forecast {
         require(c.size >= 30) { "Недостаточно исторических данных" }
         val closes = c.map { it.close }; val price = entryOverride?.takeIf { it.isFinite() && it > 0.0 } ?: closes.last(); require(price.isFinite() && price > 0.0) { "Цена должна быть положительной и конечной" }

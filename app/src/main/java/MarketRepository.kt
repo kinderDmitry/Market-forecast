@@ -41,6 +41,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         // cache prevents repeated timeframe switches/scans from hammering the same provider.
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
+        private val stableQuoteCache = ConcurrentHashMap<String, Double>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
@@ -64,15 +65,16 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         // dataset, otherwise the same instrument can have different prices/levels
         // between screens and timeframes.
         if (!bcsRefreshToken.isNullOrBlank()) {
-            val raw = runCatching { loadBcs(clean, range, interval) }.getOrElse {
-                throw IllegalStateException("БКС: не удалось получить свечи для $symbol: ${it.message ?: "ошибка источника"}")
-            }
-            val normalized = normalizeInterval(raw, interval)
+            val fetched = runCatching { loadBcs(clean, range, interval) }
+            val normalized = fetched.getOrNull()?.let { normalizeInterval(it, interval) }.orEmpty()
             if (normalized.isNotEmpty()) {
                 candleCache[cacheKey] = System.currentTimeMillis() to normalized
                 return normalized
             }
-            throw IllegalStateException("БКС не вернул свечи для $symbol ($interval)")
+            // Stale-while-revalidate: temporary BCS timeout/rate-limit must not
+            // make an already loaded timeframe disappear from the UI.
+            cached?.second?.takeIf { it.isNotEmpty() }?.let { return it }
+            throw IllegalStateException("БКС: не удалось получить свечи для $symbol ($interval): ${fetched.exceptionOrNull()?.message ?: "пустой ответ"}")
         }
         // Forecasts are intentionally fail-closed: without BCS credentials there is
         // no fallback provider. This prevents a hidden secondary price source from entering
@@ -107,15 +109,23 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     fun search(query: String): List<SearchResult> {
         val q = query.trim()
         if (q.length < 2 || !isBcsConfigured()) return emptyList()
-        // BCS is the only market-data/catalog provider. Search is performed against
-        // the BCS instrument directory, so a symbol cannot silently switch to MOEX,
-        // Yahoo or another quote source.
         val universe = runCatching { catalog() }.getOrDefault(emptyList())
         val needle = q.lowercase(Locale.ROOT)
-        return universe.filter {
-            it.symbol.lowercase(Locale.ROOT).contains(needle) ||
-            it.name.lowercase(Locale.ROOT).contains(needle)
-        }.take(30)
+        val compact = needle.replace(" ", "").replace("-", "").replace("/", "")
+        return universe.mapNotNull { item ->
+            val symbol = item.symbol.lowercase(Locale.ROOT)
+            val name = item.name.lowercase(Locale.ROOT)
+            val nameCompact = name.replace(" ", "").replace("-", "").replace("/", "")
+            val rank = when {
+                symbol == needle || name == needle -> 0
+                symbol.startsWith(needle) || name.startsWith(needle) -> 1
+                symbol.contains(needle) || name.contains(needle) -> 2
+                symbol.replace(".me", "").startsWith(compact) || nameCompact.contains(compact) -> 3
+                else -> return@mapNotNull null
+            }
+            rank to item
+        }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
+            .take(30).map { it.second }
     }
 
     /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
@@ -159,7 +169,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
                     val item = SearchResult(ticker, name, exchange, typeName, "БКС")
                     out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
                 }
-                if (arr.length() < 100 || out.size == before) break
+                if (arr.length() < 100) break
                 page++
             }
         }
@@ -349,7 +359,13 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         } else {
             throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
         }
-        if (value != null) quoteCache[quoteKey] = now to value
+        if (value != null) {
+            val previous = stableQuoteCache[quoteKey]
+            val candidate = if (previous != null && previous > 0.0 && abs(value - previous) / previous > 0.15) previous else value
+            stableQuoteCache[quoteKey] = candidate
+            quoteCache[quoteKey] = now to candidate
+            return candidate
+        }
         return value
     }
 
@@ -412,17 +428,10 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     }
 
     private fun normalizeInterval(candles: List<Candle>, interval: String): List<Candle> {
-        val sorted = candles.sortedBy { it.time }
-        if (interval != "4h" || sorted.size < 4) return sorted
-        val out = mutableListOf<Candle>(); var group = mutableListOf<Candle>(); var prevTime = 0L
-        fun flush() { if (group.size == 4) out += Candle(group.first().time, group.first().open, group.maxOf{it.high}, group.minOf{it.low}, group.last().close, group.sumOf{it.volume}); group = mutableListOf() }
-        for (c in sorted) {
-            // Do not merge across market-session gaps; that would manufacture a false 4H candle.
-            if (group.isNotEmpty() && c.time - prevTime > 2 * 60 * 60 * 1000L) flush()
-            group += c; prevTime = c.time
-            if (group.size == 4) flush()
-        }
-        return out
+        // BCS already returns the requested timeframe. In particular, H4 is an H4
+        // candle, not four 1H candles. Aggregating it again used to collapse valid
+        // 4H history and made that timeframe intermittently disappear.
+        return candles.sortedBy { it.time }.distinctBy { it.time }
     }
 
     private val bcsInstrumentCache = ConcurrentHashMap<String, Pair<String, String>>()
