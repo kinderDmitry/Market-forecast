@@ -490,7 +490,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         val start = end - days * 86_400_000L
         // BCS limits a single candle response to 1440 bars. Keep requests bounded.
         val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D1" -> 1440; else -> 10080 }
-        val chunks = maxOf(1, ((days * 1440.0) / maxSpan / 1440.0).ceil().toInt())
+        val chunks = maxOf(1, kotlin.math.ceil((days * 1440.0) / maxSpan / 1440.0).toInt())
         val out = mutableListOf<Candle>()
         val chunkMs = maxOf(86_400_000L, (1440L * maxSpan) * 60_000L)
         var cursor = start
