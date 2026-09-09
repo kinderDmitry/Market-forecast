@@ -294,7 +294,7 @@ fun MarketForecastApp(ctx: Context) {
         withContext(Dispatchers.IO) { runCatching { repo.catalog() } }
     }
     LaunchedEffect(query) {
-        if (query.trim().length < 2) { results = emptyList(); searching = false; return@LaunchedEffect }
+        if (query.trim().isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
         delay(if (query.trim().length == 1) 180 else 260); searching = true
         results = withContext(Dispatchers.IO) { runCatching { repo.search(query.trim()) }.getOrDefault(emptyList()) }
         searching = false
@@ -990,6 +990,40 @@ private fun niceStep(raw: Double): Double {
 }
 
 data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
+
+@Composable private fun Favorites(favs: List<String>, ru: Boolean, repo: MarketRepository, save: (Set<String>) -> Unit, load: (String) -> Unit, refreshTick: Long = 0L) {
+    var sort by remember { mutableStateOf("PRICE_ASC") }
+    var rows by remember(favs) { mutableStateOf(favs.map { FavoriteQuote(it, null, 0) }) }
+    LaunchedEffect(favs, refreshTick) {
+        rows = withContext(Dispatchers.IO) { favs.map { s -> FavoriteQuote(s, runCatching { repo.quote(s) }.getOrNull(), 0) }.toMutableList() }
+        rows = rows.map { r ->
+            val c = runCatching { repo.load(r.symbol, "5y", "1d") }.getOrNull()
+            val live = r.price ?: c?.lastOrNull()?.close
+            val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, "1D", System.currentTimeMillis(), r.symbol) else c
+            val conf = if (merged != null && merged.size >= 30 && live != null && live > 0.0) runCatching { AnalyticsEngine.analyze(merged, live).confidence }.getOrDefault(0) else 0
+            r.copy(price = live, confidence = conf)
+        }
+    }
+    val sorted = when(sort) { "PRICE_DESC" -> rows.sortedByDescending { it.price ?: Double.NEGATIVE_INFINITY }; "CONF_DESC" -> rows.sortedByDescending { it.confidence }; else -> rows.sortedBy { it.price ?: Double.POSITIVE_INFINITY } }
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        item { SectionHeader(if (ru) "Избранное" else "Favorites", if (ru) "Сортировка по цене и уверенности" else "Sort by price and confidence") }
+        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("PRICE_ASC","PRICE_DESC","CONF_DESC").forEach { k -> FilterChip(selected=sort==k,onClick={sort=k},label={Text(if(ru) when(k){"PRICE_ASC"->"Цена ↑";"PRICE_DESC"->"Цена ↓";else->"Уверенность ↓"} else k,fontSize=8.sp)}) } } }
+        if (sorted.isEmpty()) item { EmptyCard(if (ru) "Избранное пусто. Найди инструмент через Поиск." else "Favorites are empty. Find an instrument in Search.") }
+        items(sorted, key={it.symbol}) { r ->
+            GradientCard(Modifier.fillMaxWidth().clickable { load(r.symbol) }) {
+                Row(verticalAlignment=Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text(r.symbol.removeSuffix(".ME"), fontWeight=FontWeight.Black, fontSize=16.sp); Text(if(ru) "Live цена • уверенность ${r.confidence}%" else "Live price • confidence ${r.confidence}%", fontSize=9.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
+                    Text(r.price?.let(::fmt) ?: "—", fontSize=18.sp, fontWeight=FontWeight.Black, color=Accent, modifier=Modifier.padding(end=6.dp))
+                    IconButton({ save(favs.toSet()-r.symbol) }) { Icon(Icons.Default.Delete,null,tint=Negative) }
+                }
+            }
+        }
+    }
+}
+
+data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
+
+
 
 @Composable private fun History(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean, repo: MarketRepository, load: (String) -> Unit, remove: (HistoryEntry) -> Unit, stats: () -> Unit, initialTab: String = "TRACKING", onTab: (String) -> Unit = {}, refreshTick: Long = 0L) {
     var tab by remember(initialTab) { mutableStateOf(initialTab) }

@@ -280,3 +280,5 @@ class ScannerForegroundService : Service() {
         const val NOTIFICATION_ID = 78032
     }
 }
+
+}
