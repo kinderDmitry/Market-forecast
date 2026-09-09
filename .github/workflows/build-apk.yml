@@ -136,8 +136,8 @@ jobs:
           check_grep 'android:icon="@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml
           check_grep 'import kotlin.math.abs' app/src/main/java/TrackingEngine.kt
           check_grep 'val monitorMinConf = p.getInt("alert_min_confidence", 60)' app/src/main/java/MarketMonitorWorker.kt
-          check_grep 'versionCode = 115' app/build.gradle.kts
-          check_grep 'versionName = "4.8.74"' app/build.gradle.kts
+          check_grep 'versionCode = 118' app/build.gradle.kts
+          check_grep 'versionName = "4.8.78"' app/build.gradle.kts
           check_no_grep 'interval == "15m".*loadMoex(moex, "15m")' app/src/main/java/MarketRepository.kt
           check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.tp2?.toString() ?: "105")' app/src/main/java/MainActivity.kt
