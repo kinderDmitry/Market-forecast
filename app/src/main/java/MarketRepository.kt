@@ -45,8 +45,9 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
-        @Volatile private var catalogCacheAt = 0L
-        @Volatile private var catalogCache: List<SearchResult> = emptyList()
+        // Cache is keyed by the requested instrument-type set. A single global
+        // catalogue used to let a previous STOCK search poison a later FX scan.
+        private val catalogCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
@@ -167,9 +168,15 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
         // For one-character autocomplete, prefix matches are the primary result set.
         // Keep a small set of direct seeds visible even while the BCS catalogue is warming.
+        // Autocomplete must react from the very first character. Keep a local
+        // BCS-backed seed index available immediately, while the full BCS catalogue
+        // is loading. This also makes Cyrillic input ("с", "ц", "р") useful.
         val seedMatches = popularSeeds().filter { seed ->
-            val s = seed.symbol.lowercase(Locale.ROOT)
-            s.startsWith(needle) || s.startsWith(transliterated)
+            val symbol = seed.symbol.lowercase(Locale.ROOT)
+            val name = seed.name.lowercase(Locale.ROOT)
+            val translitName = transliterateRuToLat(name)
+            symbol.startsWith(needle) || name.startsWith(needle) ||
+                (transliterated.isNotBlank() && (symbol.startsWith(transliterated) || translitName.startsWith(transliterated)))
         }
         return (direct.values + seedMatches + matched).distinctBy { it.symbol.uppercase(Locale.US) }.take(50)
     }
@@ -196,8 +203,9 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     private fun loadCatalog(types: List<String>, maxPagesPerType: Int): List<SearchResult> {
         if (!isBcsConfigured()) return emptyList()
         val now = System.currentTimeMillis()
-        val cached = catalogCache
-        if (cached.isNotEmpty() && now - catalogCacheAt <= CATALOG_CACHE_MS) return cached
+        val cacheKey = types.map { it.uppercase(Locale.US) }.distinct().sorted().joinToString(",")
+        val cached = catalogCaches[cacheKey]
+        if (cached != null && cached.second.isNotEmpty() && now - cached.first <= CATALOG_CACHE_MS) return cached.second
 
         val out = LinkedHashMap<String, SearchResult>()
         for (type in types) {
@@ -253,8 +261,7 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         }
         val result = out.values.toList()
         if (result.isNotEmpty()) {
-            catalogCache = result
-            catalogCacheAt = System.currentTimeMillis()
+            catalogCaches[cacheKey] = System.currentTimeMillis() to result
         }
         return result
     }
@@ -269,9 +276,16 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     }
 
     private fun popularSeeds(): List<SearchResult> = listOf(
-        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "MGNT", "MOEX", "YDEX", "OZON",
-        "USDRUB=X", "EURRUB=X", "CNYRUB=X"
-    ).map { SearchResult(it, it, "BCS", "", "БКС") }
+        "SBER" to "Сбербанк", "GAZP" to "Газпром", "LKOH" to "Лукойл", "ROSN" to "Роснефть",
+        "NVTK" to "Новатэк", "TATN" to "Татнефть", "MGNT" to "Магнит", "MOEX" to "Московская биржа",
+        "YDEX" to "Яндекс", "OZON" to "Ozon", "CIAN" to "ЦИАН", "AFLT" to "Аэрофлот",
+        "VTBR" to "ВТБ", "MTSS" to "МТС", "GMKN" to "Норникель", "PLZL" to "Полюс",
+        "PHOR" to "ФосАгро", "RTKM" to "Ростелеком", "ALRS" to "АЛРОСА", "FLOT" to "Совкомфлот",
+        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "USDRUB=X" to "Доллар / Рубль",
+        "EURRUB=X" to "Евро / Рубль", "CNYRUB=X" to "Юань / Рубль"
+    ).map { (symbol, name) ->
+        SearchResult(symbol, name, "БКС", if (symbol.endsWith("=X")) "CURRENCY" else "STOCK", "БКС")
+    }
 
     private fun normalizeFx(q: String): SearchResult? {
         val x = q.uppercase(Locale.US).replace("/", "").replace("-", "").replace(" ", "")
@@ -456,6 +470,23 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         return value
     }
 
+
+    /** Fetch a quote without the normal 5-second UI cache. Used at a tracking
+     * horizon boundary so History records the actual completion price, not the
+     * price that happened to be cached at entry. */
+    fun quoteFresh(symbol: String): Double? {
+        val clean = symbol.trim().uppercase(Locale.US)
+        if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
+        val value = runCatching { quoteBcs(clean) }.getOrElse {
+            throw IllegalStateException("БКС: не удалось получить актуальную котировку $symbol: ${it.message ?: "ошибка источника"}")
+        }?.takeIf { it.isFinite() && it > 0.0 }
+            ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
+        val now = System.currentTimeMillis()
+        val key = "BCS|$clean"
+        stableQuoteCache[key] = value
+        quoteCache[key] = now to value
+        return value
+    }
 
     fun isBcsConfigured(): Boolean = !bcsRefreshToken.isNullOrBlank()
 

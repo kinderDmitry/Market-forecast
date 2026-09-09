@@ -198,7 +198,15 @@ fun MarketForecastApp(ctx: Context) {
         state = MarketState(selected, loading = true, timeframe = time, dataSource = repo.forecastSource(selected))
         scope.launch {
             val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; else -> "5y" to "1d" }
-            val candlesRaw = withContext(Dispatchers.IO) { runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse { emptyList() } }
+            val candlesRaw = withContext(Dispatchers.IO) {
+                runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse {
+                    // Never blank the chart merely because BCS timed out while switching
+                    // timeframes. The repository already keeps a stale-while-revalidate
+                    // cache; if a refresh still fails, retain the currently displayed
+                    // dataset for this instrument until a valid replacement arrives.
+                    state.candles.takeIf { state.symbol.equals(selected, true) && state.candles.isNotEmpty() }.orEmpty()
+                }
+            }
             val meta = withContext(Dispatchers.IO) { repo.instrumentMeta(selected) }
             val quoted = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
             val live = reconcileLivePrice(selected, candlesRaw, quoted)

@@ -82,7 +82,13 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
             if (t.result != "PENDING") continue
             val pair = timeframePair(t.timeframe)
             val candles = runCatching { repo.load(t.symbol, pair.first, pair.second) }.getOrDefault(emptyList())
-            val livePrice = reconcileLivePrice(t.symbol, candles, runCatching { repo.quote(t.symbol) }.getOrNull())
+            // At the exact horizon boundary bypass the short quote cache. This prevents
+            // History from closing a forecast at the same stale price used when it was added.
+            val livePrice = if (now >= t.checkAt) {
+                reconcileLivePrice(t.symbol, candles, runCatching { repo.quoteFresh(t.symbol) }.getOrNull())
+            } else {
+                reconcileLivePrice(t.symbol, candles, runCatching { repo.quote(t.symbol) }.getOrNull())
+            }
             android.util.Log.d("MFP_TRACK", "id=${t.id} now=$now checkAt=${t.checkAt} candles=${candles.size} live=$livePrice")
             val evaluation = TrackingEngine.evaluate(t, candles, livePrice, now)
             if (evaluation == null && now >= t.checkAt) {
