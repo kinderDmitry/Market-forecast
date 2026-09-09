@@ -286,16 +286,17 @@ class ScannerForegroundService : Service() {
         val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
         // scannerCatalog() returns SearchResult objects. Keep the metadata until the
         // final symbol projection; never treat SearchResult as a String.
+        // scannerCatalog(type) already applies the requested BCS instrument classes.
+        // Do not filter again by the provider's human-readable `type` field: BCS can
+        // return localized/provider-specific labels (e.g. "Акции", "Equity", etc.),
+        // which previously caused the whole market catalogue to collapse to zero
+        // symbols even though the API had returned valid instruments.
+        val catalogSymbols = catalog.map(SearchResult::symbol).filter { it.isNotBlank() }.distinct()
         val stocks = if (type == "STOCKS" || type == "ALL") {
-            catalog.filter { item ->
-                val kind = item.type.uppercase(Locale.US)
-                kind.contains("STOCK") || kind.contains("EQUITY") || kind.contains("ETF") ||
-                    kind.contains("DEPOSITARY") || kind.contains("FUND")
-            }.map(SearchResult::symbol)
+            catalogSymbols.filterNot { it.contains("/") || it.endsWith("=X", ignoreCase = true) }
         } else emptyList()
         val fx = if (type == "FX" || type == "ALL") {
-            catalog.filter { item -> item.type.contains("CURRENCY", true) || item.symbol.endsWith("=X") }
-                .map(SearchResult::symbol)
+            catalogSymbols.filter { it.endsWith("=X", ignoreCase = true) || it.contains("/") }
         } else emptyList()
         val resolved = (stocks + fx).filter { it.isNotBlank() }.distinct()
         if (resolved.isNotEmpty()) return resolved

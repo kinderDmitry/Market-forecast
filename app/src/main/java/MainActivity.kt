@@ -1050,7 +1050,7 @@ private fun niceStep(raw: Double): Double {
         if(tab=="TRACKING"){
             item{GradientCard(Modifier.fillMaxWidth()){Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){StatBlock(if(ru)"Активные" else "Active",pending.size.toString(),Accent);StatBlock(if(ru)"Завершены" else "Completed",tracked.count{it.result!="PENDING"}.toString(),Positive);StatBlock(if(ru)"Всего" else "Total",tracked.size.toString(),Blue)}}}
             if(pending.isEmpty()) item{EmptyCard(if(ru)"Активных отслеживаний нет. Добавь прогноз через кнопку «Отслеживать прогноз»." else "No active tracking. Add a forecast with Track forecast.")}
-            items(pending,key={it.id}){t->TrackingRow(t,ru,repo,prefs,{load(t.symbol)})}
+            items(pending,key={it.id}){t->TrackingRow(t,ru,repo,prefs,{load(t.symbol)},refreshTick)}
         } else if(tab=="HISTORY"){
             item{GradientCard(Modifier.fillMaxWidth()){Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){StatBlock(if(ru)"Всего" else "Total",history.size.toString(),Accent);StatBlock(if(ru)"Завершено" else "Completed",done.toString(),Warning);StatBlock(if(ru)"Точность" else "Accuracy",if(done==0)"—" else "${wins*100/done}%",Positive)}}}
             items(history,key={"${it.symbol}|${it.time}"}){h->HistoryRow(h,ru,repo,tracked,{load(h.symbol)},{remove(h)})}
@@ -1061,7 +1061,7 @@ private fun niceStep(raw: Double): Double {
     }
 }
 
-@Composable private fun TrackingRow(t: TrackedForecast, ru: Boolean, repo: MarketRepository, prefs: android.content.SharedPreferences, open: () -> Unit) {
+@Composable private fun TrackingRow(t: TrackedForecast, ru: Boolean, repo: MarketRepository, prefs: android.content.SharedPreferences, open: () -> Unit, refreshTick: Long = 0L) {
     var live by remember(t.id) { mutableStateOf(t.lastLivePrice.takeIf { it > 0.0 }) }
     var now by remember(t.id) { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(t.id, t.lastUpdated, refreshTick) {
