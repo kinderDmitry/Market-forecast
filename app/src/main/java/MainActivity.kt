@@ -1147,6 +1147,48 @@ private fun niceStep(raw: Double): Double {
     }
 }
 
+private data class HistoryPnl(val amount: Double, val percent: Double)
+
+private fun historyPnl(h: HistoryEntry): HistoryPnl? {
+    val entry = h.price
+    val close = h.closingPrice
+    if (!entry.isFinite() || !close.isFinite() || entry <= 0.0 || close <= 0.0) return null
+    val longSide = h.signal.contains("LONG", ignoreCase = true)
+    val amount = if (longSide) close - entry else entry - close
+    return HistoryPnl(amount, amount / entry * 100.0)
+}
+
+@Composable private fun HistoryPnlCard(h: HistoryEntry, ru: Boolean, prefs: android.content.SharedPreferences) {
+    val pnl = historyPnl(h)
+    val sourceCurrency = "RUB"
+    val amountText = pnl?.let { CurrencyDisplay.pnl(h.price, h.closingPrice, sourceCurrency, h.signal.contains("LONG", true), prefs) } ?: "—"
+    val percentText = pnl?.let { "${if (it.percent >= 0) "+" else "−"}${String.format(Locale.US, "%.2f", abs(it.percent))}%" } ?: "—"
+    val positive = pnl?.amount?.let { it > 1e-12 } == true
+    val negative = pnl?.amount?.let { it < -1e-12 } == true
+    val tone = when { positive -> Positive; negative -> Negative; else -> Warning }
+    val title = when { positive -> if (ru) "ПРИБЫЛЬ" else "PROFIT"; negative -> if (ru) "УБЫТОК" else "LOSS"; else -> if (ru) "БЕЗ ИЗМЕНЕНИЯ" else "FLAT" }
+    val icon = when { positive -> Icons.Default.TrendingUp; negative -> Icons.Default.TrendingDown; else -> Icons.Default.Remove }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = tone.copy(alpha = 0.10f),
+        border = androidx.compose.foundation.BorderStroke(1.3.dp, tone.copy(alpha = 0.72f)),
+        shadowElevation = 8.dp
+    ) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(shape = CircleShape, color = tone.copy(alpha = 0.18f)) {
+                Icon(icon, contentDescription = null, tint = tone, modifier = Modifier.padding(8.dp).size(22.dp))
+            }
+            Column(Modifier.padding(start = 11.dp).weight(1f)) {
+                Text(title, color = tone, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.2.sp)
+                Text(amountText, color = tone, fontSize = 20.sp, fontWeight = FontWeight.Black)
+                Text(if (ru) "Результат: $percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}" else "Result: $percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text(percentText, color = tone, fontSize = 15.sp, fontWeight = FontWeight.Black)
+        }
+    }
+}
+
 @Composable private fun HistoryRow(h: HistoryEntry, ru: Boolean, repo: MarketRepository, tracked: List<TrackedForecast>, open: () -> Unit, remove: () -> Unit) {
     // History is an immutable audit record. It must NEVER replace the recorded
     // closing price with today's live quote; live quotes belong only to Tracking.
@@ -1159,16 +1201,25 @@ private fun niceStep(raw: Double): Double {
                 Text(SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(h.time)), fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("${h.signal} • ${h.confidence}% • ${if (ru) "Цена при добавлении" else "Added price"}: ${fmt(h.price)} • ${h.timeframe}", fontSize = 9.sp)
                 val close = h.closingPrice.takeIf { it > 0.0 }
+                if (h.result.isNotBlank() && close != null) HistoryPnlCard(h, ru, LocalContext.current.getSharedPreferences("mfprefs", Context.MODE_PRIVATE))
                 Text(
                     if (h.result.isBlank()) {
                         if (ru) "Ожидание результата • прошло ${formatElapsed(elapsed)}" else "Waiting • elapsed ${formatElapsed(elapsed)}"
                     } else {
                         val hits = h.hitSummary.ifBlank { "—" }
-                        if (ru) "Результат: ${if(h.result=="≈") "≈ без изменения" else h.result} • события: $hits • прошло ${formatElapsed(elapsed)} • открытие ${fmt(h.price)} • закрытие ${close?.let(::fmt) ?: "—"}"
-                        else "Result: ${h.result} • events: $hits • elapsed ${formatElapsed(elapsed)} • open ${fmt(h.price)} • close ${close?.let(::fmt) ?: "—"}"
+                        val pnl = historyPnl(h)
+                        val pnlLabel = when {
+                            pnl == null -> if (ru) "P/L: —" else "P/L: —"
+                            pnl.amount > 1e-12 -> if (ru) "Результат: ✓ Прибыль ${if (pnl.percent >= 0) "+" else "−"}${String.format(Locale.US, "%.2f", pnl.percent)}%" else "Result: ✓ Profit ${String.format(Locale.US, "%+.2f", pnl.percent)}%"
+                            pnl.amount < -1e-12 -> if (ru) "Результат: ✕ Убыток −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%" else "Result: ✕ Loss −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%"
+                            else -> if (ru) "Результат: ≈ Без изменения 0.00%" else "Result: ≈ Flat 0.00%"
+                        }
+                        if (ru) "$pnlLabel • события: $hits • прошло ${formatElapsed(elapsed)} • открытие ${fmt(h.price)} • закрытие ${close?.let(::fmt) ?: "—"}"
+                        else "$pnlLabel • events: $hits • elapsed ${formatElapsed(elapsed)} • open ${fmt(h.price)} • close ${close?.let(::fmt) ?: "—"}"
                     },
                     fontSize=9.sp,
-                    color=if(h.result=="✓") Positive else if(h.result=="✕") Negative else Warning
+                    fontWeight = if (h.result.isNotBlank()) FontWeight.Bold else FontWeight.Normal,
+                    color=if(historyPnl(h)?.amount?.let { it > 1e-12 } == true || h.result=="✓") Positive else if(historyPnl(h)?.amount?.let { it < -1e-12 } == true || h.result=="✕") Negative else Warning
                 )
                 if (close != null) Text(if (ru) "Зафиксированная цена завершения: ${fmt(close)}" else "Recorded closing price: ${fmt(close)}", fontSize = 8.sp, color = Accent)
             }
