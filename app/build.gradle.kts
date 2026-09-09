@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 115
-        versionName = "4.8.75"
+        versionName = "4.8.74"
     }
     buildFeatures { compose = true }
 
