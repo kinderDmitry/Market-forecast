@@ -295,7 +295,7 @@ fun MarketForecastApp(ctx: Context) {
     }
     LaunchedEffect(query) {
         if (query.trim().length < 2) { results = emptyList(); searching = false; return@LaunchedEffect }
-        delay(300); searching = true
+        delay(if (query.trim().length == 1) 180 else 260); searching = true
         results = withContext(Dispatchers.IO) { runCatching { repo.search(query.trim()) }.getOrDefault(emptyList()) }
         searching = false
     }
@@ -912,64 +912,77 @@ private fun niceStep(raw: Double): Double {
 @Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
     val ctx = LocalContext.current
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
-    var searchHistory by remember { mutableStateOf(loadSearchHistory(prefs)) }; var searchFilter by remember { mutableStateOf(prefs.getString("search_filter", "ALL") ?: "ALL") }
+    var searchHistory by remember { mutableStateOf(loadSearchHistory(prefs)) }
+    var searchFilter by remember { mutableStateOf(prefs.getString("search_filter", "ALL") ?: "ALL") }
+    val filtered = results.filter { matchesSearchFilter(it, searchFilter) }
+    val prefix = q.trim()
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
         item {
-            OutlinedTextField(q, setQ, Modifier.fillMaxWidth(), singleLine = true,
-                placeholder = { Text(if (ru) "Акция, ETF, индекс, валютная пара, крипто…" else "Stock, ETF, index, FX pair, crypto…") },
-                leadingIcon = { Icon(Icons.Default.Search, null) },
-                trailingIcon = { if (q.isNotEmpty()) IconButton({ setQ("") }) { Icon(Icons.Default.Close, if (ru) "Очистить" else "Clear") } },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = {
-                    if (q.trim().isNotEmpty()) { searchHistory = saveSearchHistory(prefs, q.trim()) }
-                }))
+            GradientCard(Modifier.fillMaxWidth()) {
+                Text(if (ru) "🔎 Поиск инструмента" else "🔎 Instrument search", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                Text(
+                    if (ru) "Начните с первой буквы — акции и валюты появятся сразу. Можно вводить русское или английское название/тикер."
+                    else "Type the first letter — stocks and currencies appear immediately. Russian or English names/tickers are supported.",
+                    fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+                OutlinedTextField(
+                    value = q,
+                    onValueChange = setQ,
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    singleLine = true,
+                    placeholder = { Text(if (ru) "Например: с, s, циан, cian, usd…" else "For example: s, c, cian, usd…") },
+                    leadingIcon = { Icon(Icons.Default.Search, null) },
+                    trailingIcon = { if (q.isNotEmpty()) IconButton({ setQ("") }) { Icon(Icons.Default.Close, if (ru) "Очистить" else "Clear") } },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = {
+                        if (q.trim().isNotEmpty()) searchHistory = saveSearchHistory(prefs, q.trim())
+                    })
+                )
+            }
         }
-        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("ALL","STOCK","FX","ETF","INDEX").forEach { f -> FilterChip(selected = searchFilter == f, onClick = { searchFilter=f; prefs.edit().putString("search_filter", f).apply() }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";"ETF"->"ETF";"INDEX"->"Индексы";else->"Все"} else f,fontSize=8.sp) }) } } }
-        if (q.isBlank() && searchHistory.isNotEmpty()) {
+        item {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("ALL","STOCK","FX","ETF","INDEX").forEach { f ->
+                    FilterChip(selected = searchFilter == f, onClick = { searchFilter=f; prefs.edit().putString("search_filter", f).apply() }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";"ETF"->"ETF";"INDEX"->"Индексы";else->"Все"} else f,fontSize=8.sp) })
+                }
+            }
+        }
+        if (prefix.isBlank() && searchHistory.isNotEmpty()) {
             item { SectionHeader(if (ru) "История поиска" else "Search history", if (ru) "Последние запросы" else "Recent searches") }
             items(searchHistory) { h ->
                 Row(Modifier.fillMaxWidth().clickable { setQ(h) }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.History, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp)); Text(h, Modifier.padding(start = 10.dp), fontSize = 11.sp)
+                    Icon(Icons.Default.History, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+                    Text(h, Modifier.padding(start = 10.dp), fontSize = 11.sp)
                 }
             }
         }
-        item { Text(if (ru) "Поиск использует единый каталог БКС и данные БКС без переключения на другие источники." else "Search uses the BCS instrument catalogue and BCS market data only.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        if (prefix.isNotBlank()) {
+            item {
+                SectionHeader(
+                    if (ru) "Подсказки по «$prefix»" else "Suggestions for “$prefix”",
+                    if (ru) "${filtered.size} найдено • совпадение с начала названия или тикера" else "${filtered.size} found • prefix match on name or ticker"
+                )
+            }
+        }
         if (loading) item { Loading(ru) }
-        items(results.filter { matchesSearchFilter(it, searchFilter) }) { r ->
-            GradientCard(Modifier.fillMaxWidth().clickable { searchHistory = saveSearchHistory(prefs, q.trim()); pick(r) }) {
+        if (!loading && prefix.isNotBlank() && filtered.isEmpty()) {
+            item { EmptyCard(if (ru) "Ничего не найдено. Попробуйте другую букву, русское название или тикер." else "Nothing found. Try another letter, Russian name, or ticker.") }
+        }
+        items(filtered.take(50), key = { "${it.symbol}|${it.type}" }) { r ->
+            val isFav = favs.contains(r.symbol)
+            GradientCard(Modifier.fillMaxWidth().clickable { searchHistory = saveSearchHistory(prefs, prefix); pick(r) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text(r.name, fontWeight = FontWeight.Bold); Text("${r.symbol} • ${r.exchange} • ${r.type} • ${r.source}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    IconButton({ if (favs.contains(r.symbol)) save(favs - r.symbol) else save(favs + r.symbol) }) { Icon(if (favs.contains(r.symbol)) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }
-                }
-            }
-        }
-    }
-}
-
-@Composable private fun Favorites(favs: List<String>, ru: Boolean, repo: MarketRepository, save: (Set<String>) -> Unit, load: (String) -> Unit, refreshTick: Long = 0L) {
-    var sort by remember { mutableStateOf("PRICE_ASC") }
-    var rows by remember(favs) { mutableStateOf(favs.map { FavoriteQuote(it, null, 0) }) }
-    LaunchedEffect(favs, refreshTick) {
-        rows = withContext(Dispatchers.IO) { favs.map { s -> FavoriteQuote(s, runCatching { repo.quote(s) }.getOrNull(), 0) }.toMutableList() }
-        rows = rows.map { r ->
-            val c = runCatching { repo.load(r.symbol, "5y", "1d") }.getOrNull()
-            val live = r.price ?: c?.lastOrNull()?.close
-            val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, "1D", System.currentTimeMillis(), r.symbol) else c
-            val conf = if (merged != null && merged.size >= 30 && live != null && live > 0.0) runCatching { AnalyticsEngine.analyze(merged, live).confidence }.getOrDefault(0) else 0
-            r.copy(price = live, confidence = conf)
-        }
-    }
-    val sorted = when(sort) { "PRICE_DESC" -> rows.sortedByDescending { it.price ?: Double.NEGATIVE_INFINITY }; "CONF_DESC" -> rows.sortedByDescending { it.confidence }; else -> rows.sortedBy { it.price ?: Double.POSITIVE_INFINITY } }
-    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-        item { SectionHeader(if (ru) "Избранное" else "Favorites", if (ru) "Сортировка по цене и уверенности" else "Sort by price and confidence") }
-        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("PRICE_ASC","PRICE_DESC","CONF_DESC").forEach { k -> FilterChip(selected=sort==k,onClick={sort=k},label={Text(if(ru) when(k){"PRICE_ASC"->"Цена ↑";"PRICE_DESC"->"Цена ↓";else->"Уверенность ↓"} else k,fontSize=8.sp)}) } } }
-        if (sorted.isEmpty()) item { EmptyCard(if (ru) "Избранное пусто. Найди инструмент через Поиск." else "Favorites are empty. Find an instrument in Search.") }
-        items(sorted, key={it.symbol}) { r ->
-            GradientCard(Modifier.fillMaxWidth().clickable { load(r.symbol) }) {
-                Row(verticalAlignment=Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text(r.symbol.removeSuffix(".ME"), fontWeight=FontWeight.Black, fontSize=16.sp); Text(if(ru) "Live цена • уверенность ${r.confidence}%" else "Live price • confidence ${r.confidence}%", fontSize=9.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
-                    Text(r.price?.let(::fmt) ?: "—", fontSize=18.sp, fontWeight=FontWeight.Black, color=Accent, modifier=Modifier.padding(end=6.dp))
-                    IconButton({ save(favs.toSet()-r.symbol) }) { Icon(Icons.Default.Delete,null,tint=Negative) }
+                    Box(
+                        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(signalColor(if (r.type.contains("CURRENCY", true)) "LONG" else "NO TRADE").copy(alpha=.12f)),
+                        contentAlignment = Alignment.Center
+                    ) { Text(if (r.type.contains("CURRENCY", true)) "₽" else "▣", color = Accent, fontWeight = FontWeight.Black, fontSize = 16.sp) }
+                    Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                        Text(r.name, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Text(r.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 10.sp, color = Accent)
+                        Text("${r.exchange} • ${r.type} • ${r.source}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton({ if (isFav) save(favs - r.symbol) else save(favs + r.symbol) }) { Icon(if (isFav) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }
                 }
             }
         }
@@ -1083,37 +1096,35 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
 }
 
 @Composable private fun HistoryRow(h: HistoryEntry, ru: Boolean, repo: MarketRepository, tracked: List<TrackedForecast>, open: () -> Unit, remove: () -> Unit) {
-    var live by remember(h.symbol, h.time) { mutableStateOf<Double?>(null) }
-    var now by remember(h.symbol, h.time) { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(h.symbol, h.time) { live = withContext(Dispatchers.IO) { repo.quote(h.symbol) }; while(true){delay(1000);now=System.currentTimeMillis()} }
-    val delta = if (live != null && h.price > 0) live!! - h.price else 0.0
-    val up = delta >= 0
+    // History is an immutable audit record. It must NEVER replace the recorded
+    // closing price with today's live quote; live quotes belong only to Tracking.
+    val elapsedEnd = if (h.result.isBlank()) System.currentTimeMillis() else (tracked.firstOrNull { it.symbol == h.symbol && it.createdAt == h.time }?.checkAt ?: h.time)
+    val elapsed = (elapsedEnd - h.time).coerceAtLeast(0L)
     GradientCard(Modifier.fillMaxWidth().clickable(onClick = open)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
                 Text(SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(h.time)), fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("${h.signal} • ${h.confidence}% • ${if (ru) "Цена при добавлении" else "Added price"}: ${fmt(h.price)} • ${h.timeframe}", fontSize = 9.sp)
-                val trackedItem = tracked.firstOrNull { it.symbol == h.symbol && it.createdAt == h.time }
-                val elapsedEnd = if (h.result.isBlank()) now else (trackedItem?.checkAt ?: h.time)
-                val elapsed = (elapsedEnd - h.time).coerceAtLeast(0L)
+                val close = h.closingPrice.takeIf { it > 0.0 }
                 Text(
                     if (h.result.isBlank()) {
                         if (ru) "Ожидание результата • прошло ${formatElapsed(elapsed)}" else "Waiting • elapsed ${formatElapsed(elapsed)}"
                     } else {
                         val hits = h.hitSummary.ifBlank { "—" }
-                        if (ru) "Результат: ${if(h.result=="≈") "≈ без изменения" else h.result} • события: $hits • прошло ${formatElapsed(elapsed)} • открытие ${fmt(h.price)} • закрытие ${fmt(if (h.closingPrice > 0) h.closingPrice else (live ?: h.price))}"
-                        else "Result: ${h.result} • events: $hits • elapsed ${formatElapsed(elapsed)} • open ${fmt(h.price)} • close ${fmt(if (h.closingPrice > 0) h.closingPrice else (live ?: h.price))}"
+                        if (ru) "Результат: ${if(h.result=="≈") "≈ без изменения" else h.result} • события: $hits • прошло ${formatElapsed(elapsed)} • открытие ${fmt(h.price)} • закрытие ${close?.let(::fmt) ?: "—"}"
+                        else "Result: ${h.result} • events: $hits • elapsed ${formatElapsed(elapsed)} • open ${fmt(h.price)} • close ${close?.let(::fmt) ?: "—"}"
                     },
                     fontSize=9.sp,
                     color=if(h.result=="✓") Positive else if(h.result=="✕") Negative else Warning
                 )
+                if (close != null) Text(if (ru) "Зафиксированная цена завершения: ${fmt(close)}" else "Recorded closing price: ${fmt(close)}", fontSize = 8.sp, color = Accent)
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text(if (live == null) "—" else if (up) "↑" else "↓", color = if (up) Positive else Negative, fontSize = 24.sp, fontWeight = FontWeight.Black)
-                Text(live?.let(::fmt) ?: "—", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Black)
+                Text(if (h.result=="✓") "✓" else if (h.result=="✕") "✕" else "•", color = if(h.result=="✓") Positive else if(h.result=="✕") Negative else Warning, fontSize = 24.sp, fontWeight = FontWeight.Black)
+                Text(if (ru) "АРХИВ" else "ARCHIVE", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 7.sp)
             }
-            IconButton(remove) { Icon(Icons.Default.Delete, if (ru) "Удалить отслеживание" else "Delete monitoring", tint = Negative) }
+            IconButton(remove) { Icon(Icons.Default.Delete, if (ru) "Удалить запись" else "Delete record", tint = Negative) }
         }
     }
 }

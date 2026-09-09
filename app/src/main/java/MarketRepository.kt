@@ -108,59 +108,134 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
 
     fun search(query: String): List<SearchResult> {
         val q = query.trim()
-        if (q.length < 2 || !isBcsConfigured()) return emptyList()
-        val universe = runCatching { catalog() }.getOrDefault(emptyList())
+        if (q.length < 1 || !isBcsConfigured()) return emptyList()
+
+        // Fast path: the BCS directory has a dedicated "by tickers" endpoint.
+        // Do not wait for the whole catalogue when the user typed a ticker/name
+        // that can be resolved directly (e.g. CIAN/ЦИАН, SBER/СБЕР).
+        val direct = LinkedHashMap<String, SearchResult>()
+        val aliases = mapOf(
+            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP",
+            "лукойл" to "LKOH", "роснефть" to "ROSN", "новатэк" to "NVTK",
+            "татнефть" to "TATN", "магнит" to "MGNT", "мосбиржа" to "MOEX",
+            "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CIAN",
+            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS",
+            "норникель" to "GMKN", "полюс" to "PLZL", "фосагро" to "PHOR",
+            "ростелеком" to "RTKM", "алроса" to "ALRS", "совкомфлот" to "FLOT",
+            "полиметалл" to "POLY", "интер рао" to "IRAO", "эн+" to "ENPG",
+            "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM", "юань" to "CNYRUB_TOM"
+        )
+        val directTicker = aliases[q.lowercase(Locale.ROOT)] ?: q.uppercase(Locale.US)
+            .replace("/", "").replace("-", "")
+            .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
+        if (!directTicker.isNullOrBlank()) {
+            runCatching { bcsInstrumentInfo(directTicker) }.getOrNull()?.let { o ->
+                val ticker = o.optString("ticker").ifBlank { directTicker }
+                val board = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                direct[ticker.uppercase(Locale.US)] = SearchResult(
+                    ticker,
+                    o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
+                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
+                    o.optString("instrumentType").ifBlank { if (ticker.endsWith("=X")) "CURRENCY" else "STOCK" },
+                    "БКС"
+                )
+            }
+        }
+
+        // Name search still needs the directory. The catalogue loader is resilient
+        // to 429 and keeps partial pages instead of discarding the whole result set.
+        val universe = runCatching { searchCatalog() }.getOrElse { emptyList() }
         val needle = q.lowercase(Locale.ROOT)
         val compact = needle.replace(" ", "").replace("-", "").replace("/", "")
-        return universe.mapNotNull { item ->
-            val symbol = item.symbol.lowercase(Locale.ROOT)
+        val transliterated = transliterateRuToLat(needle)
+        val matched = universe.mapNotNull { item ->
+            val symbol = item.symbol.lowercase(Locale.ROOT).removeSuffix(".me")
             val name = item.name.lowercase(Locale.ROOT)
             val nameCompact = name.replace(" ", "").replace("-", "").replace("/", "")
+            val symbolLat = symbol
             val rank = when {
                 symbol == needle || name == needle -> 0
                 symbol.startsWith(needle) || name.startsWith(needle) -> 1
-                symbol.contains(needle) || name.contains(needle) -> 2
-                symbol.replace(".me", "").startsWith(compact) || nameCompact.contains(compact) -> 3
+                transliterated.isNotBlank() && (symbolLat.startsWith(transliterated) || name.startsWith(transliterated)) -> 1
+                symbol.contains(needle) || name.contains(needle) -> 3
+                symbol.startsWith(compact) || nameCompact.startsWith(compact) -> 2
                 else -> return@mapNotNull null
             }
             rank to item
         }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
-            .take(30).map { it.second }
+            .map { it.second }
+
+        // For one-character autocomplete, prefix matches are the primary result set.
+        // Keep a small set of direct seeds visible even while the BCS catalogue is warming.
+        val seedMatches = popularSeeds().filter { seed ->
+            val s = seed.symbol.lowercase(Locale.ROOT)
+            s.startsWith(needle) || s.startsWith(transliterated)
+        }
+        return (direct.values + seedMatches + matched).distinctBy { it.symbol.uppercase(Locale.US) }.take(50)
+    }
+
+    /** Search-oriented catalogue: only instrument classes that users normally search. */
+    private fun searchCatalog(): List<SearchResult> = loadCatalog(
+        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY", "ETF", "MUTUAL_FUNDS", "INDICES"),
+        maxPagesPerType = 40
+    )
+
+    /** Scanner universe. Avoid loading bonds/options/futures when the scanner asks for stocks/FX. */
+    fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
+        "FX" -> loadCatalog(listOf("CURRENCY"), 40)
+        "STOCKS" -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), 40)
+        else -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS", "CURRENCY"), 40)
     }
 
     /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
-    fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> {
+    fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> = loadCatalog(
+        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY", "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS", "BONDS", "NOTES", "EURO_BONDS", "GOODS"),
+        40
+    ).let { if (limit == Int.MAX_VALUE) it else it.take(limit) }
+
+    private fun loadCatalog(types: List<String>, maxPagesPerType: Int): List<SearchResult> {
         if (!isBcsConfigured()) return emptyList()
         val now = System.currentTimeMillis()
         val cached = catalogCache
-        if (cached.isNotEmpty() && now - catalogCacheAt <= CATALOG_CACHE_MS) {
-            return if (limit == Int.MAX_VALUE) cached else cached.take(limit)
-        }
+        if (cached.isNotEmpty() && now - catalogCacheAt <= CATALOG_CACHE_MS) return cached
+
         val out = LinkedHashMap<String, SearchResult>()
-        // BCS documents these instrument types in the Information Service.
-        val types = listOf(
-            "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY",
-            "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS", "BONDS"
-        )
         for (type in types) {
             var page = 0
-            var pages = 0
-            while (pages++ < 100) {
-                val before = out.size
+            var consecutiveFailures = 0
+            while (page < maxPagesPerType) {
                 val arr = runCatching {
-                    val root = JSONObject(getTextAuth(
-                        "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
-                        15000, bcsHeaders()
-                    ))
-                    root.optJSONArray("instruments")
-                }.getOrNull() ?: break
+                    var last: Throwable? = null
+                    for (attempt in 0..3) {
+                        try {
+                            val root = JSONObject(getTextAuth(
+                                "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
+                                15000, bcsHeaders()
+                            ))
+                            return@runCatching root.optJSONArray("instruments") ?: JSONArray()
+                        } catch (t: Throwable) {
+                            last = t
+                            if (!t.message.orEmpty().contains("429")) break
+                            Thread.sleep((350L shl attempt).coerceAtMost(4000L))
+                        }
+                    }
+                    throw last ?: IllegalStateException("БКС: пустой ответ каталога")
+                }.getOrNull()
+
+                if (arr == null) {
+                    consecutiveFailures++
+                    if (consecutiveFailures >= 2) break
+                    page++
+                    continue
+                }
+                consecutiveFailures = 0
+                if (arr.length() == 0) break
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     val ticker = o.optString("ticker").trim()
                     if (ticker.isBlank()) continue
-                    val boards = o.optJSONArray("boards")
-                    val boardObj = boards?.let { chooseBoard(it) }
-                    val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "BCS" }
+                    val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                    val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
                     val name = o.optString("displayName")
                         .ifBlank { o.optString("shortName") }
                         .ifBlank { o.optString("issuerName") }
@@ -169,19 +244,29 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
                     val item = SearchResult(ticker, name, exchange, typeName, "БКС")
                     out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
                 }
+                // BCS documentation explicitly says page+1 must be requested when
+                // the page contains exactly `size` objects.
                 if (arr.length() < 100) break
                 page++
+                Thread.sleep(80L)
             }
         }
         val result = out.values.toList()
-        catalogCache = result
-        catalogCacheAt = System.currentTimeMillis()
-        return if (limit == Int.MAX_VALUE) result else result.take(limit)
+        if (result.isNotEmpty()) {
+            catalogCache = result
+            catalogCacheAt = System.currentTimeMillis()
+        }
+        return result
     }
 
     /** BCS-only FX catalogue. */
     fun fxCatalog(): List<SearchResult> = if (!isBcsConfigured()) emptyList() else
         catalog(Int.MAX_VALUE).filter { it.type.contains("CURRENCY", true) }
+
+    private fun transliterateRuToLat(value: String): String {
+        val map = mapOf('а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ё' to "e", 'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m", 'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r", 'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f", 'х' to "h", 'ц' to "c", 'ч' to "ch", 'ш' to "sh", 'щ' to "sch", 'ъ' to "", 'ы' to "y", 'ь' to "", 'э' to "e", 'ю' to "yu", 'я' to "ya")
+        return buildString { value.forEach { append(map[it] ?: it) } }
+    }
 
     private fun popularSeeds(): List<SearchResult> = listOf(
         "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "MGNT", "MOEX", "YDEX", "OZON",
@@ -360,11 +445,13 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
         }
         if (value != null) {
-            val previous = stableQuoteCache[quoteKey]
-            val candidate = if (previous != null && previous > 0.0 && abs(value - previous) / previous > 0.15) previous else value
-            stableQuoteCache[quoteKey] = candidate
-            quoteCache[quoteKey] = now to candidate
-            return candidate
+            // Never freeze a valid BCS quote because it differs sharply from the
+            // previous value. A large move can be a real market move (or a
+            // session transition). The old 15% clamp was exactly the kind of
+            // hidden state that made tracking appear stuck on one price.
+            stableQuoteCache[quoteKey] = value
+            quoteCache[quoteKey] = now to value
+            return value
         }
         return value
     }
@@ -596,33 +683,46 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             body, 10000, bcsHeaders()
         ))
 
-        // BCS defines `last` as the last executed trade. Do not walk arbitrary
-        // numeric fields: that can accidentally select bid/offer/open/close and
-        // produces the apparent price jumps that were visible in the app.
-        fun findQuoteObject(v: Any?): JSONObject? {
+        // IMPORTANT: select the quote belonging to the requested ticker/classCode.
+        // The old recursive parser returned the first object containing `last`;
+        // if BCS wrapped several quote objects in one response that could make one
+        // instrument inherit another instrument's price.
+        fun numeric(v: JSONObject, vararg keys: String): Double? =
+            keys.firstNotNullOfOrNull { key ->
+                if (!v.has(key) || v.isNull(key)) null
+                else v.optDouble(key, Double.NaN).takeIf { it.isFinite() && it > 0.0 }
+            }
+
+        fun collect(v: Any?, out: MutableList<JSONObject>) {
             when (v) {
                 is JSONObject -> {
-                    if (v.has("last") || v.has("bid") || v.has("offer")) return v
+                    val t = v.optString("ticker").uppercase(Locale.US)
+                    val c = v.optString("classCode").uppercase(Locale.US)
+                    if ((t == ticker.uppercase(Locale.US) && c == classCode.uppercase(Locale.US)) ||
+                        (t == ticker.uppercase(Locale.US) && (c.isBlank() || classCode.isBlank()))) out += v
                     val keys = v.keys()
-                    while (keys.hasNext()) {
-                        findQuoteObject(v.opt(keys.next()))?.let { return it }
-                    }
+                    while (keys.hasNext()) collect(v.opt(keys.next()), out)
                 }
-                is JSONArray -> {
-                    for (i in 0 until v.length()) {
-                        findQuoteObject(v.opt(i))?.let { return it }
-                    }
-                }
+                is JSONArray -> for (i in 0 until v.length()) collect(v.opt(i), out)
             }
-            return null
         }
 
-        val q = findQuoteObject(root)
-        val last = q?.optDouble("last", Double.NaN)?.takeIf { it.isFinite() && it > 0.0 }
-        if (last != null) return last
-        val lastPrice = q?.optDouble("lastPrice", Double.NaN)?.takeIf { it.isFinite() && it > 0.0 }
-        if (lastPrice != null) return lastPrice
-        return null
+        val exact = mutableListOf<JSONObject>()
+        collect(root, exact)
+        val candidates = if (exact.isNotEmpty()) exact else buildList {
+            fun walk(v: Any?) {
+                when (v) {
+                    is JSONObject -> {
+                        if (numeric(v, "last", "lastPrice", "price") != null) add(v)
+                        val keys = v.keys(); while (keys.hasNext()) walk(v.opt(keys.next()))
+                    }
+                    is JSONArray -> for (i in 0 until v.length()) walk(v.opt(i))
+                }
+            }
+            walk(root)
+        }
+        val q = candidates.firstOrNull() ?: return null
+        return numeric(q, "last", "lastPrice", "price")
     }
 
     private fun num(o: JSONObject, vararg names: String): Double? = names.firstNotNullOfOrNull { n -> if (o.has(n) && !o.isNull(n)) o.optDouble(n, Double.NaN).takeIf { it.isFinite() } else null }

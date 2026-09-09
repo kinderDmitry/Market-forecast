@@ -70,7 +70,19 @@ object TrackingEngine {
             .filter { it.time >= item.createdAt && it.time <= item.checkAt }
             .maxByOrNull { it.time }
         val horizonPrice = horizonCandle?.close?.takeIf { it.isFinite() && it > 0.0 }
-        val price = if (horizonExpired) live ?: horizonPrice else live ?: horizonPrice
+        // At the terminal horizon the latest BCS candle is an independent audit
+        // value. If the live quote is stale/frozen at the entry while a newer
+        // candle has moved, never write the stale quote into History.
+        val candleBeatsFrozenQuote = horizonPrice != null && live != null &&
+            abs(horizonPrice - live) > (item.entry * 0.001).coerceAtLeast(1e-10) &&
+            abs(live - item.entry) <= (item.entry * 0.0005).coerceAtLeast(1e-10)
+        val price = if (horizonExpired) {
+            when {
+                candleBeatsFrozenQuote -> horizonPrice
+                live != null -> live
+                else -> horizonPrice
+            }
+        } else live ?: horizonPrice
         if (price == null || price <= 0.0) return null
 
         val flatTolerance = (item.entry * 0.0005).coerceAtLeast(1e-10) // 0.05%

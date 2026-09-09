@@ -84,21 +84,28 @@ class ScannerForegroundService : Service() {
                                 gate.withPermit {
                                     if (!currentCoroutineContext().isActive || !running.get()) return@withPermit null
                                     val pair = when (currentTf) {
-                                        "15M" -> "60d" to "15m"
-                                        "1H" -> "2y" to "1h"
-                                        "4H" -> "2y" to "4h"
+                                        "15M" -> "30d" to "15m"
+                                        "1H" -> "180d" to "1h"
+                                        "4H" -> "180d" to "4h"
                                         "1W" -> "10y" to "1wk"
-                                        else -> "5y" to "1d"
+                                        else -> "2y" to "1d"
                                     }
                                     val result = runCatching {
-                                        withTimeout(15_000L) {
+                                        withTimeout(20_000L) {
                                             val candles = repo.load(symbol, pair.first, pair.second)
                                             if (candles.size < 30) null else {
-                                                val rawQuote = repo.quote(symbol)
-                                                val live = reconcileLivePrice(symbol, candles, rawQuote)
-                                                val merged = mergeRealtimeCandle(candles, live, currentTf, System.currentTimeMillis(), symbol)
-                                                val f = AnalyticsEngine.analyzeForScanner(merged, live)
-                                                if (f.signal == "NO TRADE") null else {
+                                                // Stage 1: use the last BCS candle for the broad market pass.
+                                                // Stage 2: request the live quote only for a candidate. This prevents
+                                                // thousands of per-instrument quote calls from starving the scanner.
+                                                val baseline = candles.last().close
+                                                val baselineCandles = mergeRealtimeCandle(candles, baseline, currentTf, System.currentTimeMillis(), symbol)
+                                                val preliminary = AnalyticsEngine.analyzeForScanner(baselineCandles, baseline)
+                                                if (preliminary.signal == "NO TRADE") null else {
+                                                    val rawQuote = runCatching { repo.quote(symbol) }.getOrNull()
+                                                    val live = reconcileLivePrice(symbol, candles, rawQuote)
+                                                    val merged = mergeRealtimeCandle(candles, live, currentTf, System.currentTimeMillis(), symbol)
+                                                    val f = AnalyticsEngine.analyzeForScanner(merged, live)
+                                                    if (f.signal == "NO TRADE") null else {
                                                     val created = System.currentTimeMillis()
                                                     val hs = timeframeHorizonSeconds(currentTf)
                                                     ScanRow(SearchResult(symbol, symbol, "", "", "БКС"), currentTf, f.signal, f.confidence, f.score, f.rr, hs, created, created + hs * 1000L)
@@ -198,12 +205,17 @@ class ScannerForegroundService : Service() {
                 else -> favs.distinct()
             }
         }
-        val catalog = if (type == "FX") emptyList() else runCatching { repo.catalog() }.getOrDefault(emptyList())
+        // Use a scanner-specific catalogue. The general catalogue also contains
+        // bonds/options/futures and can hit BCS rate limits; that used to make the
+        // scanner receive an empty universe and therefore produce zero signals.
+        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
         val stocks = if (type == "STOCKS" || type == "ALL") catalog.filter {
             val t = it.type.uppercase(Locale.US)
             t.contains("STOCK") || t.contains("EQUITY") || t.contains("ETF") || t.contains("DEPOSITARY") || t.contains("FUND")
         }.map { it.symbol } else emptyList()
-        val fx = if (type == "FX" || type == "ALL") runCatching { repo.fxCatalog().map { it.symbol } }.getOrDefault(emptyList()) else emptyList()
+        val fx = if (type == "FX" || type == "ALL") catalog.filter {
+            it.type.contains("CURRENCY", true) || it.symbol.endsWith("=X")
+        }.map { it.symbol } else emptyList()
         return (stocks + fx).distinct()
     }
 
