@@ -17,6 +17,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -63,9 +66,10 @@ class ScannerForegroundService : Service() {
             .putBoolean("scanner_priority_active", scopeMode == "ALL")
             .putFloat("scanner_progress", 0f)
             .putString("scanner_status", "Подготовка сканирования…")
+            .remove("scanner_completion_signature")
             .apply()
 
-        startForeground(NOTIFICATION_ID, notification("Сканер работает", "Подготовка данных…", 0f))
+        startForeground(NOTIFICATION_ID, notification("🔎 Сканер работает", "⏳ Подготовка данных…", 0f))
         if (running.compareAndSet(false, true)) {
             scanJob = serviceScope.launch { scanLoop(scopeMode, instrumentType, timeframe) }
         }
@@ -75,7 +79,8 @@ class ScannerForegroundService : Service() {
     private suspend fun scanLoop(scopeMode: String, instrumentType: String, timeframe: String) {
         try {
             val repo = MarketRepository(
-                bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null }
+                bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null },
+                prefs = prefs
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
@@ -90,34 +95,52 @@ class ScannerForegroundService : Service() {
 
                 val total = (symbols.size.toLong() * timeframes.size.toLong()).coerceAtLeast(1L)
                 val completed = AtomicLong(0L)
-                val previous = loadScanRows(prefs)
+                val activeRows = loadScanRows(prefs)
                     .filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }
-                    .map { rowKey(it) }
-                    .toSet()
+                val previous = activeRows.map { rowKey(it) }.toSet()
                 val found = mutableListOf<ScanRow>()
+
+                fun acceptRow(candidate: ScanRow) {
+                    val old = (activeRows + found).firstOrNull { rowKey(it) == rowKey(candidate) && (it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis()) }
+                    val stable = if (old != null) candidate.copy(createdAt = old.createdAt, expiresAt = old.expiresAt) else candidate
+                    synchronized(found) {
+                        found.removeAll { rowKey(it) == rowKey(stable) }
+                        found.add(stable)
+                    }
+                    if (old == null && rowKey(candidate) !in previous) notifySignal(stable)
+                }
 
                 if (symbols.isEmpty()) {
                     setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
                 } else {
-                    for (symbol in symbols) {
-                        if (!currentCoroutineContext().isActive || !running.get()) break
-                        for (currentTf in timeframes) {
+                    val jobs = mutableListOf<kotlinx.coroutines.Deferred<ScanRow?>>()
+                    coroutineScope {
+                        for (symbol in symbols) {
                             if (!currentCoroutineContext().isActive || !running.get()) break
-                            val row = scanOne(repo, symbol, currentTf)
-                            if (row != null) {
-                                synchronized(found) {
-                                    found.removeAll { rowKey(it) == rowKey(row) }
-                                    found.add(row)
+                            for (currentTf in timeframes) {
+                                if (!currentCoroutineContext().isActive || !running.get()) break
+                                jobs += async(Dispatchers.IO) {
+                                    val row = scanOne(repo, symbol, currentTf)
+                                    val done = completed.incrementAndGet()
+                                    val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+                                    if (done == 1L || done % 5L == 0L || done == total) {
+                                        setStatus("🔎 Сканирование: $done / $total", progress)
+                                    }
+                                    row
                                 }
-                                if (rowKey(row) !in previous) {
-                                    notifySignal(row)
+                                // Keep the provider load bounded. Eight in-flight requests are enough
+                                // to make a large scan materially faster without creating a request storm.
+                                if (jobs.size >= 8) {
+                                    jobs.awaitAll().forEach { row ->
+                                        if (row != null) acceptRow(row)
+                                    }
+                                    jobs.clear()
                                 }
                             }
-
-                            val done = completed.incrementAndGet()
-                            val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
-                            if (done == 1L || done % 5L == 0L || done == total) {
-                                setStatus("Сканирование: $done / $total", progress)
+                        }
+                        if (jobs.isNotEmpty()) {
+                            jobs.awaitAll().forEach { row ->
+                                if (row != null) acceptRow(row)
                             }
                         }
                     }
@@ -138,13 +161,36 @@ class ScannerForegroundService : Service() {
                     .putString(
                         "scanner_status",
                         if (merged.isEmpty()) {
-                            "Сканирование завершено: подтверждённых сигналов пока нет • проверено ${completed.get()}"
+                            "🔎 Сканирование завершено: подтверждённых сигналов пока нет • проверено ${completed.get()}"
                         } else {
-                            "Сигналы обновлены: ${merged.size} • проверено ${completed.get()}"
+                            "🔔 Сигналы обновлены: ${merged.size} • проверено ${completed.get()}"
                         }
                     )
                     .apply()
-                updateForeground("Сканер обновлён", "Найдено сигналов: ${merged.size}", 1f)
+                updateForeground("✅ Сканирование завершено", "Найдено сигналов: ${merged.size}", 1f)
+                // A foreground scanner may run continuously. Do not spam a completion
+                // notification after every refresh cycle when nothing has changed.
+                // Notify once for a completed scan state and again only when the signal
+                // set/count changes or the user starts a new scan.
+                val completionSignature = merged
+                    .map { "${rowKey(it)}|${it.confidence}|${it.expiresAt}" }
+                    .sorted()
+                    .joinToString(";")
+                val previousCompletionSignature = prefs.getString("scanner_completion_signature", null)
+                val completionChanged = completionSignature != previousCompletionSignature
+                if (completionChanged) {
+                    NotificationHelper.notifyDirect(
+                        applicationContext,
+                        NotificationHelper.CHANNEL_MARKET,
+                        if (merged.isEmpty()) "🔎 Сканирование завершено" else "🔔 Сканирование завершено",
+                        if (merged.isEmpty()) "📭 Проверено: ${completed.get()} • подтверждённых сигналов пока нет" else "🎯 Найдено сигналов: ${merged.size} • проверено: ${completed.get()}",
+                        "SCANNER",
+                        null,
+                        null,
+                        (now and 0x7fffffff).toInt()
+                    )
+                    prefs.edit().putString("scanner_completion_signature", completionSignature).apply()
+                }
 
                 val pauseMs = when (timeframe) {
                     "15M" -> 15_000L
@@ -160,7 +206,7 @@ class ScannerForegroundService : Service() {
         } catch (t: Throwable) {
             val message = t.message ?: "Неизвестная ошибка"
             prefs.edit().putString("scanner_status", "Ошибка сканера: $message").apply()
-            updateForeground("Сканер: ошибка", message, 0f)
+            updateForeground("❌ Сканер: ошибка", message, 0f)
         } finally {
             running.set(false)
             prefs.edit()
@@ -271,7 +317,7 @@ class ScannerForegroundService : Service() {
         NotificationHelper.notifyMarket(
             applicationContext,
             "scanner|${row.result.symbol}|${row.timeframe}|${row.signal}|${row.createdAt}",
-            "Новый сигнал: ${row.signal}",
+            "🚨 Новый сигнал: ${row.signal}",
             body,
             "SCANNER",
             row.result.symbol
@@ -280,7 +326,7 @@ class ScannerForegroundService : Service() {
 
     private fun setStatus(status: String, progress: Float) {
         prefs.edit().putString("scanner_status", status).putFloat("scanner_progress", progress).apply()
-        updateForeground("Сканер работает", status, progress)
+        updateForeground("🔎 Сканер работает", status, progress)
     }
 
     private fun timeframeHorizonSeconds(tf: String): Long = when (tf) {

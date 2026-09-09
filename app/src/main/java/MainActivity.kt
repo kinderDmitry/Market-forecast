@@ -123,7 +123,7 @@ fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
     val bcsToken = prefs.getString("bcs_refresh_token", "") ?: ""
-    val repo = remember(bcsToken) { MarketRepository(bcsRefreshToken = bcsToken.ifBlank { null }) }
+    val repo = remember(bcsToken) { MarketRepository(bcsRefreshToken = bcsToken.ifBlank { null }, prefs = prefs) }
     var ru by remember { mutableStateOf(prefs.getBoolean("ru", true)) }
     var interval by remember { mutableIntStateOf(prefs.getInt("notify_interval", 15).coerceAtLeast(15)) }
     var notifications by remember { mutableStateOf(prefs.getBoolean("notifications_enabled", false)) }
@@ -209,8 +209,15 @@ fun MarketForecastApp(ctx: Context) {
             }
             val meta = withContext(Dispatchers.IO) { repo.instrumentMeta(selected) }
             val quoted = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
-            val live = reconcileLivePrice(selected, candlesRaw, quoted)
-            if (live > 0.0 && live.isFinite()) canonicalQuotes[selected] = live
+            val cachedCanonical = canonicalQuotes[selected]
+                ?: prefs.getString("canonical_quote_$selected", null)?.toDoubleOrNull()
+                    ?.takeIf { it.isFinite() && it > 0.0 }
+            val live = reconcileLivePrice(selected, candlesRaw, quoted ?: cachedCanonical)
+            if (live > 0.0 && live.isFinite()) {
+                canonicalQuotes[selected] = live
+                prefs.edit().putString("canonical_quote_$selected", live.toString())
+                    .putLong("canonical_quote_ts_$selected", System.currentTimeMillis()).apply()
+            }
             // The realtime candle is part of the exact dataset used by the forecast.
             // Entry/levels use the same canonical live price across timeframes.
             val candles = mergeRealtimeCandle(candlesRaw, live, time, System.currentTimeMillis(), selected)
@@ -306,6 +313,7 @@ fun MarketForecastApp(ctx: Context) {
         delay(if (query.trim().length == 1) 180 else 260); searching = true
         results = withContext(Dispatchers.IO) { runCatching { repo.search(query.trim()) }.getOrDefault(emptyList()) }
         searching = false
+        message = if (ru) "Поиск завершён: найдено ${results.size}" else "Search completed: ${results.size} found"
     }
     LaunchedEffect(ru) {
         prefs.edit().putBoolean("ru", ru).apply()
@@ -559,7 +567,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "Поиск" else "Search"; Screen.FAVORITES -> if (ru) "Избранное" else "Favorites"; Screen.HISTORY -> if (ru) "История прогнозов" else "Forecast history"; Screen.SCANNER -> if (ru) "Сканер" else "Scanner"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "Новости" else "News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SCANNER -> if (ru) "🔎 Сканер" else "🔎 Scanner"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
 }
 
 @Composable
@@ -627,7 +635,7 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
         }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                QuickAction(Icons.Default.Newspaper, if (ru) "Новости" else "News", openNews, Modifier.weight(1f))
+                QuickAction(Icons.Default.Newspaper, if (ru) "📰 Новости" else "📰 News", openNews, Modifier.weight(1f))
                 QuickAction(Icons.Default.CalendarMonth, if (ru) "Дивиденды" else "Dividends", openDiv, Modifier.weight(1f))
                 QuickAction(Icons.Default.Calculate, if (ru) "Прибыль" else "Profit", openFinance, Modifier.weight(1f))
                 QuickAction(Icons.Default.BarChart, if (ru) "Статистика" else "Stats", openStats, Modifier.weight(1f))
@@ -635,7 +643,7 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
         }
         item { SectionHeader(if (ru) "Рынок" else "Market", if (ru) "Индексы и дополнительные рыночные данные" else "Indices and additional market data") }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(9.dp)) { indices.forEach { IndexCard(it) } } }
-        item { SectionHeader(if (ru) "Новости" else "News", if (ru) "Акции и валюты" else "Stocks and FX") }
+        item { SectionHeader(if (ru) "📰 Новости" else "📰 News", if (ru) "Акции и валюты" else "Stocks and FX") }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf(NewsCategory.ALL,NewsCategory.STOCKS,NewsCategory.FX).forEach { c -> FilterChip(selected=newsCategory==c,onClick={setNewsCategory(c)},label={Text(if(ru) when(c){NewsCategory.ALL->"Все";NewsCategory.STOCKS->"Акции";NewsCategory.FX->"Валюты"} else c.name,fontSize=8.sp)}) } } }
         if (news.isEmpty()) { item { EmptyCard(if (ru) "Новости временно недоступны. Повторите обновление через несколько секунд." else "News are temporarily unavailable. Refresh in a few seconds.") } }
         items(news.take(20), key = { it.url.ifBlank { it.title } }) { NewsCard(it, ru, openArticle = openArticle) }
@@ -826,7 +834,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
         tfForecasts = withContext(Dispatchers.IO) {
             tfs.mapNotNull { timeframe ->
                 val pair = timeframePair(timeframe)
-                val c = runCatching { MarketRepository(bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null }).load(state.symbol, pair.first, pair.second) }.getOrNull()
+                val c = runCatching { MarketRepository(bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null }, prefs = prefs).load(state.symbol, pair.first, pair.second) }.getOrNull()
                 val live = currentLive ?: c?.lastOrNull()?.close
                 val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, timeframe, System.currentTimeMillis(), state.symbol) else c.orEmpty()
                 val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live) }.getOrNull() else null
@@ -997,8 +1005,6 @@ private fun niceStep(raw: Double): Double {
     }
 }
 
-data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
-
 @Composable private fun Favorites(favs: List<String>, ru: Boolean, repo: MarketRepository, save: (Set<String>) -> Unit, load: (String) -> Unit, refreshTick: Long = 0L) {
     var sort by remember { mutableStateOf("PRICE_ASC") }
     var rows by remember(favs) { mutableStateOf(favs.map { FavoriteQuote(it, null, 0) }) }
@@ -1014,7 +1020,7 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
     }
     val sorted = when(sort) { "PRICE_DESC" -> rows.sortedByDescending { it.price ?: Double.NEGATIVE_INFINITY }; "CONF_DESC" -> rows.sortedByDescending { it.confidence }; else -> rows.sortedBy { it.price ?: Double.POSITIVE_INFINITY } }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-        item { SectionHeader(if (ru) "Избранное" else "Favorites", if (ru) "Сортировка по цене и уверенности" else "Sort by price and confidence") }
+        item { SectionHeader(if (ru) "⭐ Избранное" else "⭐ Favorites", if (ru) "Сортировка по цене и уверенности" else "Sort by price and confidence") }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("PRICE_ASC","PRICE_DESC","CONF_DESC").forEach { k -> FilterChip(selected=sort==k,onClick={sort=k},label={Text(if(ru) when(k){"PRICE_ASC"->"Цена ↑";"PRICE_DESC"->"Цена ↓";else->"Уверенность ↓"} else k,fontSize=8.sp)}) } } }
         if (sorted.isEmpty()) item { EmptyCard(if (ru) "Избранное пусто. Найди инструмент через Поиск." else "Favorites are empty. Find an instrument in Search.") }
         items(sorted, key={it.symbol}) { r ->
@@ -1177,10 +1183,16 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
     var scope by remember { mutableStateOf(prefs.getString("scanner_scope","ALL") ?: "ALL") }
     var busy by remember { mutableStateOf(false) }; var progress by remember { mutableFloatStateOf(0f) }; var results by remember { mutableStateOf(loadAutoScanResults(prefs)) }
     var scannerStatus by remember { mutableStateOf(prefs.getString("scanner_status", "") ?: "") }
+    var countdownNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(refreshTick) {
         results = loadAutoScanResults(prefs)
         scannerStatus = prefs.getString("scanner_status", "") ?: ""
-
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            countdownNow = System.currentTimeMillis()
+            delay(1000L)
+        }
     }
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text(
@@ -1228,18 +1240,18 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
                 if (Build.VERSION.SDK_INT >= 26) androidx.core.content.ContextCompat.startForegroundService(ctx, intent) else ctx.startService(intent)
             }
         }, Modifier.fillMaxWidth(), enabled=true, colors=ButtonDefaults.buttonColors(containerColor=if (busy) Negative else Accent)) {
-            Text(if (busy) (if (ru) "ОСТАНОВИТЬ СКАНЕР" else "STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
+            Text(if (busy) (if (ru) "⛔ ОСТАНОВИТЬ СКАНЕР" else "⛔ STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
         }
         if(scannerStatus.isNotBlank()&&!busy) Text(scannerStatus,fontSize=9.sp,color=Positive,modifier=Modifier.padding(top=6.dp))
         if (results.isNotEmpty()) Text(if (ru) "Сигналы действуют только до указанного времени. После окончания горизонта они автоматически исчезают и ждут нового подтверждения." else "Signals are valid only until the shown expiry. After the horizon they disappear automatically and wait for a new confirmation.", fontSize=8.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, modifier=Modifier.padding(top=5.dp))
-        if (results.isNotEmpty()) { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "Удалить все" else "Delete all") } } }
-        LazyColumn(verticalArrangement=Arrangement.spacedBy(8.dp)) { items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row -> GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) { Row(verticalAlignment=Alignment.CenterVertically){Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black);Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }; Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black); val left=(row.expiresAt-System.currentTimeMillis()).coerceAtLeast(0L); Text(if(left>0) "• ${formatElapsed(left)}" else "• ${if(ru) "истёк" else "expired"}", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp); Spacer(Modifier.width(3.dp)); TextButton(onClick={track(row)}, contentPadding=PaddingValues(horizontal=6.dp, vertical=0.dp)) { Text(if(ru) "Отследить" else "Track", color=Positive, fontSize=8.sp, fontWeight=FontWeight.Black) }; IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}} } } }
+        if (results.isNotEmpty()) { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "🗑️ Удалить все" else "🗑️ Delete all") } } }
+        LazyColumn(verticalArrangement=Arrangement.spacedBy(8.dp)) { items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row -> GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) { Row(verticalAlignment=Alignment.CenterVertically){Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black);Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }; Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black); val left=(row.expiresAt-countdownNow).coerceAtLeast(0L); Text(if(left>0) "• ${formatElapsed(left)}" else "• ${if(ru) "истёк" else "expired"}", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp); Spacer(Modifier.width(3.dp)); TextButton(onClick={track(row)}, contentPadding=PaddingValues(horizontal=6.dp, vertical=0.dp)) { Text(if(ru) "Отследить" else "Track", color=Positive, fontSize=8.sp, fontWeight=FontWeight.Black) }; IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}} } } }
     }
 }
 
 @Composable private fun NewsScreen(news: List<NewsItem>, ru: Boolean, refreshTick: Long = 0L, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-        item { SectionHeader(if (ru) "Новости" else "News", if (ru) "Открой новость внутри приложения: фото, текст и оригинальная страница без выхода из приложения" else "Open the full article inside the app with images and text") }
+        item { SectionHeader(if (ru) "📰 Новости" else "📰 News", if (ru) "Открой новость внутри приложения: фото, текст и оригинальная страница без выхода из приложения" else "Open the full article inside the app with images and text") }
         if (news.isEmpty()) { item { EmptyCard(if (ru) "Лента новостей пока пуста. Источники будут повторно проверены автоматически." else "The news feed is empty. Sources will be retried automatically.") } }
         items(news, key = { it.url.ifBlank { it.title } }) { NewsCard(it, ru, openArticle) }
     }

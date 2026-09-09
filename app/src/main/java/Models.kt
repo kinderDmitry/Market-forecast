@@ -106,3 +106,6 @@ data class MarketState(
     val meta: InstrumentMeta = InstrumentMeta(symbol),
     val dataSource: String = ""
 )
+
+
+data class FavoriteQuote(val symbol: String, val price: Double?, val confidence: Int)

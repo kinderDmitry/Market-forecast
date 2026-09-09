@@ -34,7 +34,11 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
 }
 
 /** Market-data repository. BCS is the sole market-data provider; news/dividends are separate informational feeds. */
-class MarketRepository(private val alphaVantageKey: String? = null, private val bcsRefreshToken: String? = null) {
+class MarketRepository(
+    private val alphaVantageKey: String? = null,
+    private val bcsRefreshToken: String? = null,
+    private val prefs: android.content.SharedPreferences? = null
+) {
     companion object {
         const val BCS_DIVIDEND_CALENDAR_URL = "https://bcs-express.ru/dividednyj-kalendar"
         // Historical candles change slowly compared with live quotes. A short process-wide
@@ -45,6 +49,8 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
+        private const val SEARCH_CACHE_MS = 60_000L
+        private val searchCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         // Cache is keyed by the requested instrument-type set. A single global
         // catalogue used to let a previous STOCK search poison a later FX scan.
         private val catalogCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
@@ -110,6 +116,11 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     fun search(query: String): List<SearchResult> {
         val q = query.trim()
         if (q.length < 1 || !isBcsConfigured()) return emptyList()
+        val searchKey = q.lowercase(Locale.ROOT)
+        val now = System.currentTimeMillis()
+        searchCaches[searchKey]?.let { cached ->
+            if (now - cached.first <= SEARCH_CACHE_MS) return cached.second
+        }
 
         // Fast path: the BCS directory has a dedicated "by tickers" endpoint.
         // Do not wait for the whole catalogue when the user typed a ticker/name
@@ -141,6 +152,15 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
                     "БКС"
                 )
             }
+        }
+
+        // Exact ticker/alias resolution is complete enough for the interactive search
+        // result. Do not block it behind a multi-page catalogue request. This keeps
+        // common searches (SBER, Сбер, Роснефть, USD/RUB, etc.) near-instant.
+        if (direct.isNotEmpty()) {
+            val exact = direct.values.take(50)
+            searchCaches[searchKey] = now to exact
+            return exact
         }
 
         // Name search still needs the directory. The catalogue loader is resilient
@@ -178,13 +198,17 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             symbol.startsWith(needle) || name.startsWith(needle) ||
                 (transliterated.isNotBlank() && (symbol.startsWith(transliterated) || translitName.startsWith(transliterated)))
         }
-        return (direct.values + seedMatches + matched).distinctBy { it.symbol.uppercase(Locale.US) }.take(50)
+        val finalResults = (direct.values + seedMatches + matched)
+            .distinctBy { it.symbol.uppercase(Locale.US) }
+            .take(50)
+        searchCaches[searchKey] = now to finalResults
+        return finalResults
     }
 
     /** Search-oriented catalogue: only instrument classes that users normally search. */
     private fun searchCatalog(): List<SearchResult> = loadCatalog(
         listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY", "ETF", "MUTUAL_FUNDS", "INDICES"),
-        maxPagesPerType = 40
+        maxPagesPerType = 12
     )
 
     /** Scanner universe. Avoid loading bonds/options/futures when the scanner asks for stocks/FX. */
@@ -451,12 +475,18 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             return cached.second
         }
         val value = if (!bcsRefreshToken.isNullOrBlank()) {
-            runCatching { quoteBcs(clean) }.getOrElse {
-                throw IllegalStateException("БКС: не удалось получить котировку $symbol: ${it.message ?: "ошибка источника"}")
-            }?.takeIf { it.isFinite() && it > 0.0 }
+            runCatching { quoteBcs(clean) }
+                .getOrNull()
+                ?.takeIf { it.isFinite() && it > 0.0 }
+                ?: stableQuoteCache[quoteKey]
+                ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
+                    ?.takeIf { it.isFinite() && it > 0.0 }
                 ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
         } else {
-            throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
+            stableQuoteCache[quoteKey]
+                ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
+                    ?.takeIf { it.isFinite() && it > 0.0 }
+                ?: throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
         }
         if (value != null) {
             // Never freeze a valid BCS quote because it differs sharply from the
@@ -465,6 +495,10 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
             // hidden state that made tracking appear stuck on one price.
             stableQuoteCache[quoteKey] = value
             quoteCache[quoteKey] = now to value
+            prefs?.edit()
+                ?.putString("canonical_quote_$clean", value.toString())
+                ?.putLong("canonical_quote_ts_$clean", now)
+                ?.apply()
             return value
         }
         return value
@@ -477,14 +511,20 @@ class MarketRepository(private val alphaVantageKey: String? = null, private val 
     fun quoteFresh(symbol: String): Double? {
         val clean = symbol.trim().uppercase(Locale.US)
         if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
-        val value = runCatching { quoteBcs(clean) }.getOrElse {
-            throw IllegalStateException("БКС: не удалось получить актуальную котировку $symbol: ${it.message ?: "ошибка источника"}")
-        }?.takeIf { it.isFinite() && it > 0.0 }
+        val value = runCatching { quoteBcs(clean) }.getOrNull()
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?: stableQuoteCache["BCS|$clean"]
+            ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
+                ?.takeIf { it.isFinite() && it > 0.0 }
             ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
         val now = System.currentTimeMillis()
         val key = "BCS|$clean"
         stableQuoteCache[key] = value
         quoteCache[key] = now to value
+        prefs?.edit()
+            ?.putString("canonical_quote_$clean", value.toString())
+            ?.putLong("canonical_quote_ts_$clean", now)
+            ?.apply()
         return value
     }
 
