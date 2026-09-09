@@ -1029,7 +1029,6 @@ data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
     }
 }
 
-data class FavoriteQuote(val symbol:String,val price:Double?,val confidence:Int)
 
 
 
