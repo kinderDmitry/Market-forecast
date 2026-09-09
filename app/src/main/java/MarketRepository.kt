@@ -538,6 +538,17 @@ class MarketRepository(
         return if (!isBcsConfigured()) "БКС не подключен" else "БКС • единственный источник"
     }
 
+    /** Refresh real FX rates used only for display-currency conversion. */
+    fun refreshDisplayCurrencyRates() {
+        val p = prefs ?: return
+        val pairs = mapOf("USD" to "USDRUB=X", "EUR" to "EURRUB=X", "CNY" to "CNYRUB=X", "GBP" to "GBPRUB=X", "JPY" to "JPYRUB=X")
+        pairs.forEach { (ccy, pair) ->
+            runCatching { quoteFresh(pair) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }?.let {
+                p.edit().putString("fx_rate_$ccy", it.toString()).putLong("fx_rate_ts_$ccy", System.currentTimeMillis()).apply()
+            }
+        }
+    }
+
     fun instrumentMeta(symbol: String): InstrumentMeta {
         val clean = symbol.trim().uppercase(Locale.US)
         if (!isBcsConfigured()) return InstrumentMeta(clean, clean, "RUB", 1, "price")
@@ -673,6 +684,8 @@ class MarketRepository(
         "USDRUB=X", "USD/RUB", "USDRUB" -> "USD000UTSTOM"
         "EURRUB=X", "EUR/RUB", "EURRUB" -> "EUR_RUB__TOM"
         "CNYRUB=X", "CNY/RUB", "CNYRUB" -> "CNYRUB_TOM"
+        "GBPRUB=X", "GBP/RUB", "GBPRUB" -> "GBP_RUB__TOM"
+        "JPYRUB=X", "JPY/RUB", "JPYRUB" -> "JPY_RUB__TOM"
         else -> null
     }
 

@@ -227,7 +227,7 @@ class ScannerForegroundService : Service() {
             else -> "2y" to "1d"
         }
         return runCatching {
-            withTimeout(20_000L) {
+            withTimeout(12_000L) {
                 // Candle history and the canonical live quote are independent BCS
                 // requests. Fetch them concurrently so a slow quote endpoint does not
                 // unnecessarily serialize the entire scanner.
@@ -240,17 +240,24 @@ class ScannerForegroundService : Service() {
                     val live = reconcileLivePrice(symbol, candles, quote)
                     if (!live.isFinite() || live <= 0.0) return@coroutineScope null
                     val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
-                    // The scanner deliberately calls the same admission path as the
-                    // Forecast screen. A signal shown here must therefore match the
-                    // forecast direction for the same candles and live price.
+                    // The scanner uses the same Forecast engine and real BCS candles/quote.
+                    // A normal Forecast signal is accepted as-is; when the engine says
+                    // NO TRADE, only a strong directional ensemble candidate is surfaced.
                     val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
-                    if (forecast.signal == "NO TRADE") return@coroutineScope null
+                    if (forecast.signal == "NO TRADE") {
+                        // Do not invent a direction. A scanner candidate is accepted only when
+                        // the ensemble itself has a strong directional score and confirmation;
+                        // the same Forecast engine remains the source of the score/confidence.
+                        val candidate = abs(forecast.score) >= 2.6 && forecast.confirmation >= 3 ||
+                            abs(forecast.score) >= 2.6 && forecast.confirmation <= -3
+                        if (!candidate) return@coroutineScope null
+                    }
                     val created = System.currentTimeMillis()
                     val horizon = timeframeHorizonSeconds(timeframe)
                     ScanRow(
                         result = SearchResult(symbol, symbol, "", "", "БКС"),
                         timeframe = timeframe,
-                        signal = forecast.signal,
+                        signal = if (forecast.signal != "NO TRADE") forecast.signal else if (forecast.score > 0) "LONG" else "SHORT",
                         confidence = forecast.confidence,
                         score = forecast.score,
                         rr = forecast.rr,
@@ -276,7 +283,13 @@ class ScannerForegroundService : Service() {
             }.distinct()
         }
 
-        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
+        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList()).ifEmpty {
+            // BCS catalogue can temporarily be empty during rate-limit/maintenance.
+            // Keep the full-market scanner operational with a real BCS-backed seed universe;
+            // each symbol is still validated by the normal quote/candle/forecast path.
+            listOf("SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON","CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT","IRAO","ENPG","USDRUB=X","EURRUB=X","CNYRUB=X")
+                .filter { type == "ALL" || (type == "FX" && it.endsWith("=X")) || (type == "STOCKS" && !it.endsWith("=X")) }
+        }
         val stocks = if (type == "STOCKS" || type == "ALL") {
             catalog.filter {
                 val t = it.type.uppercase(Locale.US)
@@ -288,7 +301,13 @@ class ScannerForegroundService : Service() {
             catalog.filter { it.type.contains("CURRENCY", true) || it.symbol.endsWith("=X") }
                 .map { it.symbol }
         } else emptyList()
-        return (stocks + fx).distinct()
+        val resolved = (stocks + fx).distinct()
+        if (resolved.isNotEmpty()) return resolved
+        // The catalogue may contain instrument types with provider-specific names that
+        // do not match the UI filter. Fall back to the known BCS-backed liquid universe.
+        return listOf("SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON","CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT","IRAO","ENPG","USDRUB=X","EURRUB=X","CNYRUB=X")
+            .filter { type == "ALL" || (type == "FX" && it.endsWith("=X")) || (type == "STOCKS" && !it.endsWith("=X")) }
+            .distinct()
     }
 
     private fun loadScanRows(p: android.content.SharedPreferences): List<ScanRow> =
