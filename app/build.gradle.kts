@@ -11,8 +11,8 @@ android {
         applicationId = "com.marketforecast.prox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 104
-        versionName = "4.8.62"
+        versionCode = 105
+        versionName = "4.8.63"
     }
     buildFeatures { compose = true }
 
