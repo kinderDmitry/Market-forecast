@@ -1122,7 +1122,7 @@ private fun niceStep(raw: Double): Double {
                         fontSize = 8.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Text(if (ru) "Прибыль / убыток: ${pnlText ?: "—"}" else "Profit / loss: ${pnlText ?: "—"}", fontSize = 10.sp, fontWeight = FontWeight.Black, color = if (pnlText?.startsWith("+") == true) Positive else if (pnlText?.startsWith("−") == true || pnlText?.startsWith("-") == true) Negative else Warning)
+                    Text(if (pnlText == null) "—" else if (ru && pnlText.startsWith("+")) "Прибыль: $pnlText" else if (ru && (pnlText.startsWith("−") || pnlText.startsWith("-"))) "Убыток: $pnlText" else pnlText, fontSize = 10.sp, fontWeight = FontWeight.Black, color = if (pnlText?.startsWith("+") == true) Positive else if (pnlText?.startsWith("−") == true || pnlText?.startsWith("-") == true) Negative else Warning)
                     Text(
                         if (ru) "Entry ${CurrencyDisplay.format(t.entry, sourceCurrency, prefs)} • SL ${CurrencyDisplay.format(t.stop, sourceCurrency, prefs)} • TP1 ${CurrencyDisplay.format(t.tp1, sourceCurrency, prefs)} • TP2 ${CurrencyDisplay.format(t.tp2, sourceCurrency, prefs)} • TP3 ${CurrencyDisplay.format(t.tp3, sourceCurrency, prefs)}"
                         else "Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)} • TP2 ${fmt(t.tp2)} • TP3 ${fmt(t.tp3)}",
@@ -1166,7 +1166,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     val positive = pnl?.amount?.let { it > 1e-12 } == true
     val negative = pnl?.amount?.let { it < -1e-12 } == true
     val tone = when { positive -> Positive; negative -> Negative; else -> Warning }
-    val title = when { positive -> if (ru) "ПРИБЫЛЬ" else "PROFIT"; negative -> if (ru) "УБЫТОК" else "LOSS"; else -> if (ru) "БЕЗ ИЗМЕНЕНИЯ" else "FLAT" }
+    val title = when { positive -> if (ru) "Прибыль" else "Profit"; negative -> if (ru) "Убыток" else "Loss"; else -> if (ru) "Без изменения" else "Flat" }
     val icon = when { positive -> Icons.Default.TrendingUp; negative -> Icons.Default.TrendingDown; else -> Icons.Default.Remove }
     Surface(
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -1181,8 +1181,8 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
             }
             Column(Modifier.padding(start = 11.dp).weight(1f)) {
                 Text(title, color = tone, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.2.sp)
-                Text(amountText, color = tone, fontSize = 20.sp, fontWeight = FontWeight.Black)
-                Text(if (ru) "Результат: $percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}" else "Result: $percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (pnl == null) "—" else if (positive) "${if (ru) "Прибыль: " else "Profit: "}$amountText" else if (negative) "${if (ru) "Убыток: " else "Loss: "}$amountText" else "${if (ru) "Без изменения: " else "Flat: "}$amountText", color = tone, fontSize = 20.sp, fontWeight = FontWeight.Black)
+                Text(if (ru) "$percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}" else "$percentText • ${fmt(h.price)} → ${h.closingPrice.takeIf { it > 0 }?.let(::fmt) ?: "—"}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(percentText, color = tone, fontSize = 15.sp, fontWeight = FontWeight.Black)
         }
@@ -1209,10 +1209,10 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
                         val hits = h.hitSummary.ifBlank { "—" }
                         val pnl = historyPnl(h)
                         val pnlLabel = when {
-                            pnl == null -> if (ru) "P/L: —" else "P/L: —"
-                            pnl.amount > 1e-12 -> if (ru) "Результат: ✓ Прибыль ${if (pnl.percent >= 0) "+" else "−"}${String.format(Locale.US, "%.2f", pnl.percent)}%" else "Result: ✓ Profit ${String.format(Locale.US, "%+.2f", pnl.percent)}%"
-                            pnl.amount < -1e-12 -> if (ru) "Результат: ✕ Убыток −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%" else "Result: ✕ Loss −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%"
-                            else -> if (ru) "Результат: ≈ Без изменения 0.00%" else "Result: ≈ Flat 0.00%"
+                            pnl == null -> if (ru) "—" else "—"
+                            pnl.amount > 1e-12 -> if (ru) "✓ Прибыль ${if (pnl.percent >= 0) "+" else "−"}${String.format(Locale.US, "%.2f", pnl.percent)}%" else "✓ Profit ${String.format(Locale.US, "%+.2f", pnl.percent)}%"
+                            pnl.amount < -1e-12 -> if (ru) "✕ Убыток −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%" else "✕ Loss −${String.format(Locale.US, "%.2f", abs(pnl.percent))}%"
+                            else -> if (ru) "≈ Без изменения 0.00%" else "≈ Flat 0.00%"
                         }
                         if (ru) "$pnlLabel • события: $hits • прошло ${formatElapsed(elapsed)} • открытие ${fmt(h.price)} • закрытие ${close?.let(::fmt) ?: "—"}"
                         else "$pnlLabel • events: $hits • elapsed ${formatElapsed(elapsed)} • open ${fmt(h.price)} • close ${close?.let(::fmt) ?: "—"}"
