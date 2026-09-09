@@ -283,30 +283,27 @@ class ScannerForegroundService : Service() {
             }.distinct()
         }
 
-        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList()).ifEmpty {
-            // BCS catalogue can temporarily be empty during rate-limit/maintenance.
-            // Keep the full-market scanner operational with a real BCS-backed seed universe;
-            // each symbol is still validated by the normal quote/candle/forecast path.
-            listOf("SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON","CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT","IRAO","ENPG","USDRUB=X","EURRUB=X","CNYRUB=X")
-                .filter { type == "ALL" || (type == "FX" && it.endsWith("=X")) || (type == "STOCKS" && !it.endsWith("=X")) }
-        }
+        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
+        // scannerCatalog() returns SearchResult objects. Keep the metadata until the
+        // final symbol projection; never treat SearchResult as a String.
         val stocks = if (type == "STOCKS" || type == "ALL") {
-            catalog.filter {
-                val t = it.type.uppercase(Locale.US)
-                t.contains("STOCK") || t.contains("EQUITY") || t.contains("ETF") ||
-                    t.contains("DEPOSITARY") || t.contains("FUND")
-            }.map { it.symbol }
+            catalog.filter { item ->
+                val kind = item.type.uppercase(Locale.US)
+                kind.contains("STOCK") || kind.contains("EQUITY") || kind.contains("ETF") ||
+                    kind.contains("DEPOSITARY") || kind.contains("FUND")
+            }.map(SearchResult::symbol)
         } else emptyList()
         val fx = if (type == "FX" || type == "ALL") {
-            catalog.filter { it.type.contains("CURRENCY", true) || it.symbol.endsWith("=X") }
-                .map { it.symbol }
+            catalog.filter { item -> item.type.contains("CURRENCY", true) || item.symbol.endsWith("=X") }
+                .map(SearchResult::symbol)
         } else emptyList()
-        val resolved = (stocks + fx).distinct()
+        val resolved = (stocks + fx).filter { it.isNotBlank() }.distinct()
         if (resolved.isNotEmpty()) return resolved
-        // The catalogue may contain instrument types with provider-specific names that
-        // do not match the UI filter. Fall back to the known BCS-backed liquid universe.
+        // BCS catalogue can temporarily be empty or expose provider-specific type names.
+        // These are only a seed universe: every item still goes through the real BCS
+        // candle + quote + Forecast engine, so no synthetic signal is created.
         return listOf("SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON","CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT","IRAO","ENPG","USDRUB=X","EURRUB=X","CNYRUB=X")
-            .filter { type == "ALL" || (type == "FX" && it.endsWith("=X")) || (type == "STOCKS" && !it.endsWith("=X")) }
+            .filter { symbol -> type == "ALL" || (type == "FX" && symbol.endsWith("=X")) || (type == "STOCKS" && !symbol.endsWith("=X")) }
             .distinct()
     }
 

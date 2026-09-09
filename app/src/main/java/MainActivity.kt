@@ -523,7 +523,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, marketPicks, marketLoading, marketMode, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, { marketMode = it }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, ::saveFav) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
-                        Screen.HISTORY -> History(history, tracked, ru, repo, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
+                        Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick, { row -> pendingScanTrack = row.result.symbol to row.timeframe; load(row.result.symbol, row.timeframe) })
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
@@ -1040,7 +1040,7 @@ private fun niceStep(raw: Double): Double {
 
 
 
-@Composable private fun History(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean, repo: MarketRepository, load: (String) -> Unit, remove: (HistoryEntry) -> Unit, stats: () -> Unit, initialTab: String = "TRACKING", onTab: (String) -> Unit = {}, refreshTick: Long = 0L) {
+@Composable private fun History(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean, repo: MarketRepository, prefs: android.content.SharedPreferences, load: (String) -> Unit, remove: (HistoryEntry) -> Unit, stats: () -> Unit, initialTab: String = "TRACKING", onTab: (String) -> Unit = {}, refreshTick: Long = 0L) {
     var tab by remember(initialTab) { mutableStateOf(initialTab) }
     val pending=tracked.filter{it.result=="PENDING"}.sortedByDescending{it.createdAt}
     val done=history.count{it.directionOk!=null}; val wins=history.count{it.directionOk==true}
@@ -1064,7 +1064,7 @@ private fun niceStep(raw: Double): Double {
 @Composable private fun TrackingRow(t: TrackedForecast, ru: Boolean, repo: MarketRepository, prefs: android.content.SharedPreferences, open: () -> Unit) {
     var live by remember(t.id) { mutableStateOf(t.lastLivePrice.takeIf { it > 0.0 }) }
     var now by remember(t.id) { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(t.id, t.lastUpdated) {
+    LaunchedEffect(t.id, t.lastUpdated, refreshTick) {
         live = t.lastLivePrice.takeIf { it > 0.0 }
         now = if (t.lastUpdated > 0L) t.lastUpdated else System.currentTimeMillis()
     }
@@ -1075,7 +1075,7 @@ private fun niceStep(raw: Double): Double {
     val movePct = if (current != null && t.entry > 0) {
         if (longSide) (current - t.entry) / t.entry * 100.0 else (t.entry - current) / t.entry * 100.0
     } else null
-    val sourceCurrency = "RUB"
+    val sourceCurrency = if (t.symbol.endsWith("=X", ignoreCase = true)) "RUB" else "RUB"
     val pnlText = current?.let { CurrencyDisplay.pnl(t.entry, it, sourceCurrency, longSide, prefs) }
     val riskDistance = abs(t.entry - t.stop).coerceAtLeast(1e-9)
     val tp1Distance = abs(t.tp1 - t.entry).coerceAtLeast(1e-9)
