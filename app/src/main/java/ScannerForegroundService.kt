@@ -238,8 +238,8 @@ class ScannerForegroundService : Service() {
                     if (candles.size < 30) return@coroutineScope null
                     val quote = quoteJob.await()
                     val live = reconcileLivePrice(symbol, candles, quote)
-                if (!live.isFinite() || live <= 0.0) return@withTimeout null
-                val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
+                    if (!live.isFinite() || live <= 0.0) return@coroutineScope null
+                    val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
                     // The scanner deliberately calls the same admission path as the
                     // Forecast screen. A signal shown here must therefore match the
                     // forecast direction for the same candles and live price.
