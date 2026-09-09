@@ -136,8 +136,8 @@ jobs:
           check_grep 'android:icon="@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml
           check_grep 'import kotlin.math.abs' app/src/main/java/TrackingEngine.kt
           check_grep 'val monitorMinConf = p.getInt("alert_min_confidence", 60)' app/src/main/java/MarketMonitorWorker.kt
-          check_grep 'versionCode = 104' app/build.gradle.kts
-          check_grep 'versionName = "4.8.62"' app/build.gradle.kts
+          check_grep 'versionCode = 106' app/build.gradle.kts
+          check_grep 'versionName = "4.8.64"' app/build.gradle.kts
           check_no_grep 'interval == "15m".*loadMoex(moex, "15m")' app/src/main/java/MarketRepository.kt
           check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
           check_no_grep 'mutableStateOf(f?.tp2?.toString() ?: "105")' app/src/main/java/MainActivity.kt
@@ -155,7 +155,7 @@ jobs:
       - name: Rename APK
         run: |
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.62.apk
+          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.64.apk
 
       # GitHub Actions artifact storage can be exhausted independently of the
       # repository. Do NOT publish the APK as a workflow artifact here. Publish the APK as a GitHub
@@ -166,8 +166,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.62 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.62.apk \
+          TITLE="MarketForecast PROX 4.8.64 build ${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" release/MarketForecast_PROX_4.8.64.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.62. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.64. Commit: ${GITHUB_SHA}"
