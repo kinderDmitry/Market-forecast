@@ -24,6 +24,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -102,7 +104,10 @@ class ScannerForegroundService : Service() {
 
                 fun acceptRow(candidate: ScanRow) {
                     val old = (activeRows + found).firstOrNull { rowKey(it) == rowKey(candidate) && (it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis()) }
-                    val stable = if (old != null) candidate.copy(createdAt = old.createdAt, expiresAt = old.expiresAt) else candidate
+                    // Every completed scan is a fresh validation event. Keep the same row key,
+                    // but renew its action horizon so the countdown never gets stuck on
+                    // the previous scan cycle.
+                    val stable = candidate
                     synchronized(found) {
                         found.removeAll { rowKey(it) == rowKey(stable) }
                         found.add(stable)
@@ -113,35 +118,30 @@ class ScannerForegroundService : Service() {
                 if (symbols.isEmpty()) {
                     setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
                 } else {
-                    val jobs = mutableListOf<kotlinx.coroutines.Deferred<ScanRow?>>()
+                    // Worker-pool model: unlike the old fixed batches, workers keep
+                    // consuming symbols as soon as a request finishes. This removes
+                    // the "wait for the slowest 8th request" pauses on market-wide scans.
+                    val concurrency = if (scopeMode == "SELECTED") 8 else 12
+                    val gate = Semaphore(concurrency)
                     coroutineScope {
-                        for (symbol in symbols) {
-                            if (!currentCoroutineContext().isActive || !running.get()) break
-                            for (currentTf in timeframes) {
-                                if (!currentCoroutineContext().isActive || !running.get()) break
-                                jobs += async(Dispatchers.IO) {
-                                    val row = scanOne(repo, symbol, currentTf)
-                                    val done = completed.incrementAndGet()
-                                    val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
-                                    if (done == 1L || done % 5L == 0L || done == total) {
-                                        setStatus("🔎 Сканирование: $done / $total", progress)
+                        val jobs = symbols.flatMap { symbol ->
+                            if (!currentCoroutineContext().isActive || !running.get()) return@flatMap emptyList()
+                            timeframes.map { currentTf ->
+                                async(Dispatchers.IO) {
+                                    gate.withPermit {
+                                        val row = scanOne(repo, symbol, currentTf)
+                                        val done = completed.incrementAndGet()
+                                        val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+                                        if (done == 1L || done % 5L == 0L || done == total) {
+                                            setStatus("🔎 Сканирование: $done / $total", progress)
+                                        }
+                                        row
                                     }
-                                    row
-                                }
-                                // Keep the provider load bounded. Eight in-flight requests are enough
-                                // to make a large scan materially faster without creating a request storm.
-                                if (jobs.size >= 8) {
-                                    jobs.awaitAll().forEach { row ->
-                                        if (row != null) acceptRow(row)
-                                    }
-                                    jobs.clear()
                                 }
                             }
                         }
-                        if (jobs.isNotEmpty()) {
-                            jobs.awaitAll().forEach { row ->
-                                if (row != null) acceptRow(row)
-                            }
+                        jobs.awaitAll().forEach { row ->
+                            if (row != null) acceptRow(row)
                         }
                     }
                 }
@@ -173,7 +173,7 @@ class ScannerForegroundService : Service() {
                 // Notify once for a completed scan state and again only when the signal
                 // set/count changes or the user starts a new scan.
                 val completionSignature = merged
-                    .map { "${rowKey(it)}|${it.confidence}|${it.expiresAt}" }
+                    .map { "${rowKey(it)}|${it.confidence}" }
                     .sorted()
                     .joinToString(";")
                 val previousCompletionSignature = prefs.getString("scanner_completion_signature", null)
@@ -228,27 +228,37 @@ class ScannerForegroundService : Service() {
         }
         return runCatching {
             withTimeout(20_000L) {
-                val candles = repo.load(symbol, pair.first, pair.second)
-                if (candles.size < 30) return@withTimeout null
-                val quote = runCatching { repo.quote(symbol) }.getOrNull()
-                val live = reconcileLivePrice(symbol, candles, quote)
+                // Candle history and the canonical live quote are independent BCS
+                // requests. Fetch them concurrently so a slow quote endpoint does not
+                // unnecessarily serialize the entire scanner.
+                coroutineScope {
+                    val candlesJob = async(Dispatchers.IO) { repo.load(symbol, pair.first, pair.second) }
+                    val quoteJob = async(Dispatchers.IO) { runCatching { repo.quote(symbol) }.getOrNull() }
+                    val candles = candlesJob.await()
+                    if (candles.size < 30) return@coroutineScope null
+                    val quote = quoteJob.await()
+                    val live = reconcileLivePrice(symbol, candles, quote)
                 if (!live.isFinite() || live <= 0.0) return@withTimeout null
                 val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
-                val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
-                if (forecast.signal == "NO TRADE") return@withTimeout null
-                val created = System.currentTimeMillis()
-                val horizon = timeframeHorizonSeconds(timeframe)
-                ScanRow(
-                    result = SearchResult(symbol, symbol, "", "", "БКС"),
-                    timeframe = timeframe,
-                    signal = forecast.signal,
-                    confidence = forecast.confidence,
-                    score = forecast.score,
-                    rr = forecast.rr,
-                    horizonSeconds = horizon,
-                    createdAt = created,
-                    expiresAt = created + horizon * 1000L
-                )
+                    // The scanner deliberately calls the same admission path as the
+                    // Forecast screen. A signal shown here must therefore match the
+                    // forecast direction for the same candles and live price.
+                    val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
+                    if (forecast.signal == "NO TRADE") return@coroutineScope null
+                    val created = System.currentTimeMillis()
+                    val horizon = timeframeHorizonSeconds(timeframe)
+                    ScanRow(
+                        result = SearchResult(symbol, symbol, "", "", "БКС"),
+                        timeframe = timeframe,
+                        signal = forecast.signal,
+                        confidence = forecast.confidence,
+                        score = forecast.score,
+                        rr = forecast.rr,
+                        horizonSeconds = horizon,
+                        createdAt = created,
+                        expiresAt = created + horizon * 1000L
+                    )
+                }
             }
         }.getOrNull()
     }

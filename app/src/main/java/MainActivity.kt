@@ -1007,9 +1007,9 @@ private fun niceStep(raw: Double): Double {
 
 @Composable private fun Favorites(favs: List<String>, ru: Boolean, repo: MarketRepository, save: (Set<String>) -> Unit, load: (String) -> Unit, refreshTick: Long = 0L) {
     var sort by remember { mutableStateOf("PRICE_ASC") }
-    var rows by remember(favs) { mutableStateOf(favs.map { FavoriteQuote(it, null, 0) }) }
+    var rows by remember(favs) { mutableStateOf(favs.map { FavoriteQuoteItem(it, null, 0) }) }
     LaunchedEffect(favs, refreshTick) {
-        rows = withContext(Dispatchers.IO) { favs.map { s -> FavoriteQuote(s, runCatching { repo.quote(s) }.getOrNull(), 0) }.toMutableList() }
+        rows = withContext(Dispatchers.IO) { favs.map { s -> FavoriteQuoteItem(s, runCatching { repo.quote(s) }.getOrNull(), 0) }.toMutableList() }
         rows = rows.map { r ->
             val c = runCatching { repo.load(r.symbol, "5y", "1d") }.getOrNull()
             val live = r.price ?: c?.lastOrNull()?.close

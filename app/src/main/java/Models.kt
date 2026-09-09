@@ -108,4 +108,4 @@ data class MarketState(
 )
 
 
-data class FavoriteQuote(val symbol: String, val price: Double?, val confidence: Int)
+data class FavoriteQuoteItem(val symbol: String, val price: Double?, val confidence: Int)
