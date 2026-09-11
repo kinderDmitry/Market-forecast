@@ -399,6 +399,55 @@ object AnalyticsEngine {
         return if (total == 0) 0.5 else ((wins + neutral * 0.5) / total).coerceIn(0.05, 0.95)
     }
 
+    /**
+     * Conditional walk-forward edge: evaluate only historical bars whose basic
+     * market regime resembles the current setup. Unconditional direction bias is
+     * too weak for calibration because bull markets can make every LONG look good.
+     */
+    private fun conditionalHistoricalEdge(c: List<Candle>, direction: Int, horizon: Int, currentTrend: Double, currentRsi: Double): Double {
+        if (c.size < 110) return 0.5
+        val start = max(55, c.size - 150)
+        val end = c.size - horizon - 2
+        if (end <= start) return 0.5
+        var wins = 0.0
+        var neutral = 0.0
+        var total = 0
+        var i = start
+        while (i <= end) {
+            val x = c.subList(0, i + 1)
+            val closes = x.map { it.close }
+            val e20 = ema(closes, 20) ?: closes.last()
+            val e50 = ema(closes, 50) ?: closes.last()
+            val localTrend = ((e20 - e50) / closes.last().coerceAtLeast(1e-9) * 100.0).coerceIn(-8.0, 8.0)
+            val localRsi = rsi(closes) ?: 50.0
+            val sameDirection = if (direction > 0) localTrend >= -0.15 else localTrend <= 0.15
+            val trendDistance = abs(localTrend - currentTrend)
+            val rsiDistance = abs(localRsi - currentRsi)
+            // Keep a reasonably broad neighbourhood so sparse instruments do not
+            // collapse to a meaningless 50/50 estimate.
+            if (sameDirection && trendDistance <= 1.8 && rsiDistance <= 18.0) {
+                val entry = c[i].close
+                val unit = (atr(x) ?: entry * 0.01).coerceAtLeast(entry * 0.002)
+                val future = c.subList(i + 1, min(c.size, i + 1 + horizon))
+                if (future.isNotEmpty() && entry.isFinite() && entry > 0.0) {
+                    val favorable = if (direction > 0) future.maxOf { it.high } - entry else entry - future.minOf { it.low }
+                    val adverse = if (direction > 0) entry - future.minOf { it.low } else future.maxOf { it.high } - entry
+                    val target = unit * 0.75
+                    when {
+                        favorable >= target && adverse < target -> wins += 1.0
+                        favorable < target && adverse < target -> {
+                            if (direction * (future.last().close - entry) > 0) wins += 1.0 else neutral += 1.0
+                        }
+                        else -> neutral += 1.0
+                    }
+                    total++
+                }
+            }
+            i += 5
+        }
+        return if (total < 3) 0.5 else ((wins + neutral * 0.5) / total).coerceIn(0.05, 0.95)
+    }
+
     private fun multiHorizonEdge(c: List<Candle>, direction: Int): Double {
         // Calibrate the direction on several horizons. A signal is considered robust
         // only when it has positive walk-forward edge across more than one horizon.
@@ -582,8 +631,14 @@ object AnalyticsEngine {
         // Historical edge is deliberately computed in both directions and only the
         // selected direction is used after signal formation. This makes confidence
         // sensitive to what this market has actually rewarded recently.
-        val longEdge = if (calibrate) multiHorizonEdge(c, 1) else 0.5
-        val shortEdge = if (calibrate) multiHorizonEdge(c, -1) else 0.5
+        val currentTrendContext = ((e20 - e50) / price.coerceAtLeast(1e-9) * 100.0).coerceIn(-8.0, 8.0)
+        val longEdgeRaw = if (calibrate) multiHorizonEdge(c, 1) else 0.5
+        val shortEdgeRaw = if (calibrate) multiHorizonEdge(c, -1) else 0.5
+        val longConditional = if (calibrate) conditionalHistoricalEdge(c, 1, 8, currentTrendContext, r) else 0.5
+        val shortConditional = if (calibrate) conditionalHistoricalEdge(c, -1, 8, currentTrendContext, r) else 0.5
+        // Conditional evidence gets more weight than unconditional market drift.
+        val longEdge = (longConditional * 0.65 + longEdgeRaw * 0.35).coerceIn(0.05, 0.95)
+        val shortEdge = (shortConditional * 0.65 + shortEdgeRaw * 0.35).coerceIn(0.05, 0.95)
         val edgeGap = abs(longEdge - shortEdge)
         val efficiencyWindow = c.takeLast(min(20, c.size)).map { it.close }
         val pathNoise = efficiencyWindow.zipWithNext().sumOf { abs(it.second - it.first) }.coerceAtLeast(1e-9)
@@ -624,13 +679,13 @@ object AnalyticsEngine {
             else -> 0.022
         }
         val scoreThreshold = when {
-            trendRegimeStrong -> 3.0
-            rangeMarketRegime -> 3.8
-            else -> 3.3
+            trendRegimeStrong -> 3.05
+            rangeMarketRegime -> 4.15
+            else -> 3.45
         }
         val weakEdge = edgeGap < edgeThreshold && abs(score) < scoreThreshold + 0.9
-        val precisionLong = longEdge >= 0.515 && longEdge - shortEdge >= edgeThreshold
-        val precisionShort = shortEdge >= 0.515 && shortEdge - longEdge >= edgeThreshold
+        val precisionLong = longEdge >= 0.535 && longEdge - shortEdge >= edgeThreshold
+        val precisionShort = shortEdge >= 0.535 && shortEdge - longEdge >= edgeThreshold
         val efficiencyGate = if (trendRegimeStrong) efficiency >= 0.12 else efficiency >= 0.055
         val scoreGate = abs(score) >= scoreThreshold
         val confirmationGate = abs(confirmation) >= 2
@@ -749,16 +804,17 @@ object AnalyticsEngine {
             "Расширенный теханализ: CCI %.1f; Williams %%R %.1f; MFI %.1f; CMF %.2f; Ichimoku %.2f; Donchian %.2f; Stoch RSI %.2f.".format(Locale.US, cciV, williamsV, mfiV, cmfV, ichimoku, donchian, stochRsi),
             "Вероятность направления: %.0f%%; edge %.0f%%, gap %.1f п.п., ADX %.1f, R/R %.2f, подтверждение %d/5.".format(Locale.US, calibratedProbability, selectedEdge * 100.0, edgeGap * 100.0, adxV, rr, confirmation)
         )
+        val expectedProfitPct = if (price == 0.0) 0.0 else abs(safeTp2 - price) / price * 100.0
+        val expectedLossPct = if (price == 0.0) 0.0 else abs(price - stop) / price * 100.0
         val robustEdge = selectedEdge >= 0.62 && edgeGap >= 0.08
         val robustTrend = abs(confirmation) >= 3 && adxV >= 22.0
         val robustStructure = rr >= 1.60 && abs(advancedTechnical) >= 0.90
-        val highConviction = signal != "NO TRADE" && robustEdge && robustTrend && robustStructure
-        val finalSignal = signal
+        val actualRrGate = rr >= 1.60 && expectedProfitPct >= expectedLossPct * 1.60
+        val highConviction = signal != "NO TRADE" && actualRrGate && robustEdge && robustTrend && robustStructure
+        val finalSignal = if (signal != "NO TRADE" && !actualRrGate) "NO TRADE" else signal
         // For NO TRADE, confidence describes directional certainty only as a
         // probability estimate; it is never presented as permission to trade.
         val finalConfidence = confidence
-        val expectedProfitPct = if (price == 0.0) 0.0 else abs(safeTp2 - price) / price * 100.0
-        val expectedLossPct = if (price == 0.0) 0.0 else abs(price - stop) / price * 100.0
         val finalExplanation = explanation + listOf(
             "Режим рынка: $regime; ширина Bollinger %.2f%%.".format(Locale.US, bbWidth * 100.0),
             String.format(Locale.US, "Risk Engine: SL ограничен %.2f%% цены; R/R по TP2 %.2f.", expectedLossPct, rr)

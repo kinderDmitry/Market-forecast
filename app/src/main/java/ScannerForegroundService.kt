@@ -29,7 +29,6 @@ import kotlinx.coroutines.sync.withPermit
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.abs
 
 /**
  * Foreground scanner. Keeps the scanner independent from the Activity and writes all
@@ -240,18 +239,12 @@ class ScannerForegroundService : Service() {
                     val live = reconcileLivePrice(symbol, candles, quote)
                     if (!live.isFinite() || live <= 0.0) return@coroutineScope null
                     val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
-                    // The scanner uses the same Forecast engine and real BCS candles/quote.
-                    // A normal Forecast signal is accepted as-is; when the engine says
-                    // NO TRADE, only a strong directional ensemble candidate is surfaced.
+                    // Scanner is a strict execution surface of the Forecast engine.
+                    // Never manufacture a direction from score/confirmation when the
+                    // engine explicitly rejects the setup. This keeps scanner results
+                    // identical to instrument forecasts and prevents low-quality trades.
                     val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
-                    if (forecast.signal == "NO TRADE") {
-                        // Do not invent a direction. A scanner candidate is accepted only when
-                        // the ensemble itself has a strong directional score and confirmation;
-                        // the same Forecast engine remains the source of the score/confidence.
-                        val candidate = abs(forecast.score) >= 2.6 && forecast.confirmation >= 3 ||
-                            abs(forecast.score) >= 2.6 && forecast.confirmation <= -3
-                        if (!candidate) return@coroutineScope null
-                    }
+                    if (forecast.signal == "NO TRADE") return@coroutineScope null
                     val created = System.currentTimeMillis()
                     val horizon = timeframeHorizonSeconds(timeframe)
                     ScanRow(
