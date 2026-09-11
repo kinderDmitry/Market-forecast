@@ -448,6 +448,24 @@ object AnalyticsEngine {
         return if (total < 3) 0.5 else ((wins + neutral * 0.5) / total).coerceIn(0.05, 0.95)
     }
 
+    private data class HorizonEdgeStats(val average: Double, val minimum: Double, val positiveCount: Int, val count: Int)
+
+    private fun horizonEdgeStats(c: List<Candle>, direction: Int): HorizonEdgeStats {
+        val horizons = intArrayOf(3, 8, 16)
+        val weights = doubleArrayOf(.25, .50, .25)
+        var weighted = 0.0; var used = 0.0; var minimum = 1.0; var positive = 0; var count = 0
+        horizons.forEachIndexed { idx, h ->
+            if (c.size >= 70 + h) {
+                val e = historicalEdge(c, direction, h)
+                weighted += e * weights[idx]; used += weights[idx]; minimum = minOf(minimum, e)
+                if (e >= 0.52) positive++
+                count++
+            }
+        }
+        return if (count == 0) HorizonEdgeStats(.5, .5, 0, 0)
+        else HorizonEdgeStats((weighted / used).coerceIn(.05, .95), minimum.coerceIn(.05, .95), positive, count)
+    }
+
     private fun multiHorizonEdge(c: List<Candle>, direction: Int): Double {
         // Calibrate the direction on several horizons. A signal is considered robust
         // only when it has positive walk-forward edge across more than one horizon.
@@ -639,6 +657,8 @@ object AnalyticsEngine {
         // Conditional evidence gets more weight than unconditional market drift.
         val longEdge = (longConditional * 0.65 + longEdgeRaw * 0.35).coerceIn(0.05, 0.95)
         val shortEdge = (shortConditional * 0.65 + shortEdgeRaw * 0.35).coerceIn(0.05, 0.95)
+        val longHorizon = if (calibrate) horizonEdgeStats(c, 1) else HorizonEdgeStats(.5, .5, 0, 0)
+        val shortHorizon = if (calibrate) horizonEdgeStats(c, -1) else HorizonEdgeStats(.5, .5, 0, 0)
         val edgeGap = abs(longEdge - shortEdge)
         val efficiencyWindow = c.takeLast(min(20, c.size)).map { it.close }
         val pathNoise = efficiencyWindow.zipWithNext().sumOf { abs(it.second - it.first) }.coerceAtLeast(1e-9)
@@ -686,6 +706,8 @@ object AnalyticsEngine {
         val weakEdge = edgeGap < edgeThreshold && abs(score) < scoreThreshold + 0.9
         val precisionLong = longEdge >= 0.535 && longEdge - shortEdge >= edgeThreshold
         val precisionShort = shortEdge >= 0.535 && shortEdge - longEdge >= edgeThreshold
+        val horizonLongGate = longHorizon.count == 0 || (longHorizon.positiveCount >= minOf(2, longHorizon.count) && longHorizon.minimum >= 0.48)
+        val horizonShortGate = shortHorizon.count == 0 || (shortHorizon.positiveCount >= minOf(2, shortHorizon.count) && shortHorizon.minimum >= 0.48)
         val efficiencyGate = if (trendRegimeStrong) efficiency >= 0.12 else efficiency >= 0.055
         val scoreGate = abs(score) >= scoreThreshold
         val confirmationGate = abs(confirmation) >= 2
@@ -698,8 +720,8 @@ object AnalyticsEngine {
         }
         val signal = when {
             directionalConflict || divergenceConflict || !efficiencyGate || !scoreGate || !confirmationGate || !rrGate -> "NO TRADE"
-            score > 0 && precisionLong && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "LONG"
-            score < 0 && precisionShort && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "SHORT"
+            score > 0 && precisionLong && horizonLongGate && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "LONG"
+            score < 0 && precisionShort && horizonShortGate && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "SHORT"
             // If historical edge is inconclusive, a very strong current ensemble
             // can still produce a directional call. Confidence is capped below.
             score >= scoreThreshold + 1.5 && confirmation >= 3 && !divergenceConflict -> "LONG"
@@ -796,7 +818,7 @@ object AnalyticsEngine {
             "VWAP: %.4f; отклонение цены %.2f%%; наклон EMA20 %.2f%%.".format(Locale.US, vwapV, (price-vwapV)/price*100.0, slope),
             "Давление последней свечи: %.2f; ATR-перцентиль: %.0f%%; эффективность движения %.2f.".format(Locale.US, pressure, atrPctile*100.0, efficiency),
             "Пробойный импульс: %.2f; объёмный импульс: %.2f; режим волатильности: %.2f%%.".format(Locale.US, breakout, volumeImpulse, volatilityPct),
-            "Walk-forward edge по горизонтам: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п.; слабые и конфликтные направления отсекаются.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0),
+            "Walk-forward edge: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п. Мультигоризонт: LONG %d/%d положительных, min %.0f%%; SHORT %d/%d, min %.0f%%.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0, longHorizon.positiveCount, longHorizon.count, longHorizon.minimum * 100.0, shortHorizon.positiveCount, shortHorizon.count, shortHorizon.minimum * 100.0),
             "Новая перекрёстная проверка: качество тренда %.2f; цена+объём %.2f; дивергенция RSI %.2f; сила подтверждения %.0f%%.".format(Locale.US, trendQuality, volumePrice, divergence, confirmationStrength * 100.0),
             "Price Action Engine: сила тела %.2f; эффективность диапазона %.2f; расширение диапазона %.2f; аномалия объёма %.2f.".format(Locale.US, bodyStrength, rangeEfficiency, rangeExpansion, volumeAnomaly),
             "Pattern Engine: score %.2f; распознано: %s.".format(Locale.US, patterns.score, if (patterns.names.isEmpty()) "нет устойчивой формации" else patterns.names.joinToString(", ")),

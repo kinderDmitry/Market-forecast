@@ -151,7 +151,7 @@ class ScannerForegroundService : Service() {
                     (found + loadScanRows(prefs))
                         .filter { it.expiresAt <= 0L || it.expiresAt > now }
                         .distinctBy { rowKey(it) }
-                        .sortedWith(compareByDescending<ScanRow> { it.confidence }.thenByDescending { abs(it.score) })
+                        .sortedWith(compareByDescending<ScanRow> { it.confidence }.thenByDescending { kotlin.math.abs(it.score) })
                 }
                 saveScanRows(prefs, merged)
                 prefs.edit()
