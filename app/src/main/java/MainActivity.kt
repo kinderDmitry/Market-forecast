@@ -1248,61 +1248,98 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     LaunchedEffect(Unit) {
         while (true) {
             countdownNow = System.currentTimeMillis()
-            delay(1000L)
-        }
-    }
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text(
-            text = if (ru) "Выберите область: только избранные или весь доступный рынок. При сканировании всего рынка фоновые задачи приостанавливаются, чтобы все ресурсы устройства были отданы сканеру." else "Choose scope: favorites only or the full available market. During a full scan, background tasks are paused so device resources are dedicated to the scanner.",
-            fontSize = 9.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("SELECTED","ALL").forEach { k ->
-                FilterChip(selected=scope==k,onClick={scope=k;prefs.edit().putString("scanner_scope",k).apply()},label={Text(if(ru) if(k=="SELECTED") "Только избранные" else "Весь рынок" else if(k=="SELECTED") "Selected only" else "Entire market",fontSize=8.sp)})
-            }
-        }
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("ALL","STOCKS","FX").forEach { k -> FilterChip(selected=type==k,onClick={type=k;prefs.edit().putString("scanner_type",k).apply()},label={Text(if(ru) when(k){"ALL"->"Все";"STOCKS"->"Акции";else->"Валюты"} else k,fontSize=8.sp)}) } }
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("15M","1H","4H","1D","1W","ANY").forEach { k -> FilterChip(selected=tf==k,onClick={tf=k;prefs.edit().putString("scanner_tf",k).apply()},label={Text(if(ru&&k=="ANY")"Любой" else k,fontSize=8.sp)}) } }
-        Spacer(Modifier.height(8.dp))
-        if (busy) { GradientCard(Modifier.fillMaxWidth()) { Row(verticalAlignment=Alignment.CenterVertically){CircularProgressIndicator(Modifier.size(24.dp),color=Accent);Column(Modifier.padding(start=10.dp)){Text(if(ru)"Идёт сканирование рыночных данных…" else "Scanning live market…",fontWeight=FontWeight.Bold,fontSize=10.sp);LinearProgressIndicator(progress={progress},Modifier.fillMaxWidth().padding(top=6.dp),color=Accent)}} } }
-        LaunchedEffect(refreshTick) {
             busy = prefs.getBoolean("scanner_running", false)
             progress = prefs.getFloat("scanner_progress", 0f)
             scannerStatus = prefs.getString("scanner_status", "") ?: ""
+            results = loadAutoScanResults(prefs)
+            delay(1000L)
         }
-        LaunchedEffect(Unit) {
-            while (true) {
-                busy = prefs.getBoolean("scanner_running", false)
-                progress = prefs.getFloat("scanner_progress", 0f)
-                scannerStatus = prefs.getString("scanner_status", "") ?: ""
-                results = loadAutoScanResults(prefs)
-                delay(1000L)
-            }
+    }
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(top = 10.dp, bottom = 30.dp)
+    ) {
+        item {
+            Text(
+                text = if (ru) "Выберите область: только избранные или весь доступный рынок. При сканировании всего рынка фоновые задачи приостанавливаются, чтобы все ресурсы устройства были отданы сканеру." else "Choose scope: favorites only or the full available market. During a full scan, background tasks are paused so device resources are dedicated to the scanner.",
+                fontSize = 9.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
-        Button({
-            if (prefs.getBoolean("scanner_running", false)) {
-                ctx.startService(Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_STOP))
-            } else {
-                prefs.edit().putBoolean("scanner_priority_active", scope == "ALL").apply()
-                if (scope == "ALL") {
-                    WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor")
-                    WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_now")
-                    WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_history_catchup")
+        item {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("SELECTED","ALL").forEach { k ->
+                    FilterChip(selected=scope==k,onClick={scope=k;prefs.edit().putString("scanner_scope",k).apply()},label={Text(if(ru) if(k=="SELECTED") "Только избранные" else "Весь рынок" else if(k=="SELECTED") "Selected only" else "Entire market",fontSize=8.sp)})
                 }
-                val intent = Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_START)
-                    .putExtra(ScannerForegroundService.EXTRA_SCOPE, scope)
-                    .putExtra(ScannerForegroundService.EXTRA_TYPE, type)
-                    .putExtra(ScannerForegroundService.EXTRA_TF, tf)
-                if (Build.VERSION.SDK_INT >= 26) androidx.core.content.ContextCompat.startForegroundService(ctx, intent) else ctx.startService(intent)
             }
-        }, Modifier.fillMaxWidth(), enabled=true, colors=ButtonDefaults.buttonColors(containerColor=if (busy) Negative else Accent)) {
-            Text(if (busy) (if (ru) "⛔ ОСТАНОВИТЬ СКАНЕР" else "⛔ STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
         }
-        if(scannerStatus.isNotBlank()&&!busy) Text(scannerStatus,fontSize=9.sp,color=Positive,modifier=Modifier.padding(top=6.dp))
-        if (results.isNotEmpty()) Text(if (ru) "Сигналы действуют только до указанного времени. После окончания горизонта они автоматически исчезают и ждут нового подтверждения." else "Signals are valid only until the shown expiry. After the horizon they disappear automatically and wait for a new confirmation.", fontSize=8.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, modifier=Modifier.padding(top=5.dp))
-        if (results.isNotEmpty()) { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "🗑️ Удалить все" else "🗑️ Delete all") } } }
-        LazyColumn(verticalArrangement=Arrangement.spacedBy(8.dp)) { items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row -> GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) { Row(verticalAlignment=Alignment.CenterVertically){Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black);Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }; Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black); val left=(row.expiresAt-countdownNow).coerceAtLeast(0L); Text(if(left>0) "• ${formatElapsed(left)}" else "• ${if(ru) "истёк" else "expired"}", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp); Spacer(Modifier.width(3.dp)); TextButton(onClick={track(row)}, contentPadding=PaddingValues(horizontal=6.dp, vertical=0.dp)) { Text(if(ru) "Отследить" else "Track", color=Positive, fontSize=8.sp, fontWeight=FontWeight.Black) }; IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}} } } }
+        item {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("ALL","STOCKS","FX").forEach { k ->
+                    FilterChip(selected=type==k,onClick={type=k;prefs.edit().putString("scanner_type",k).apply()},label={Text(if(ru) when(k){"ALL"->"Все";"STOCKS"->"Акции";else->"Валюты"} else k,fontSize=8.sp)})
+                }
+            }
+        }
+        item {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("15M","1H","4H","1D","1W","ANY").forEach { k ->
+                    FilterChip(selected=tf==k,onClick={tf=k;prefs.edit().putString("scanner_tf",k).apply()},label={Text(if(ru&&k=="ANY")"Любой" else k,fontSize=8.sp)})
+                }
+            }
+        }
+        item {
+            Button({
+                if (prefs.getBoolean("scanner_running", false)) {
+                    ctx.startService(Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_STOP))
+                } else {
+                    prefs.edit().putBoolean("scanner_priority_active", scope == "ALL").apply()
+                    if (scope == "ALL") {
+                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor")
+                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_now")
+                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_history_catchup")
+                    }
+                    val intent = Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_START)
+                        .putExtra(ScannerForegroundService.EXTRA_SCOPE, scope)
+                        .putExtra(ScannerForegroundService.EXTRA_TYPE, type)
+                        .putExtra(ScannerForegroundService.EXTRA_TF, tf)
+                    if (Build.VERSION.SDK_INT >= 26) androidx.core.content.ContextCompat.startForegroundService(ctx, intent) else ctx.startService(intent)
+                }
+            }, Modifier.fillMaxWidth(), enabled=true, colors=ButtonDefaults.buttonColors(containerColor=if (busy) Negative else Accent)) {
+                Text(if (busy) (if (ru) "⛔ ОСТАНОВИТЬ СКАНЕР" else "⛔ STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
+            }
+        }
+        if (busy) {
+            item {
+                GradientCard(Modifier.fillMaxWidth()) {
+                    Row(verticalAlignment=Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(24.dp),color=Accent)
+                        Column(Modifier.padding(start=10.dp).weight(1f)) {
+                            Text(if(ru)"Идёт сканирование рыночных данных…" else "Scanning live market…",fontWeight=FontWeight.Bold,fontSize=10.sp)
+                            LinearProgressIndicator(progress={progress},Modifier.fillMaxWidth().padding(top=6.dp),color=Accent)
+                        }
+                    }
+                }
+            }
+        }
+        if(scannerStatus.isNotBlank()&&!busy) item { Text(scannerStatus,fontSize=9.sp,color=Positive,modifier=Modifier.padding(top=2.dp)) }
+        if (results.isNotEmpty()) {
+            item { Text(if (ru) "Сигналы действуют только до указанного времени. После окончания горизонта они автоматически исчезают и ждут нового подтверждения." else "Signals are valid only until the shown expiry. After the horizon they disappear automatically and wait for a new confirmation.", fontSize=8.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, modifier=Modifier.padding(top=2.dp)) }
+            item { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "🗑️ Удалить все" else "🗑️ Delete all") } } }
+            items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row ->
+                GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) {
+                    Row(verticalAlignment=Alignment.CenterVertically) {
+                        Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black)
+                        Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }
+                        Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black)
+                        val left=(row.expiresAt-countdownNow).coerceAtLeast(0L)
+                        Text(if(left>0) "• ${formatElapsed(left)}" else "• ${if(ru) "истёк" else "expired"}", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp)
+                        Spacer(Modifier.width(3.dp)); TextButton(onClick={track(row)}, contentPadding=PaddingValues(horizontal=6.dp, vertical=0.dp)) { Text(if(ru) "Отследить" else "Track", color=Positive, fontSize=8.sp, fontWeight=FontWeight.Black) }
+                        IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}
+                    }
+                }
+            }
+        }
     }
 }
 
