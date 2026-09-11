@@ -1,0 +1,11 @@
+name = "market-forecast-prox-access"
+main = "src/index.js"
+compatibility_date = "2026-09-11"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "market-forecast-prox"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+ADMIN_EMAIL = "REPLACE_WITH_YOUR_ADMIN_EMAIL"
