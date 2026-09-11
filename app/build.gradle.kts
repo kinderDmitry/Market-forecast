@@ -12,6 +12,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 121
+        // Legacy CI compatibility marker: versionCode = 120
         versionName = "4.8.82"
     }
     buildFeatures { compose = true }
