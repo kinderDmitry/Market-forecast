@@ -136,7 +136,7 @@ jobs:
           check_grep 'android:icon="@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml
           check_grep 'import kotlin.math.abs' app/src/main/java/TrackingEngine.kt
           check_grep 'val monitorMinConf = p.getInt("alert_min_confidence", 60)' app/src/main/java/MarketMonitorWorker.kt
-          check_grep 'versionCode = 120' app/build.gradle.kts
+          check_grep 'versionCode = 121' app/build.gradle.kts
           check_grep 'versionName = "4.8.82"' app/build.gradle.kts
           check_no_grep 'interval == "15m".*loadMoex(moex, "15m")' app/src/main/java/MarketRepository.kt
           check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
@@ -166,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.82 build ${GITHUB_RUN_NUMBER}"
+          TITLE="MarketForecast PROX 4.8.80 build ${GITHUB_RUN_NUMBER}"
           gh release create "$TAG" release/MarketForecast_PROX_4.8.80.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
