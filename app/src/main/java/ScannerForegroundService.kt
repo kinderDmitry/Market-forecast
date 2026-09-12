@@ -22,7 +22,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.abs
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Semaphore
@@ -30,6 +29,9 @@ import kotlinx.coroutines.sync.withPermit
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+
+
+private fun abs(value: Double): Double = kotlin.math.abs(value)
 
 /**
  * Foreground scanner. Keeps the scanner independent from the Activity and writes all
