@@ -69,7 +69,12 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          # setup-android defaults to the obsolete "tools" SDK package.
+          # Install only the command-line tools here; required SDK packages
+          # are installed explicitly in the next step.
+          packages: ''
 
       - name: Install Android SDK 36
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
