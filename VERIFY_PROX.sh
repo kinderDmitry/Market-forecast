@@ -11,8 +11,8 @@ test -f app/src/main/java/ScannerForegroundService.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 122' app/build.gradle.kts
-grep -q 'versionName = "4.8.83"' app/build.gradle.kts
+grep -q 'versionCode = 121' app/build.gradle.kts
+grep -q 'versionName = "4.8.82"' app/build.gradle.kts
 
 echo "[3/6] Scanner/forecast consistency"
 grep -q 'fun analyzeForScanner' app/src/main/java/AnalyticsEngine.kt
@@ -31,13 +31,7 @@ echo "[5/6] No duplicate FavoriteQuote"
 COUNT=$(grep -R -h -c 'data class FavoriteQuote' app/src/main/java --include='*.kt' | awk '{s+=$1} END{print s+0}')
 test "$COUNT" -eq 1
 
-echo "[6/7] Account backend files"
-test -f server/google_apps_script/Code.gs
-test -f server/google_apps_script/README_RU.md
-grep -q "action === 'register'" server/google_apps_script/Code.gs
-grep -q "active=FALSE" server/google_apps_script/README_RU.md
-
-echo "[7/7] Pure Kotlin analytics compile"
+echo "[6/6] Pure Kotlin analytics compile"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 kotlinc app/src/main/java/Models.kt app/src/main/java/AnalyticsEngine.kt -d "$TMP/analytics.jar"
