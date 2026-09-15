@@ -224,6 +224,97 @@ object AnalyticsEngine {
 
     private data class StructuralLevels(val support1: Double, val support2: Double, val resistance1: Double, val resistance2: Double)
 
+    private data class LiquidityStats(val score: Double, val sweep: Double, val equalHighs: Double, val equalLows: Double)
+
+    /** Detects clustered highs/lows and recent liquidity sweeps from OHLCV alone. */
+    private fun liquidityStats(c: List<Candle>, price: Double, atrValue: Double): LiquidityStats {
+        if (c.size < 30 || atrValue <= 0.0) return LiquidityStats(0.0, 0.0, 0.0, 0.0)
+        val w = c.takeLast(minOf(80, c.size))
+        val tol = atrValue * 0.16
+        var eqH = 0.0; var eqL = 0.0
+        for (i in 3 until w.size - 2) {
+            val h = w[i].high; val l = w[i].low
+            val nearH = listOf(w[i-2].high, w[i-1].high, w[i+1].high, w[i+2].high).count { abs(it-h) <= tol }
+            val nearL = listOf(w[i-2].low, w[i-1].low, w[i+1].low, w[i+2].low).count { abs(it-l) <= tol }
+            if (nearH >= 2) eqH += 1.0
+            if (nearL >= 2) eqL += 1.0
+        }
+        val last = w.last()
+        val prev = w.dropLast(1)
+        val priorHigh = prev.maxOf { it.high }
+        val priorLow = prev.minOf { it.low }
+        val sweep = when {
+            last.high > priorHigh + tol && last.close < priorHigh -> -1.0
+            last.low < priorLow - tol && last.close > priorLow -> 1.0
+            else -> 0.0
+        }
+        val upperPool = (eqH / 5.0).coerceIn(0.0, 2.0)
+        val lowerPool = (eqL / 5.0).coerceIn(0.0, 2.0)
+        val directionalPool = if (price >= priorHigh - tol) -upperPool else if (price <= priorLow + tol) lowerPool else (lowerPool-upperPool)*0.5
+        return LiquidityStats((directionalPool + sweep * 1.8).coerceIn(-4.0,4.0), sweep, upperPool, lowerPool)
+    }
+
+    /** Higher-window hierarchy from the same candle stream. This is intentionally
+     * a hierarchical proxy when the provider exposes only one requested timeframe. */
+    private fun mtfHierarchy(c: List<Candle>): Double {
+        if (c.size < 80) return 0.0
+        val windows = intArrayOf(20, 40, 80, minOf(160, c.size))
+        val weights = doubleArrayOf(0.10, 0.20, 0.30, 0.40)
+        var out=0.0; var used=0.0
+        for (i in windows.indices) {
+            val n=windows[i]; if(c.size<n) continue
+            val x=c.takeLast(n).map{it.close}
+            val e20=ema(x,minOf(20,x.size))?:x.last(); val e50=ema(x,minOf(50,x.size))?:x.last()
+            val slope=emaSlope(x,minOf(20,x.size),minOf(5,maxOf(1,x.size/8)))
+            val v=((x.last()-e20)/x.last().coerceAtLeast(1e-9)*4.0 + (e20-e50)/x.last().coerceAtLeast(1e-9)*4.0 + slope*1.5).coerceIn(-5.0,5.0)
+            out += v*weights[i]; used += weights[i]
+        }
+        return if(used==0.0) 0.0 else (out/used).coerceIn(-5.0,5.0)
+    }
+
+    /** Probability that a target is reached before the structural/ATR stop in a
+     * completed historical window. This is target-specific, unlike one generic edge. */
+    private fun targetHitProbability(c: List<Candle>, direction: Int, targetR: Double, stopR: Double, horizon: Int = 16): Double {
+        if(c.size < 110) return 0.5
+        val start=maxOf(45,c.size-170); val end=c.size-horizon-2
+        if(end<=start) return 0.5
+        var wins=0.0; var total=0.0; var i=start
+        while(i<=end){
+            val entry=c[i].close; val unit=(atr(c.subList(0,i+1))?:entry*0.01).coerceAtLeast(entry*0.002)
+            if(entry>0.0 && entry.isFinite()){
+                val fut=c.subList(i+1,minOf(c.size,i+1+horizon)); var decided=false
+                for(x in fut){
+                    val favorable=if(direction>0) x.high-entry else entry-x.low
+                    val adverse=if(direction>0) entry-x.low else x.high-entry
+                    if(adverse>=unit*stopR){ total+=1; decided=true; break }
+                    if(favorable>=unit*targetR){ wins+=1; total+=1; decided=true; break }
+                }
+                if(!decided) { total+=1; val close=fut.lastOrNull()?.close?:entry; if(direction*(close-entry)>=unit*targetR*0.35) wins+=0.5 }
+            }
+            i+=5
+        }
+        return if(total<5) 0.5 else (wins/total).coerceIn(0.03,0.97)
+    }
+
+    /** Regime-specific historical calibration. The sample is restricted to bars whose
+     * local regime matches the current regime, reducing bull-market leakage. */
+    private fun regimeHistoricalEdge(c: List<Candle>, direction: Int, regime: String, horizon: Int=8): Double {
+        if(c.size<130) return 0.5
+        val start=maxOf(60,c.size-180); val end=c.size-horizon-2
+        var wins=0.0; var total=0.0; var i=start
+        while(i<=end){
+            val local=c.subList(0,i+1); val px=local.last().close; val e20=ema(local.map{it.close},20)?:px; val e50=ema(local.map{it.close},50)?:px; val av=atr(local)?:px*0.01; val ad=adx(local)
+            val tr=when{ad>=28&&px>e20&&e20>e50->"TREND_UP";ad>=28&&px<e20&&e20<e50->"TREND_DOWN";ad<18->"RANGE";abs(av/px)>=0.04->"HIGH_VOLATILITY";else->"TRANSITION"}
+            if(tr==regime){
+                val fut=c.subList(i+1,minOf(c.size,i+1+horizon)); val move=if(direction>0) fut.maxOf{it.high}-px else px-fut.minOf{it.low}; val adverse=if(direction>0) px-fut.minOf{it.low} else fut.maxOf{it.high}-px; val unit=av.coerceAtLeast(px*0.002); total+=1
+                if(move>=unit*0.75 && adverse<unit*1.0) wins+=1.0 else if(direction*(fut.last().close-px)>0) wins+=0.5
+            }
+            i+=6
+        }
+        return if(total<5) 0.5 else (wins/total).coerceIn(0.05,0.95)
+    }
+
+
     private fun structuralLevels(c: List<Candle>, price: Double): StructuralLevels {
         val w = c.takeLast(180)
         val supports = mutableListOf<Double>()
@@ -656,6 +747,8 @@ object AnalyticsEngine {
         val support2 = sr.support2
         val resistance1 = sr.resistance1
         val resistance2 = sr.resistance2
+        val liquidity = liquidityStats(c, price, a)
+        val hierarchy = mtfHierarchy(c)
         val timingDirection = if (e20 >= e50) 1 else -1
         val timingQuality = entryTimingQuality(c, price, timingDirection, a)
         val longExcursion = if (calibrate) historicalExcursionR(c, 1, 8) else (2.0 to 3.0)
@@ -700,13 +793,22 @@ object AnalyticsEngine {
         // selected direction is used after signal formation. This makes confidence
         // sensitive to what this market has actually rewarded recently.
         val currentTrendContext = ((e20 - e50) / price.coerceAtLeast(1e-9) * 100.0).coerceIn(-8.0, 8.0)
+        val preliminaryRegime = when {
+            adxV >= 28.0 && trendBase >= 6.0 -> "TREND_UP"
+            adxV >= 28.0 && trendBase <= -6.0 -> "TREND_DOWN"
+            volatilityPct >= 4.0 -> "HIGH_VOLATILITY"
+            adxV < 18.0 -> "RANGE"
+            else -> "TRANSITION"
+        }
+        val longRegimeEdge = if(calibrate) regimeHistoricalEdge(c,1,preliminaryRegime,8) else 0.5
+        val shortRegimeEdge = if(calibrate) regimeHistoricalEdge(c,-1,preliminaryRegime,8) else 0.5
         val longEdgeRaw = if (calibrate) multiHorizonEdge(c, 1) else 0.5
         val shortEdgeRaw = if (calibrate) multiHorizonEdge(c, -1) else 0.5
         val longConditional = if (calibrate) conditionalHistoricalEdge(c, 1, 8, currentTrendContext, r) else 0.5
         val shortConditional = if (calibrate) conditionalHistoricalEdge(c, -1, 8, currentTrendContext, r) else 0.5
         // Conditional evidence gets more weight than unconditional market drift.
-        val longEdge = (longConditional * 0.65 + longEdgeRaw * 0.35).coerceIn(0.05, 0.95)
-        val shortEdge = (shortConditional * 0.65 + shortEdgeRaw * 0.35).coerceIn(0.05, 0.95)
+        val longEdge = (longConditional * 0.52 + longEdgeRaw * 0.28 + longRegimeEdge * 0.20).coerceIn(0.05, 0.95)
+        val shortEdge = (shortConditional * 0.52 + shortEdgeRaw * 0.28 + shortRegimeEdge * 0.20).coerceIn(0.05, 0.95)
         val longHorizon = if (calibrate) horizonEdgeStats(c, 1) else HorizonEdgeStats(.5, .5, 0, 0)
         val shortHorizon = if (calibrate) horizonEdgeStats(c, -1) else HorizonEdgeStats(.5, .5, 0, 0)
         val edgeGap = abs(longEdge - shortEdge)
@@ -730,7 +832,7 @@ object AnalyticsEngine {
             adxV < 18.0 -> (-bb.coerceIn(-2.0, 2.0) + (50.0 - r) / 18.0).coerceIn(-3.0, 3.0)
             else -> (trendQuality + agreement + volumePrice).coerceIn(-4.0, 4.0)
         }
-        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost + regimeAlignment*.10 + timingQuality*.10
+        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost + regimeAlignment*.10 + timingQuality*.10 + hierarchy*.055 + liquidity.score*.065
         val score = raw.coerceIn(-10.0, 10.0)
         // Directional confirmation is deliberately conservative: a high raw score is
         // not enough when trend, momentum and higher-timeframe structure disagree.
@@ -836,6 +938,27 @@ object AnalyticsEngine {
             safeTp3 = min(safeTp3, safeTp2 - minStep).coerceAtLeast(1e-9)
         }
         val rr = abs(safeTp2 - price) / riskDistance
+        val tp1RActual = abs(safeTp1-price)/riskDistance
+        val tp2RActual = abs(safeTp2-price)/riskDistance
+        val tp3RActual = abs(safeTp3-price)/riskDistance
+        val tp1Prob = if(calibrate) targetHitProbability(c, direction.toInt(), tp1RActual.coerceIn(0.7,2.2), 1.0, 12) else 0.5
+        val tp2Prob = if(calibrate) targetHitProbability(c, direction.toInt(), tp2RActual.coerceIn(1.2,5.0), 1.0, 16) else 0.5
+        val tp3Prob = if(calibrate) targetHitProbability(c, direction.toInt(), tp3RActual.coerceIn(1.8,7.0), 1.0, 20) else 0.5
+        val stopProb = (1.0 - tp1Prob).coerceIn(0.03,0.97)
+        // Partial exits: 30% TP1, 40% TP2, 30% TP3. This is an expected-value
+        // model, not a promise of realized P/L.
+        val expectedValueR = (0.30*tp1Prob*tp1RActual + 0.40*tp2Prob*tp2RActual + 0.30*tp3Prob*tp3RActual) - stopProb*1.0
+        val directionalS = if(direction>0) resistance1 else support1
+        val distanceToS = abs(directionalS-price)
+        val srPenalty = if(distanceToS <= a*0.65) (1.0-distanceToS/(a*0.65)).coerceIn(0.0,1.0)*3.0 else 0.0
+        val dynamicEntry = when {
+            direction>0 && support1<price && price-support1<=a*1.25 -> maxOf(support1+a*0.18, support1)
+            direction<0 && resistance1>price && resistance1-price<=a*1.25 -> minOf(resistance1-a*0.18, resistance1)
+            else -> price
+        }.coerceIn(price-a*0.35, price+a*0.35)
+        val entryZoneLow = minOf(price, dynamicEntry)
+        val entryZoneHigh = maxOf(price, dynamicEntry)
+        val entryQuality = (1.0 - srPenalty/3.0 + hierarchy.sign*direction*0.12 + liquidity.score.sign*0.08).coerceIn(0.0,1.0)
         val projected = if (signal == "NO TRADE") price else if (direction > 0) safeTp2 else safeTp2
         val regime = when {
             adxV >= 28 && trendBase >= 6 -> "TREND_UP"
@@ -892,10 +1015,10 @@ object AnalyticsEngine {
             "VWAP: %.4f; отклонение цены %.2f%%; наклон EMA20 %.2f%%.".format(Locale.US, vwapV, (price-vwapV)/price*100.0, slope),
             "Давление последней свечи: %.2f; ATR-перцентиль: %.0f%%; эффективность движения %.2f.".format(Locale.US, pressure, atrPctile*100.0, efficiency),
             "Пробойный импульс: %.2f; объёмный импульс: %.2f; режим волатильности: %.2f%%.".format(Locale.US, breakout, volumeImpulse, volatilityPct),
-            "Walk-forward edge: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п. Мультигоризонт: LONG %d/%d положительных, min %.0f%%; SHORT %d/%d, min %.0f%%.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0, longHorizon.positiveCount, longHorizon.count, longHorizon.minimum * 100.0, shortHorizon.positiveCount, shortHorizon.count, shortHorizon.minimum * 100.0),
+            "Историческое пошаговое преимущество: LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п. Мультигоризонт: LONG %d/%d положительных, минимум %.0f%%; SHORT %d/%d, минимум %.0f%%.".format(Locale.US, longEdge * 100.0, shortEdge * 100.0, edgeGap * 100.0, longHorizon.positiveCount, longHorizon.count, longHorizon.minimum * 100.0, shortHorizon.positiveCount, shortHorizon.count, shortHorizon.minimum * 100.0),
             "Новая перекрёстная проверка: качество тренда %.2f; цена+объём %.2f; дивергенция RSI %.2f; сила подтверждения %.0f%%.".format(Locale.US, trendQuality, volumePrice, divergence, confirmationStrength * 100.0),
-            "Price Action Engine: сила тела %.2f; эффективность диапазона %.2f; расширение диапазона %.2f; аномалия объёма %.2f.".format(Locale.US, bodyStrength, rangeEfficiency, rangeExpansion, volumeAnomaly),
-            "Pattern Engine: score %.2f; распознано: %s.".format(Locale.US, patterns.score, if (patterns.names.isEmpty()) "нет устойчивой формации" else patterns.names.joinToString(", ")),
+            "Анализ движения цены: сила тела %.2f; эффективность диапазона %.2f; расширение диапазона %.2f; аномалия объёма %.2f.".format(Locale.US, bodyStrength, rangeEfficiency, rangeExpansion, volumeAnomaly),
+            "Анализ формаций: оценка %.2f; распознано: %s.".format(Locale.US, patterns.score, if (patterns.names.isEmpty()) "нет устойчивой формации" else patterns.names.joinToString(", ")),
             "Ключевые уровни: поддержка %.2f / %.2f; сопротивление %.2f / %.2f.".format(Locale.US, support1, support2, resistance1, resistance2),
             "Расширенный теханализ: CCI %.1f; Williams %%R %.1f; MFI %.1f; CMF %.2f; Ichimoku %.2f; Donchian %.2f; Stoch RSI %.2f.".format(Locale.US, cciV, williamsV, mfiV, cmfV, ichimoku, donchian, stochRsi),
             "Вероятность направления: %.0f%%; edge %.0f%%, gap %.1f п.п., ADX %.1f, R/R %.2f, подтверждение %d/5.".format(Locale.US, calibratedProbability, selectedEdge * 100.0, edgeGap * 100.0, adxV, rr, confirmation)
@@ -907,16 +1030,22 @@ object AnalyticsEngine {
         val robustStructure = rr >= 1.60 && abs(advancedTechnical) >= 0.90
         val actualRrGate = rr >= 1.60 && expectedProfitPct >= expectedLossPct * 1.60
         val highConviction = signal != "NO TRADE" && actualRrGate && robustEdge && robustTrend && robustStructure
-        val finalSignal = if (signal != "NO TRADE" && !actualRrGate) "NO TRADE" else signal
+        val expectancyGate = expectedValueR >= 0.15 && tp2Prob >= 0.42
+        val srGate = srPenalty < 2.25
+        val finalSignal = if (signal != "NO TRADE" && (!actualRrGate || !expectancyGate || !srGate)) "NO TRADE" else signal
         // For NO TRADE, confidence describes directional certainty only as a
         // probability estimate; it is never presented as permission to trade.
         val finalConfidence = confidence
         val finalExplanation = explanation + listOf(
-            "Режим рынка: $regime; ширина Bollinger %.2f%%.".format(Locale.US, bbWidth * 100.0),
-            String.format(Locale.US, "Risk/Target Engine: SL %.2f%%; TP1/TP2/TP3 = %.2fR / %.2fR / %.2fR; R/R %.2f; историческая MFE %.2fR/%.2fR; timing %.2f.", expectedLossPct, tp1R, tp2R, tp3R, rr, excursion.first, excursion.second, timingQuality)
+            "Режим рынка: $regime; ширина Bollinger %.2f%%; regime calibration LONG %.0f%% / SHORT %.0f%%.".format(Locale.US, bbWidth * 100.0, longRegimeEdge*100.0, shortRegimeEdge*100.0),
+            String.format(Locale.US, "Движок риска и целей: SL %.2f%%; TP1/TP2/TP3 = %.2fR / %.2fR / %.2fR; риск/прибыль %.2f; исторический максимум благоприятного движения %.2fR/%.2fR; качество момента входа %.2f.", expectedLossPct, tp1R, tp2R, tp3R, rr, excursion.first, excursion.second, timingQuality),
+            String.format(Locale.US, "Движок вероятности целей: TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%%; SL %.0f%%; математическое ожидание %.2fR.", tp1Prob*100.0,tp2Prob*100.0,tp3Prob*100.0,stopProb*100.0,expectedValueR),
+            String.format(Locale.US, "Иерархия таймфреймов %.2f (старший контекст имеет больший вес); ликвидность %.2f; штраф у поддержки/сопротивления %.2f; качество входа %.0f%%.", hierarchy, liquidity.score, srPenalty, entryQuality*100.0),
+            String.format(Locale.US, "Динамическая зона входа: %.4f–%.4f; текущая цена %.4f.", entryZoneLow, entryZoneHigh, price)
         )
         return Forecast(finalSignal, score, finalConfidence, trendBase, momentumBase, abs(a / price) * 100.0, levelBase, volumeBase, bull, base, bear,
-            price, stop, stopAggressive, stopOptimal, stopConservative, safeTp1, safeTp2, safeTp3, rr, projected, support1, support2, resistance1, resistance2, finalExplanation, quality, regime, expectedProfitPct, expectedLossPct, selectedEdge, edgeGap, confirmation, advancedTechnical, highConviction, patterns.score, patterns.names)
+            dynamicEntry, stop, stopAggressive, stopOptimal, stopConservative, safeTp1, safeTp2, safeTp3, rr, projected, support1, support2, resistance1, resistance2, finalExplanation, quality, regime, expectedProfitPct, expectedLossPct, selectedEdge, edgeGap, confirmation, advancedTechnical, highConviction, patterns.score, patterns.names,
+            tp1Prob, tp2Prob, tp3Prob, stopProb, expectedValueR, if(direction>0) longRegimeEdge else shortRegimeEdge, hierarchy, liquidity.score, srPenalty, entryQuality, entryZoneLow, entryZoneHigh)
     }
 
     fun backtest(c: List<Candle>): Pair<Int, Int> {

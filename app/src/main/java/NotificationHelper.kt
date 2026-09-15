@@ -173,9 +173,9 @@ object NotificationHelper {
     }
 
     private fun notificationSubText(channel: String): String = when (channel) {
-        CHANNEL_TRACKING -> "MFP • Tracking"
-        CHANNEL_MARKET -> "MFP • Market"
-        else -> "MFP • System"
+        CHANNEL_TRACKING -> "MFP • Отслеживание"
+        CHANNEL_MARKET -> "MFP • Рынок"
+        else -> "MFP • Система"
     }
 
     private fun notificationCategory(channel: String, title: String, body: String): String {

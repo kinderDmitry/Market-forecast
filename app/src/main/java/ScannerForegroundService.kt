@@ -256,6 +256,10 @@ class ScannerForegroundService : Service() {
                         score = forecast.score,
                         rr = forecast.rr,
                         horizonSeconds = horizon,
+                        tp1Probability = forecast.tp1Probability,
+                        tp2Probability = forecast.tp2Probability,
+                        tp3Probability = forecast.tp3Probability,
+                        expectedValueR = forecast.expectedValueR,
                         createdAt = created,
                         expiresAt = created + horizon * 1000L
                     )
@@ -315,7 +319,11 @@ class ScannerForegroundService : Service() {
                 rr = x[5].toDoubleOrNull() ?: 0.0,
                 horizonSeconds = x.getOrNull(6)?.toLongOrNull() ?: 0L,
                 createdAt = x.getOrNull(7)?.toLongOrNull() ?: 0L,
-                expiresAt = x.getOrNull(8)?.toLongOrNull() ?: 0L
+                expiresAt = x.getOrNull(8)?.toLongOrNull() ?: 0L,
+                tp1Probability = x.getOrNull(9)?.toDoubleOrNull() ?: 0.0,
+                tp2Probability = x.getOrNull(10)?.toDoubleOrNull() ?: 0.0,
+                tp3Probability = x.getOrNull(11)?.toDoubleOrNull() ?: 0.0,
+                expectedValueR = x.getOrNull(12)?.toDoubleOrNull() ?: 0.0
             )
         }
 
@@ -323,7 +331,8 @@ class ScannerForegroundService : Service() {
         val encoded = rows.map {
             listOf(
                 it.result.symbol, it.timeframe, it.signal, it.confidence,
-                it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt
+                it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt,
+                it.tp1Probability, it.tp2Probability, it.tp3Probability, it.expectedValueR
             ).joinToString("|")
         }.toSet()
         p.edit().putStringSet("auto_scan_results", encoded).apply()

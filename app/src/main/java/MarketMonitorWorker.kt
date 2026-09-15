@@ -137,7 +137,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                     val body = if (ru) {
                         "${t.symbol} • ${t.timeframe}\nРезультат: ${if (ok) "подтверждён" else "не подтверждён"}\nВход: ${format(t.entry)} • Закрытие: ${format(evaluation.price)}\nСобытия: $hitsText\nSL: ${format(t.stop)} • TP1: ${format(t.tp1)} • TP2: ${format(t.tp2)} • TP3: ${format(t.tp3)}"
                     } else {
-                        "${t.symbol} • ${t.timeframe}\nResult: ${if (ok) "confirmed" else "failed"}\nOpen: ${format(t.entry)} • Close: ${format(evaluation.price)}\nEvents: $hitsText\nSL: ${format(t.stop)} • TP1: ${format(t.tp1)} • TP2: ${format(t.tp2)} • TP3: ${format(t.tp3)}"
+                        if (ru) "${t.symbol} • ${t.timeframe}\nРезультат: ${if (ok) "подтверждён" else "не подтверждён"}\nОткрытие: ${format(t.entry)} • Закрытие: ${format(evaluation.price)}\nСобытия: $hitsText\nSL: ${format(t.stop)} • TP1: ${format(t.tp1)} • TP2: ${format(t.tp2)} • TP3: ${format(t.tp3)}" else "${t.symbol} • ${t.timeframe}\nResult: ${if (ok) "confirmed" else "failed"}\nOpen: ${format(t.entry)} • Close: ${format(evaluation.price)}\nEvents: $hitsText\nSL: ${format(t.stop)} • TP1: ${format(t.tp1)} • TP2: ${format(t.tp2)} • TP3: ${format(t.tp3)}"
                     }
                     NotificationHelper.notifyTracking(applicationContext, "${t.id}|RESULT|$result", ru, title, body, t.symbol)
                 }

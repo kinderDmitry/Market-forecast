@@ -11,7 +11,11 @@ data class ScanRow(
     val rr: Double,
     val horizonSeconds: Long = 0L,
     val createdAt: Long = 0L,
-    val expiresAt: Long = 0L
+    val expiresAt: Long = 0L,
+    val tp1Probability: Double = 0.0,
+    val tp2Probability: Double = 0.0,
+    val tp3Probability: Double = 0.0,
+    val expectedValueR: Double = 0.0
 )
 data class DividendEvent(val symbol: String, val date: Long, val amount: Double, val source: String = "БКС Экспресс")
 enum class NewsCategory { ALL, STOCKS, FX }
@@ -91,7 +95,20 @@ data class Forecast(
     val advancedTechnical: Double = 0.0,
     val highConviction: Boolean = false,
     val patternScore: Double = 0.0,
-    val detectedPatterns: List<String> = emptyList()
+    val detectedPatterns: List<String> = emptyList(),
+    // MAX INTELLIGENCE v2: target-specific probabilities and expected value.
+    val tp1Probability: Double = 0.0,
+    val tp2Probability: Double = 0.0,
+    val tp3Probability: Double = 0.0,
+    val stopProbability: Double = 0.0,
+    val expectedValueR: Double = 0.0,
+    val regimeCalibration: Double = 0.5,
+    val mtfHierarchy: Double = 0.0,
+    val liquidityScore: Double = 0.0,
+    val srRiskPenalty: Double = 0.0,
+    val entryQuality: Double = 0.0,
+    val entryZoneLow: Double = 0.0,
+    val entryZoneHigh: Double = 0.0
 )
 data class MarketState(
     val symbol: String,
