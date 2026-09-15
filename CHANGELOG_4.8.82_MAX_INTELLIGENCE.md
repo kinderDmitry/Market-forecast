@@ -9,3 +9,8 @@
 - Version 4.8.82 / versionCode 121.
 
 No model guarantees profit; optimization targets risk-adjusted expectancy and signal quality rather than fabricated win rates.
+
+## Build-fix verification
+- Scanner score sorting now calls `kotlin.math.abs` explicitly, removing the recurring CI `Unresolved reference 'abs'` failure in `ScannerForegroundService.kt`.
+- Existing AnalyticsEngine and Scanner/Forecast single-path architecture preserved.
+- `VERIFY_PROX.sh` passes, including pure Kotlin compilation of the analytics engine.
