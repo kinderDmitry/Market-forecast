@@ -11,9 +11,8 @@ android {
         applicationId = "com.marketforecast.prox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 122
-        // Legacy CI compatibility markers: versionCode = 121 / 120
-        versionName = "4.8.83"
+        versionCode = 121
+        versionName = "4.8.82"
     }
     buildFeatures { compose = true }
 
