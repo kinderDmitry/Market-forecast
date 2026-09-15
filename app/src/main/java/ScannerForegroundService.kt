@@ -30,9 +30,6 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
-
-private fun abs(value: Double): Double = kotlin.math.abs(value)
-
 /**
  * Foreground scanner. Keeps the scanner independent from the Activity and writes all
  * state to SharedPreferences so the UI can reconnect after rotation/process recreation.

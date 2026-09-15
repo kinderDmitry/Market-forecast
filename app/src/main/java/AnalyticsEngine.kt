@@ -448,6 +448,52 @@ object AnalyticsEngine {
         return if (total < 3) 0.5 else ((wins + neutral * 0.5) / total).coerceIn(0.05, 0.95)
     }
 
+    /** Historical favorable-excursion calibration in R units. Uses only completed
+     * windows, so TP targets adapt to the actual volatility of each instrument/timeframe. */
+    private fun historicalExcursionR(c: List<Candle>, direction: Int, horizon: Int = 8): Pair<Double, Double> {
+        if (c.size < 100) return 2.0 to 3.0
+        val start = max(45, c.size - 180)
+        val end = c.size - horizon - 2
+        if (end <= start) return 2.0 to 3.0
+        val values = ArrayList<Double>(32)
+        var i = start
+        while (i <= end) {
+            val entry = c[i].close
+            if (entry.isFinite() && entry > 0.0) {
+                val local = c.subList(0, i + 1)
+                val unit = (atr(local) ?: entry * 0.01).coerceAtLeast(entry * 0.002)
+                val future = c.subList(i + 1, min(c.size, i + 1 + horizon))
+                if (future.isNotEmpty()) {
+                    val favorable = if (direction > 0) future.maxOf { it.high } - entry else entry - future.minOf { it.low }
+                    values += (favorable / unit).coerceIn(0.0, 8.0)
+                }
+            }
+            i += 6
+        }
+        if (values.size < 5) return 2.0 to 3.0
+        values.sort()
+        fun q(percentile: Double): Double {
+            val pos = ((values.size - 1) * percentile).coerceIn(0.0, (values.size - 1).toDouble())
+            val lo = floor(pos).toInt(); val hi = ceil(pos).toInt()
+            if (lo == hi) return values[lo]
+            val f = pos - lo
+            return values[lo] * (1.0 - f) + values[hi] * f
+        }
+        return q(0.55).coerceIn(0.8, 6.0) to q(0.72).coerceIn(1.0, 7.0)
+    }
+
+    /** Rejects late/chasing entries even when raw indicator agreement is high. */
+    private fun entryTimingQuality(c: List<Candle>, price: Double, direction: Int, atrValue: Double): Double {
+        if (c.size < 30 || atrValue <= 0.0) return 0.0
+        val w = c.takeLast(30); val hi = w.dropLast(1).maxOf { it.high }; val lo = w.dropLast(1).minOf { it.low }
+        val span = (hi - lo).coerceAtLeast(atrValue); val location = ((price - lo) / span).coerceIn(0.0, 1.0)
+        val late = if (direction > 0) ((location - 0.72) * -5.0).coerceIn(-2.5, 2.5)
+                   else ((0.28 - location) * -5.0).coerceIn(-2.5, 2.5)
+        val recent = w.takeLast(5); val path = recent.zipWithNext().sumOf { abs(it.second.close - it.first.close) }
+        val net = abs(recent.last().close - recent.first().close); val efficiency = if (path <= 1e-9) 0.0 else net / path
+        return (late + if (efficiency > 0.82) -0.7 else 0.0).coerceIn(-3.0, 2.5)
+    }
+
     private data class HorizonEdgeStats(val average: Double, val minimum: Double, val positiveCount: Int, val count: Int)
 
     private fun horizonEdgeStats(c: List<Candle>, direction: Int): HorizonEdgeStats {
@@ -610,6 +656,10 @@ object AnalyticsEngine {
         val support2 = sr.support2
         val resistance1 = sr.resistance1
         val resistance2 = sr.resistance2
+        val timingDirection = if (e20 >= e50) 1 else -1
+        val timingQuality = entryTimingQuality(c, price, timingDirection, a)
+        val longExcursion = if (calibrate) historicalExcursionR(c, 1, 8) else (2.0 to 3.0)
+        val shortExcursion = if (calibrate) historicalExcursionR(c, -1, 8) else (2.0 to 3.0)
 
         val trendBase = when {
             price > e20 && e20 > e50 && (e200 == null || e50 > e200) -> 10.0
@@ -675,7 +725,12 @@ object AnalyticsEngine {
         val rangeRegime = 1.0 - trendRegime
         val confirmationBoost = trendQuality * (0.08 + 0.12 * trendRegime) +
             volumePrice * 0.07 + divergence * (0.05 + 0.08 * rangeRegime)
-        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost
+        val regimeAlignment = when {
+            adxV >= 28.0 -> (trendQuality.sign + agreement.sign + mtf.sign).coerceIn(-3.0, 3.0)
+            adxV < 18.0 -> (-bb.coerceIn(-2.0, 2.0) + (50.0 - r) / 18.0).coerceIn(-3.0, 3.0)
+            else -> (trendQuality + agreement + volumePrice).coerceIn(-4.0, 4.0)
+        }
+        val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost + regimeAlignment*.10 + timingQuality*.10
         val score = raw.coerceIn(-10.0, 10.0)
         // Directional confirmation is deliberately conservative: a high raw score is
         // not enough when trend, momentum and higher-timeframe structure disagree.
@@ -683,6 +738,7 @@ object AnalyticsEngine {
         val directionalConflict = abs(score) >= 2.2 && confirmation * score.sign < 2.0
         val confirmationStrength = (abs(confirmation) / 7.0).coerceIn(0.0, 1.0)
         val divergenceConflict = divergence * score.sign < -1.0
+        val timingConflict = timingQuality < -1.8 && abs(score) < 7.0
         // Probability-first gating.  NO TRADE is reserved for genuinely ambiguous
         // markets; ordinary directional setups are allowed when several independent
         // blocks agree.  This prevents the previous over-filtering from turning the
@@ -719,7 +775,7 @@ object AnalyticsEngine {
             abs(provisionalTp - price) / abs(price - provisionalStop) >= 1.35
         }
         val signal = when {
-            directionalConflict || divergenceConflict || !efficiencyGate || !scoreGate || !confirmationGate || !rrGate -> "NO TRADE"
+            directionalConflict || divergenceConflict || timingConflict || !efficiencyGate || !scoreGate || !confirmationGate || !rrGate -> "NO TRADE"
             score > 0 && precisionLong && horizonLongGate && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "LONG"
             score < 0 && precisionShort && horizonShortGate && (!weakEdge || trendRegimeStrong || abs(score) >= scoreThreshold + 0.9) -> "SHORT"
             // If historical edge is inconclusive, a very strong current ensemble
@@ -730,6 +786,7 @@ object AnalyticsEngine {
         }
         val direction = when { signal.contains("LONG") -> 1.0; signal.contains("SHORT") -> -1.0; else -> if (score >= 0) 1.0 else -1.0 }
 
+        val selectedEdge = if (score >= 0) longEdge else shortEdge
         // Risk/target engine: every level is derived from observed swing structure plus ATR.
         // No arbitrary percentage projection is used. If structure is too far away, the
         // fallback is an explicit R-multiple of ATR-derived risk, not a fabricated market price.
@@ -748,9 +805,26 @@ object AnalyticsEngine {
         val directionalRes1 = if (direction > 0) resistance1.takeIf { it > price } else support1.takeIf { it < price }
         val directionalRes2 = if (direction > 0) resistance2.takeIf { it > price && it > (directionalRes1 ?: price) } else support2.takeIf { it < price && it < (directionalRes1 ?: price) }
         fun rTarget(r: Double): Double = if (direction > 0) price + riskDistance * r else (price - riskDistance * r).coerceAtLeast(1e-9)
-        var safeTp1 = directionalRes1 ?: rTarget(1.0)
-        var safeTp2 = directionalRes2 ?: rTarget(2.0)
-        var safeTp3 = rTarget(3.0)
+        // Target Engine 2.0: nearby resistance/support must never collapse TP2 into a
+        // tiny scalp target.  Structure is used as a confirmation level, while the
+        // primary target is selected from the market regime, trend efficiency and
+        // observed historical edge. Strong, directional markets receive a wider
+        // asymmetric profit runway; ranges stay conservative.
+        val strongExpansion = adxV >= 30.0 && efficiency >= 0.18 && selectedEdge >= 0.62 && edgeGap >= 0.08
+        val directionalExpansion = adxV >= 24.0 && efficiency >= 0.11 && selectedEdge >= 0.57
+        val excursion = if (direction > 0) longExcursion else shortExcursion
+        val regimeTp2Floor = when { strongExpansion -> 3.00; directionalExpansion -> 2.45; adxV < 18.0 -> 1.65; else -> 2.10 }
+        val tp2R = max(regimeTp2Floor, (excursion.first * 0.72 + excursion.second * 0.28) * (0.90 + (selectedEdge - 0.50).coerceIn(0.0, 0.20))).coerceIn(1.65, 4.80)
+        val tp1R = max(if (adxV < 18.0) 0.90 else 1.10, tp2R * 0.48).coerceIn(0.90, 2.00)
+        val tp3R = max(tp2R + 0.80, excursion.second * (0.95 + (selectedEdge - 0.50).coerceIn(0.0, 0.20))).coerceIn(tp2R + 0.50, 6.00)
+        var safeTp1 = maxOf(directionalRes1 ?: rTarget(tp1R), rTarget(tp1R))
+        var safeTp2 = maxOf(directionalRes2 ?: rTarget(tp2R), rTarget(tp2R))
+        var safeTp3 = maxOf(rTarget(tp3R), safeTp2 + riskDistance * 0.80)
+        if (direction < 0) {
+            safeTp1 = minOf(directionalRes1 ?: rTarget(tp1R), rTarget(tp1R))
+            safeTp2 = minOf(directionalRes2 ?: rTarget(tp2R), rTarget(tp2R))
+            safeTp3 = minOf(rTarget(tp3R), safeTp2 - riskDistance * 0.80).coerceAtLeast(1e-9)
+        }
         val minStep = max(price * 0.001, a * 0.10)
         if (direction > 0) {
             safeTp1 = max(safeTp1, price + minStep)
@@ -775,10 +849,10 @@ object AnalyticsEngine {
         val qualityBase = (55 + min(25, c.size / 8) + (if (avgVol > 0) 5 else 0) + (if (a > 0) 5 else 0) + (if (e200 != null) 5 else 0)).coerceIn(55, 95)
         val volatilityPenalty = when { volatilityPct >= 8.0 -> 14.0; volatilityPct >= 5.0 -> 8.0; volatilityPct >= 3.0 -> 3.0; else -> 0.0 }
         val conflictPenalty = if (directionalConflict) 18.0 else 0.0
-        val selectedEdge = if (score >= 0) longEdge else shortEdge
+        val timingPenalty = if (timingQuality < 0.0) abs(timingQuality) * 2.0 else 0.0
         val edgeAdjustment = (selectedEdge - 0.50) * 34.0
         val robustnessBonus = (edgeGap * 20.0).coerceIn(0.0, 5.0)
-        val rawConfidence = (qualityBase + abs(score) * 3.8 + min(10.0, abs(trendBase)) + min(7.0, abs(volumeBase)) + agreementBonus + efficiency * 4.0 + edgeAdjustment + robustnessBonus + confirmationStrength * 4.0 - rrPenalty - volatilityPenalty - conflictPenalty - if (divergenceConflict) 5.0 else 0.0)
+        val rawConfidence = (qualityBase + abs(score) * 3.8 + min(10.0, abs(trendBase)) + min(7.0, abs(volumeBase)) + agreementBonus + efficiency * 4.0 + edgeAdjustment + robustnessBonus + confirmationStrength * 4.0 - rrPenalty - volatilityPenalty - conflictPenalty - timingPenalty - if (divergenceConflict) 5.0 else 0.0)
         // Confidence is calibrated by the observed walk-forward edge. A setup cannot
         // display a very high confidence merely because many technical factors agree.
         // This keeps the UI honest when historical directional edge is mediocre.
@@ -839,7 +913,7 @@ object AnalyticsEngine {
         val finalConfidence = confidence
         val finalExplanation = explanation + listOf(
             "Режим рынка: $regime; ширина Bollinger %.2f%%.".format(Locale.US, bbWidth * 100.0),
-            String.format(Locale.US, "Risk Engine: SL ограничен %.2f%% цены; R/R по TP2 %.2f.", expectedLossPct, rr)
+            String.format(Locale.US, "Risk/Target Engine: SL %.2f%%; TP1/TP2/TP3 = %.2fR / %.2fR / %.2fR; R/R %.2f; историческая MFE %.2fR/%.2fR; timing %.2f.", expectedLossPct, tp1R, tp2R, tp3R, rr, excursion.first, excursion.second, timingQuality)
         )
         return Forecast(finalSignal, score, finalConfidence, trendBase, momentumBase, abs(a / price) * 100.0, levelBase, volumeBase, bull, base, bear,
             price, stop, stopAggressive, stopOptimal, stopConservative, safeTp1, safeTp2, safeTp3, rr, projected, support1, support2, resistance1, resistance2, finalExplanation, quality, regime, expectedProfitPct, expectedLossPct, selectedEdge, edgeGap, confirmation, advancedTechnical, highConviction, patterns.score, patterns.names)
