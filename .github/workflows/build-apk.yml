@@ -171,8 +171,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.83 build ${GITHUB_RUN_NUMBER}"
+          TITLE="MarketForecast PROX 4.8.84 build ${GITHUB_RUN_NUMBER}"
           gh release create "$TAG" release/MarketForecast_PROX_4.8.83.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.83. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.84. Commit: ${GITHUB_SHA}"
