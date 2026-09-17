@@ -86,9 +86,11 @@ class ScannerForegroundService : Service() {
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
-                val symbols = withContext(Dispatchers.IO) {
-                    resolveSymbols(repo, scopeMode, instrumentType)
+                val instruments = withContext(Dispatchers.IO) {
+                    resolveInstruments(repo, scopeMode, instrumentType)
                 }
+                val symbols = instruments.map { it.symbol }.distinct()
+                val metadataBySymbol = instruments.associateBy { repo.canonicalSymbol(it.symbol).uppercase(Locale.US) }
                 val timeframes: List<String> = if (timeframe == "ANY") {
                     listOf("15M", "1H", "4H", "1D", "1W")
                 } else {
@@ -247,10 +249,12 @@ class ScannerForegroundService : Service() {
                     // identical to instrument forecasts and prevents low-quality trades.
                     val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
                     if (forecast.signal == "NO TRADE") return@coroutineScope null
+                    val meta = metadataBySymbol[repo.canonicalSymbol(symbol).uppercase(Locale.US)]
+                        ?: SearchResult(repo.canonicalSymbol(symbol), repo.canonicalSymbol(symbol), "БКС", "", "БКС")
                     val created = System.currentTimeMillis()
                     val horizon = timeframeHorizonSeconds(timeframe)
                     ScanRow(
-                        result = SearchResult(symbol, symbol, "", "", "БКС"),
+                        result = meta,
                         timeframe = timeframe,
                         signal = if (forecast.signal != "NO TRADE") forecast.signal else if (forecast.score > 0) "LONG" else "SHORT",
                         confidence = forecast.confidence,
@@ -269,9 +273,9 @@ class ScannerForegroundService : Service() {
         }.getOrNull()
     }
 
-    private fun resolveSymbols(repo: MarketRepository, scopeMode: String, type: String): List<String> {
+    private fun resolveInstruments(repo: MarketRepository, scopeMode: String, type: String): List<SearchResult> {
         fun matches(item: SearchResult): Boolean {
-            val t = item.type.uppercase(java.util.Locale.US)
+            val t = item.type.uppercase(Locale.US)
             val isFx = t.contains("CURRENCY") || t.contains("FOREX")
             return when (type) {
                 "FX" -> isFx
@@ -283,44 +287,64 @@ class ScannerForegroundService : Service() {
         if (scopeMode == "SELECTED") {
             val favorites = prefs.getStringSet("favorites", emptySet()).orEmpty().toList()
             val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
-            val byCanonical = catalog.associateBy { repo.canonicalSymbol(it.symbol).uppercase(java.util.Locale.US) }
+            val byCanonical = catalog.associateBy { repo.canonicalSymbol(it.symbol).uppercase(Locale.US) }
             return favorites
                 .map { repo.canonicalSymbol(it) }
                 .distinct()
-                .mapNotNull { byCanonical[it.uppercase(java.util.Locale.US)]?.takeIf(::matches)?.let { meta -> repo.canonicalSymbol(meta.symbol) }
-                    ?: runCatching { repo.canonicalSymbol(it) }.getOrNull()?.takeIf { symbol ->
-                        type == "ALL" || (type == "FX" && (symbol.contains("RUB") || symbol.contains("/"))) || (type == "STOCKS" && !symbol.contains("RUB"))
-                    }
+                .mapNotNull { key ->
+                    byCanonical[key.uppercase(Locale.US)]?.takeIf(::matches)
+                        ?: runCatching {
+                            val canonical = repo.canonicalSymbol(key)
+                            val knownFx = mapOf(
+                                "USD000UTSTOM" to "Доллар США",
+                                "EUR_RUB__TOM" to "Евро",
+                                "CNYRUB_TOM" to "Юань",
+                                "GBP_RUB__TOM" to "Фунт стерлингов",
+                                "JPY_RUB__TOM" to "Японская иена"
+                            )
+                            when {
+                                type == "ALL" -> SearchResult(canonical, knownFx[canonical] ?: canonical, "БКС", if (canonical in knownFx) "CURRENCY" else "", "БКС")
+                                type == "FX" && knownFx.containsKey(canonical) -> SearchResult(canonical, knownFx.getValue(canonical), "БКС", "CURRENCY", "БКС")
+                                else -> null
+                            }
+                        }.getOrNull()
                 }
-                .distinct()
+                .distinctBy { repo.canonicalSymbol(it.symbol).uppercase(Locale.US) }
         }
 
         val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
-        // The scanner count is the real catalogue size after normalization/deduplication.
-        // Never cap it to an artificial value such as 110.
+        // Keep the authoritative BCS ticker + display name together. Do not
+        // canonicalize a real BCS ticker into a Yahoo-style or synthetic symbol.
         val resolved = catalog
             .filter(::matches)
-            .map { repo.canonicalSymbol(it.symbol) }
-            .filter { it.isNotBlank() }
-            .distinct()
+            .filter { it.symbol.isNotBlank() }
+            .distinctBy { it.symbol.uppercase(Locale.US) }
         if (resolved.isNotEmpty()) return resolved
 
-        // Real BCS identifiers only; this is a connectivity fallback, not a synthetic universe.
+        // Connectivity fallback only; all identifiers are real BCS tickers.
         return listOf(
-            "SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON",
-            "CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT",
-            "IRAO","ENPG","USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM"
-        ).filter { symbol ->
-            type == "ALL" || (type == "FX" && symbol in setOf("USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM")) || (type == "STOCKS" && symbol !in setOf("USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM"))
-        }.distinct()
+            SearchResult("SBER", "Сбербанк", "БКС", "STOCK", "БКС"),
+            SearchResult("GAZP", "Газпром", "БКС", "STOCK", "БКС"),
+            SearchResult("LKOH", "ЛУКОЙЛ", "БКС", "STOCK", "БКС"),
+            SearchResult("ROSN", "Роснефть", "БКС", "STOCK", "БКС"),
+            SearchResult("USD000UTSTOM", "Доллар США", "БКС", "CURRENCY", "БКС"),
+            SearchResult("EUR_RUB__TOM", "Евро", "БКС", "CURRENCY", "БКС"),
+            SearchResult("CNYRUB_TOM", "Юань", "БКС", "CURRENCY", "БКС")
+        ).filter(::matches)
     }
 
     private fun loadScanRows(p: android.content.SharedPreferences): List<ScanRow> =
         p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { encoded ->
-            val x = encoded.split("|", limit = 9)
+            val x = encoded.split("|", limit = 16)
             if (x.size < 6) return@mapNotNull null
             ScanRow(
-                result = SearchResult(x[0], x[0], "", "", "БКС"),
+                result = SearchResult(
+                    x[0],
+                    x.getOrNull(13).orEmpty().ifBlank { x[0] },
+                    x.getOrNull(14).orEmpty().ifBlank { "БКС" },
+                    x.getOrNull(15).orEmpty(),
+                    "БКС"
+                ),
                 timeframe = x[1],
                 signal = x[2],
                 confidence = x[3].toIntOrNull() ?: 0,
@@ -341,7 +365,8 @@ class ScannerForegroundService : Service() {
             listOf(
                 it.result.symbol, it.timeframe, it.signal, it.confidence,
                 it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt,
-                it.tp1Probability, it.tp2Probability, it.tp3Probability, it.expectedValueR
+                it.tp1Probability, it.tp2Probability, it.tp3Probability, it.expectedValueR,
+                it.result.name, it.result.exchange, it.result.type
             ).joinToString("|")
         }.toSet()
         p.edit().putStringSet("auto_scan_results", encoded).apply()
@@ -351,7 +376,7 @@ class ScannerForegroundService : Service() {
         "${row.result.symbol}|${row.timeframe}|${row.signal}"
 
     private fun notifySignal(row: ScanRow) {
-        val body = "${row.result.symbol.removeSuffix(".ME")} • ${row.signal} • ${row.confidence}%\n" +
+        val body = "${row.result.symbol} — ${row.result.name} • ${row.signal} • ${row.confidence}%\n" +
             "Горизонт: ${formatHorizonSeconds(row.horizonSeconds)}"
         NotificationHelper.notifyMarket(
             applicationContext,

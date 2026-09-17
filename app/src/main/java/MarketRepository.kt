@@ -57,6 +57,7 @@ class MarketRepository(
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
+        private val catalogPool = Executors.newFixedThreadPool(6)
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
 
@@ -120,6 +121,21 @@ class MarketRepository(
         val now = System.currentTimeMillis()
         searchCaches[searchKey]?.let { cached ->
             if (now - cached.first <= SEARCH_CACHE_MS) return cached.second
+        }
+        // A single character is handled entirely from the local BCS-backed seed
+        // index. This is critical for responsive autocomplete: one keystroke must
+        // never start an HTTP request or a multi-page catalogue scan.
+        if (q.length == 1) {
+            val needleOne = q.lowercase(Locale.ROOT)
+            val translitOne = transliterateRuToLat(needleOne)
+            val instant = popularSeeds().filter { seed ->
+                val symbol = seed.symbol.lowercase(Locale.ROOT)
+                val name = seed.name.lowercase(Locale.ROOT)
+                symbol.startsWith(needleOne) || name.startsWith(needleOne) ||
+                    (translitOne.isNotBlank() && (symbol.startsWith(translitOne) || transliterateRuToLat(name).startsWith(translitOne)))
+            }.take(50)
+            searchCaches[searchKey] = now to instant
+            return instant
         }
 
         // Fast path: the BCS directory has a dedicated "by tickers" endpoint.
@@ -205,11 +221,17 @@ class MarketRepository(
         return finalResults
     }
 
-    /** Search-oriented catalogue: only instrument classes that users normally search. */
+    /** Search-oriented catalogue: only tradable equity/FX classes needed by the app. */
     private fun searchCatalog(): List<SearchResult> = loadCatalog(
-        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY", "ETF", "MUTUAL_FUNDS", "INDICES"),
-        maxPagesPerType = 12
+        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY"),
+        maxPagesPerType = 40
     )
+
+    /** Warm the searchable BCS directory without blocking the UI. */
+    fun warmSearchIndex() {
+        if (!isBcsConfigured()) return
+        runCatching { searchCatalog() }
+    }
 
     /** Scanner universe. Avoid loading bonds/options/futures when the scanner asks for stocks/FX. */
     fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
@@ -231,63 +253,73 @@ class MarketRepository(
         val cached = catalogCaches[cacheKey]
         if (cached != null && cached.second.isNotEmpty() && now - cached.first <= CATALOG_CACHE_MS) return cached.second
 
+        // BCS exposes the catalogue by instrument type. Fetch different types in
+        // parallel, while keeping pagination for each type ordered. This removes the
+        // old 4-7x sequential network penalty without changing the authoritative source.
+        val futures = types.distinct().map { type ->
+            catalogPool.submit<List<SearchResult>> { loadCatalogType(type, maxPagesPerType) }
+        }
         val out = LinkedHashMap<String, SearchResult>()
-        for (type in types) {
-            var page = 0
-            var consecutiveFailures = 0
-            while (page < maxPagesPerType) {
-                val arr = runCatching {
-                    var last: Throwable? = null
-                    for (attempt in 0..3) {
-                        try {
-                            val root = JSONObject(getTextAuth(
-                                "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
-                                15000, bcsHeaders()
-                            ))
-                            return@runCatching root.optJSONArray("instruments") ?: JSONArray()
-                        } catch (t: Throwable) {
-                            last = t
-                            if (!t.message.orEmpty().contains("429")) break
-                            Thread.sleep((350L shl attempt).coerceAtMost(4000L))
-                        }
-                    }
-                    throw last ?: IllegalStateException("БКС: пустой ответ каталога")
-                }.getOrNull()
-
-                if (arr == null) {
-                    consecutiveFailures++
-                    if (consecutiveFailures >= 2) break
-                    page++
-                    continue
-                }
-                consecutiveFailures = 0
-                if (arr.length() == 0) break
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val ticker = o.optString("ticker").trim()
-                    if (ticker.isBlank()) continue
-                    val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                    val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
-                    val name = o.optString("displayName")
-                        .ifBlank { o.optString("shortName") }
-                        .ifBlank { o.optString("issuerName") }
-                        .ifBlank { ticker }
-                    val typeName = o.optString("instrumentType").ifBlank { type }
-                    val item = SearchResult(ticker, name, exchange, typeName, "БКС")
-                    out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
-                }
-                // BCS documentation explicitly says page+1 must be requested when
-                // the page contains exactly `size` objects.
-                if (arr.length() < 100) break
-                page++
-                Thread.sleep(80L)
+        futures.forEach { future ->
+            runCatching { future.get(90, TimeUnit.SECONDS) }.getOrDefault(emptyList()).forEach { item ->
+                out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
             }
         }
         val result = out.values.toList()
-        if (result.isNotEmpty()) {
-            catalogCaches[cacheKey] = System.currentTimeMillis() to result
-        }
+        if (result.isNotEmpty()) catalogCaches[cacheKey] = System.currentTimeMillis() to result
         return result
+    }
+
+    private fun loadCatalogType(type: String, maxPagesPerType: Int): List<SearchResult> {
+        val out = LinkedHashMap<String, SearchResult>()
+        var page = 0
+        var consecutiveFailures = 0
+        while (page < maxPagesPerType) {
+            val arr = runCatching {
+                var last: Throwable? = null
+                for (attempt in 0..3) {
+                    try {
+                        val root = JSONObject(getTextAuth(
+                            "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
+                            15000, bcsHeaders()
+                        ))
+                        return@runCatching root.optJSONArray("instruments") ?: JSONArray()
+                    } catch (t: Throwable) {
+                        last = t
+                        if (!t.message.orEmpty().contains("429")) break
+                        Thread.sleep((350L shl attempt).coerceAtMost(4000L))
+                    }
+                }
+                throw last ?: IllegalStateException("БКС: пустой ответ каталога")
+            }.getOrNull()
+
+            if (arr == null) {
+                consecutiveFailures++
+                if (consecutiveFailures >= 2) break
+                page++
+                continue
+            }
+            consecutiveFailures = 0
+            if (arr.length() == 0) break
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val ticker = o.optString("ticker").trim()
+                if (ticker.isBlank()) continue
+                val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
+                val name = o.optString("displayName")
+                    .ifBlank { o.optString("shortName") }
+                    .ifBlank { o.optString("issuerName") }
+                    .ifBlank { ticker }
+                val typeName = o.optString("instrumentType").ifBlank { type }
+                out.putIfAbsent(ticker.uppercase(Locale.US), SearchResult(ticker, name, exchange, typeName, "БКС"))
+            }
+            // BCS documents that a full page requires requesting page + 1.
+            if (arr.length() < 100) break
+            page++
+            Thread.sleep(40L)
+        }
+        return out.values.toList()
     }
 
     /** BCS-only FX catalogue. */
@@ -305,10 +337,10 @@ class MarketRepository(
         "YDEX" to "Яндекс", "OZON" to "Ozon", "CIAN" to "ЦИАН", "AFLT" to "Аэрофлот",
         "VTBR" to "ВТБ", "MTSS" to "МТС", "GMKN" to "Норникель", "PLZL" to "Полюс",
         "PHOR" to "ФосАгро", "RTKM" to "Ростелеком", "ALRS" to "АЛРОСА", "FLOT" to "Совкомфлот",
-        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "USDRUB=X" to "Доллар / Рубль",
-        "EURRUB=X" to "Евро / Рубль", "CNYRUB=X" to "Юань / Рубль"
+        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "USD000UTSTOM" to "Доллар / Рубль",
+        "EUR_RUB__TOM" to "Евро / Рубль", "CNYRUB_TOM" to "Юань / Рубль"
     ).map { (symbol, name) ->
-        SearchResult(symbol, name, "БКС", if (symbol.endsWith("=X")) "CURRENCY" else "STOCK", "БКС")
+        SearchResult(symbol, name, "БКС", if (symbol in setOf("USD000UTSTOM", "EUR_RUB__TOM", "CNYRUB_TOM")) "CURRENCY" else "STOCK", "БКС")
     }
 
     private fun normalizeFx(q: String): SearchResult? {
@@ -359,7 +391,7 @@ class MarketRepository(
         };return out
     }
     private fun parseRssDate(v:String):Long{val fs=listOf("EEE, dd MMM yyyy HH:mm:ss Z","EEE, dd MMM yyyy HH:mm Z","yyyy-MM-dd'T'HH:mm:ssXXX","yyyy-MM-dd'T'HH:mm:ss.SSSXXX");for(f in fs){val x=runCatching{SimpleDateFormat(f,Locale.US).parse(v.trim())?.time}.getOrNull();if(x!=null)return x};return 0L}
-    private fun extractInstrument(title:String,body:String):String{val text="$title $body".uppercase(Locale.US);val a=mapOf("SBER" to "SBER","СБЕР" to "SBER","ГАЗПРОМ" to "GAZP","GAZP" to "GAZP","ЛУКОЙЛ" to "LKOH","LKOH" to "LKOH","РОСНЕФТЬ" to "ROSN","НОВАТЭК" to "NVTK","ЯНДЕКС" to "YDEX","ОЗОН" to "OZON","ЦИАН" to "CIAN","CIAN" to "CIAN","ДОЛЛАР" to "USDRUB=X","ЕВРО" to "EURRUB=X","ЮАН" to "CNYRUB=X");return a.entries.firstOrNull{text.contains(it.key)}?.value.orEmpty()}
+    private fun extractInstrument(title:String,body:String):String{val text="$title $body".uppercase(Locale.US);val a=mapOf("SBER" to "SBER","СБЕР" to "SBER","ГАЗПРОМ" to "GAZP","GAZP" to "GAZP","ЛУКОЙЛ" to "LKOH","LKOH" to "LKOH","РОСНЕФТЬ" to "ROSN","НОВАТЭК" to "NVTK","ЯНДЕКС" to "YDEX","ОЗОН" to "OZON","ЦИАН" to "CIAN","CIAN" to "CIAN","ДОЛЛАР" to "USD000UTSTOM","ЕВРО" to "EUR_RUB__TOM","ЮАН" to "CNYRUB_TOM");return a.entries.firstOrNull{text.contains(it.key)}?.value.orEmpty()}
 
     private fun finamMarketNews(limit:Int,category:NewsCategory):List<NewsItem>{val html=getText("https://www.finam.ru/publications/section/market/",15000);val out=mutableListOf<NewsItem>();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val m=p.matcher(html);while(m.find()&&out.size<limit){val href=htmlDecode(m.group(1).orEmpty());val title=stripHtml(m.group(2).orEmpty());if(title.length<12)continue;val low=title.lowercase(Locale.US);val fx=listOf("рубл","доллар","евро","юань","валют","курс").any{low.contains(it)};val stock=listOf("акци","сбер","газпром","лукойл","роснефт","новатэк","дивиденд","яндекс","озон").any{low.contains(it)};val cat=when{fx&&!stock->NewsCategory.FX;stock->NewsCategory.STOCKS;else->NewsCategory.ALL};if(cat==NewsCategory.ALL||(category!=NewsCategory.ALL&&cat!=category))continue;val url=if(href.startsWith("http"))href else "https://www.finam.ru"+if(href.startsWith("/"))href else "/$href";out+=NewsItem(title,"Финам",url,0L,title,cat,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
     private fun moexNews(limit:Int,category:NewsCategory):List<NewsItem>{val url=when(category){NewsCategory.STOCKS->"https://www.moex.com/ru/news/?ncat=111";NewsCategory.FX->"https://www.moex.com/ru/news/?ncat=118";else->"https://www.moex.com/ru/news/"};val html=runCatching{getText(url,15000)}.getOrNull()?:return emptyList();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val out=mutableListOf<NewsItem>();val m=p.matcher(html);while(m.find()&&out.size<limit){val title=stripHtml(m.group(2).orEmpty());val href=htmlDecode(m.group(1).orEmpty());if(title.length<12)continue;val full=if(href.startsWith("http"))href else "https://www.moex.com"+href;out+=NewsItem(title,"Московская биржа",full,0L,title,category,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
@@ -544,7 +576,7 @@ class MarketRepository(
     /** Refresh real FX rates used only for display-currency conversion. */
     fun refreshDisplayCurrencyRates() {
         val p = prefs ?: return
-        val pairs = mapOf("USD" to "USDRUB=X", "EUR" to "EURRUB=X", "CNY" to "CNYRUB=X", "GBP" to "GBPRUB=X", "JPY" to "JPYRUB=X")
+        val pairs = mapOf("USD" to "USD000UTSTOM", "EUR" to "EUR_RUB__TOM", "CNY" to "CNYRUB_TOM", "GBP" to "GBP_RUB__TOM", "JPY" to "JPY_RUB__TOM")
         pairs.forEach { (ccy, pair) ->
             runCatching { quoteFresh(pair) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }?.let {
                 p.edit().putString("fx_rate_$ccy", it.toString()).putLong("fx_rate_ts_$ccy", System.currentTimeMillis()).apply()
@@ -637,14 +669,14 @@ class MarketRepository(
             "CNYRUB=X", "CNY/RUB", "CNYRUB" -> "CNYRUB_TOM"
             "GBPRUB=X", "GBP/RUB", "GBPRUB" -> "GBP_RUB__TOM"
             "JPYRUB=X", "JPY/RUB", "JPYRUB" -> "JPY_RUB__TOM"
-            else -> raw.removeSuffix(".ME").substringBefore("@")
+            else -> raw.removeSuffix(".ME")
         }
     }
 
     private fun bcsSupported(symbol: String): Boolean {
         if (!isBcsConfigured()) return false
         if (bcsFx(symbol) != null) return true
-        val clean = symbol.uppercase(Locale.US).removeSuffix(".ME").substringBefore("@")
+        val clean = canonicalSymbol(symbol).substringBefore("@")
         return runCatching { bcsInstrument(clean) }.isSuccess
     }
 

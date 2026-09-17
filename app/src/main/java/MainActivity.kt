@@ -305,16 +305,32 @@ fun MarketForecastApp(ctx: Context) {
     }
 
     LaunchedEffect(Unit) {
-        // Warm the BCS catalogue once in the background. Autocomplete must not wait
-        // for the first keystroke while thousands of BCS instruments are paged in.
-        withContext(Dispatchers.IO) { runCatching { repo.catalog() } }
+        // Warm only the searchable BCS directory. The previous full-market warmup
+        // loaded stocks, FX, funds, indices, futures, options and bonds before the
+        // user had asked for anything; that made startup and the first search feel slow.
+        withContext(Dispatchers.IO) { repo.warmSearchIndex() }
     }
     LaunchedEffect(query) {
-        if (query.trim().isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
-        delay(if (query.trim().length == 1) 180 else 260); searching = true
-        results = withContext(Dispatchers.IO) { runCatching { repo.search(query.trim()) }.getOrDefault(emptyList()) }
+        val q = query.trim()
+        if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
+        // One-character autocomplete must never hit the network. The local BCS-backed
+        // seed index is rendered immediately; network lookup starts only from 2 chars.
+        if (q.length == 1) {
+            searching = true
+            results = withContext(Dispatchers.Default) { repo.search(q) }
+            searching = false
+            return@LaunchedEffect
+        }
+        delay(320)
+        searching = true
+        val requested = q
+        val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested) }.getOrDefault(emptyList()) }
+        // Do not let an older, slower HTTP response overwrite a newer query.
+        if (query.trim().equals(requested, true)) {
+            results = found
+            message = if (ru) "Поиск завершён: найдено ${results.size}" else "Search completed: ${results.size} found"
+        }
         searching = false
-        message = if (ru) "Поиск завершён: найдено ${results.size}" else "Search completed: ${results.size} found"
     }
     LaunchedEffect(ru) {
         prefs.edit().putBoolean("ru", ru).apply()
@@ -1364,7 +1380,10 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
             items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row ->
                 GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) {
                     Row(verticalAlignment=Alignment.CenterVertically) {
-                        Text(row.result.symbol,Modifier.weight(1f),fontWeight=FontWeight.Black)
+                        Column(Modifier.weight(1f)) {
+                            Text(row.result.symbol, fontWeight=FontWeight.Black, fontSize=11.sp)
+                            Text(row.result.name, fontWeight=FontWeight.SemiBold, fontSize=9.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, maxLines=1, overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        }
                         Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }
                         Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black)
                         val left=(row.expiresAt-countdownNow).coerceAtLeast(0L)
@@ -1550,7 +1569,27 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun ErrorCard(s:String,ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Данные временно недоступны" else "Data temporarily unavailable",color=Negative,fontWeight=FontWeight.Bold);Text(s,fontSize=9.sp,modifier=Modifier.padding(top=5.dp))}}
 
 @Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier, shape = RoundedCornerShape(12.dp), color = Color.Black, contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
-private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a -> val x=a.split("|",limit=13); if(x.size<6) null else { val created=x.getOrNull(7)?.toLongOrNull()?:0L; val expires=x.getOrNull(8)?.toLongOrNull()?:0L; ScanRow(SearchResult(x[0],x[0],"",""),x[1],x[2],x[3].toIntOrNull()?:0,x[4].toDoubleOrNull()?:0.0,x[5].toDoubleOrNull()?:0.0,x.getOrNull(6)?.toLongOrNull()?:0L,created,expires,x.getOrNull(9)?.toDoubleOrNull()?:0.0,x.getOrNull(10)?.toDoubleOrNull()?:0.0,x.getOrNull(11)?.toDoubleOrNull()?:0.0,x.getOrNull(12)?.toDoubleOrNull()?:0.0) } }.filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }.sortedByDescending{it.confidence}
+private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a ->
+    val x = a.split("|", limit = 16)
+    if (x.size < 6) null else {
+        val created = x.getOrNull(7)?.toLongOrNull() ?: 0L
+        val expires = x.getOrNull(8)?.toLongOrNull() ?: 0L
+        ScanRow(
+            SearchResult(
+                x[0],
+                x.getOrNull(13).orEmpty().ifBlank { x[0] },
+                x.getOrNull(14).orEmpty().ifBlank { "БКС" },
+                x.getOrNull(15).orEmpty(),
+                "БКС"
+            ),
+            x[1], x[2], x[3].toIntOrNull() ?: 0, x[4].toDoubleOrNull() ?: 0.0,
+            x[5].toDoubleOrNull() ?: 0.0, x.getOrNull(6)?.toLongOrNull() ?: 0L,
+            created, expires, x.getOrNull(9)?.toDoubleOrNull() ?: 0.0,
+            x.getOrNull(10)?.toDoubleOrNull() ?: 0.0, x.getOrNull(11)?.toDoubleOrNull() ?: 0.0,
+            x.getOrNull(12)?.toDoubleOrNull() ?: 0.0
+        )
+    }
+}.filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }.sortedByDescending { it.confidence }
 private fun loadFavoriteOrder(p: android.content.SharedPreferences, favs: Set<String>): List<String> = (p.getString("favorite_order", "").orEmpty().split("\n").filter { it.isNotBlank() }.filter { it in favs } + favs.filter { it !in p.getString("favorite_order", "").orEmpty().split("\n") }).distinct()
 private fun loadSearchHistory(p: android.content.SharedPreferences): List<String> = p.getString("search_history", "").orEmpty().split("\n").filter { it.isNotBlank() }.take(20)
 private fun saveSearchHistory(p: android.content.SharedPreferences, q: String): List<String> { val out = (listOf(q) + loadSearchHistory(p).filterNot { it.equals(q, true) }).take(20); p.edit().putString("search_history", out.joinToString("\n")).apply(); return out }
