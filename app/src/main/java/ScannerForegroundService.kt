@@ -233,17 +233,20 @@ class ScannerForegroundService : Service() {
         return runCatching {
             withTimeout(12_000L) {
                 // Candle history and the canonical live quote are independent BCS
-                // requests. Fetch them concurrently so a slow quote endpoint does not
-                // unnecessarily serialize the entire scanner.
+                // requests. Resolve the exact BCS ticker + classCode from metadata so
+                // an instrument such as CIAN/CNRU cannot silently jump to another board.
                 coroutineScope {
-                    val candlesJob = async(Dispatchers.IO) { repo.load(symbol, pair.first, pair.second) }
-                    val quoteJob = async(Dispatchers.IO) { runCatching { repo.quote(symbol) }.getOrNull() }
+                    val requestSymbol = metadata?.let {
+                        if (it.classCode.isNotBlank()) "${it.symbol}@${it.classCode}" else it.symbol
+                    } ?: symbol
+                    val candlesJob = async(Dispatchers.IO) { repo.load(requestSymbol, pair.first, pair.second) }
+                    val quoteJob = async(Dispatchers.IO) { runCatching { repo.quote(requestSymbol) }.getOrNull() }
                     val candles = candlesJob.await()
                     if (candles.size < 30) return@coroutineScope null
                     val quote = quoteJob.await()
-                    val live = reconcileLivePrice(symbol, candles, quote)
+                    val live = reconcileLivePrice(requestSymbol, candles, quote)
                     if (!live.isFinite() || live <= 0.0) return@coroutineScope null
-                    val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), symbol)
+                    val merged = mergeRealtimeCandle(candles, live, timeframe, System.currentTimeMillis(), requestSymbol)
                     // Scanner is a strict execution surface of the Forecast engine.
                     // Never manufacture a direction from score/confirmation when the
                     // engine explicitly rejects the setup. This keeps scanner results
@@ -337,7 +340,7 @@ class ScannerForegroundService : Service() {
 
     private fun loadScanRows(p: android.content.SharedPreferences): List<ScanRow> =
         p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { encoded ->
-            val x = encoded.split("|", limit = 16)
+            val x = encoded.split("|", limit = 17)
             if (x.size < 6) return@mapNotNull null
             ScanRow(
                 result = SearchResult(
@@ -345,7 +348,8 @@ class ScannerForegroundService : Service() {
                     x.getOrNull(13).orEmpty().ifBlank { x[0] },
                     x.getOrNull(14).orEmpty().ifBlank { "БКС" },
                     x.getOrNull(15).orEmpty(),
-                    "БКС"
+                    "БКС",
+                    x.getOrNull(16).orEmpty()
                 ),
                 timeframe = x[1],
                 signal = x[2],
@@ -368,7 +372,7 @@ class ScannerForegroundService : Service() {
                 it.result.symbol, it.timeframe, it.signal, it.confidence,
                 it.score, it.rr, it.horizonSeconds, it.createdAt, it.expiresAt,
                 it.tp1Probability, it.tp2Probability, it.tp3Probability, it.expectedValueR,
-                it.result.name, it.result.exchange, it.result.type
+                it.result.name, it.result.exchange, it.result.type, it.result.classCode
             ).joinToString("|")
         }.toSet()
         p.edit().putStringSet("auto_scan_results", encoded).apply()

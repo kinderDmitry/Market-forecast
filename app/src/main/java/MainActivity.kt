@@ -210,10 +210,7 @@ fun MarketForecastApp(ctx: Context) {
             }
             val meta = withContext(Dispatchers.IO) { repo.instrumentMeta(selected) }
             val quoted = withContext(Dispatchers.IO) { runCatching { repo.quote(selected) }.getOrNull() }
-            val cachedCanonical = canonicalQuotes[selected]
-                ?: prefs.getString("canonical_quote_$selected", null)?.toDoubleOrNull()
-                    ?.takeIf { it.isFinite() && it > 0.0 }
-            val live = reconcileLivePrice(selected, candlesRaw, quoted ?: cachedCanonical)
+            val live = reconcileLivePrice(selected, candlesRaw, quoted)
             if (live > 0.0 && live.isFinite()) {
                 canonicalQuotes[selected] = live
                 prefs.edit().putString("canonical_quote_$selected", live.toString())
@@ -221,9 +218,9 @@ fun MarketForecastApp(ctx: Context) {
             }
             // The realtime candle is part of the exact dataset used by the forecast.
             // Entry/levels use the same canonical live price across timeframes.
-            val candles = mergeRealtimeCandle(candlesRaw, live, time, System.currentTimeMillis(), selected)
-            val f = if (candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live) }.getOrNull() } else null
-            state = MarketState(selected, candles, f, false, if (f == null) "Недостаточно рыночных данных или БКС недоступен" else null, System.currentTimeMillis(), time, news, live, meta, repo.forecastSource(selected))
+            val candles = if (live > 0.0) mergeRealtimeCandle(candlesRaw, live, time, System.currentTimeMillis(), selected) else candlesRaw
+            val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live) }.getOrNull() } else null
+            state = MarketState(selected, candles, f, false, if (f == null) "Актуальная цена БКС недоступна или недостаточно рыночных данных" else null, System.currentTimeMillis(), time, news, live, meta, repo.forecastSource(selected))
             val fresh = withContext(Dispatchers.IO) { runCatching { repo.news(selected, 12, ru) }.getOrDefault(emptyList()) }
             if (fresh.isNotEmpty()) { news = fresh; saveCachedNews(prefs, fresh); state = state.copy(news = fresh) }
         }
@@ -383,7 +380,7 @@ fun MarketForecastApp(ctx: Context) {
                         } else cached
                         val lp = runCatching { repo.quote(item.symbol) }.getOrNull()
                         val reconciled = reconcileLivePrice(item.symbol, cs, lp)
-                        val ev = TrackingEngine.evaluate(item, cs, reconciled, now)
+                        val ev = if (reconciled > 0.0) TrackingEngine.evaluate(item, cs, reconciled, now) else null
                         if (ev == null) item to null else item.copy(
                             lastLivePrice = ev.price, lastUpdated = now,
                             tp1Hit = item.tp1Hit || ev.events.contains("SUCCESS_TP1"),
@@ -1570,7 +1567,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 
 @Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier, shape = RoundedCornerShape(12.dp), color = Color.Black, contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
 private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a ->
-    val x = a.split("|", limit = 16)
+    val x = a.split("|", limit = 17)
     if (x.size < 6) null else {
         val created = x.getOrNull(7)?.toLongOrNull() ?: 0L
         val expires = x.getOrNull(8)?.toLongOrNull() ?: 0L
@@ -1580,7 +1577,8 @@ private fun loadAutoScanResults(p: android.content.SharedPreferences): List<Scan
                 x.getOrNull(13).orEmpty().ifBlank { x[0] },
                 x.getOrNull(14).orEmpty().ifBlank { "БКС" },
                 x.getOrNull(15).orEmpty(),
-                "БКС"
+                "БКС",
+                x.getOrNull(16).orEmpty()
             ),
             x[1], x[2], x[3].toIntOrNull() ?: 0, x[4].toDoubleOrNull() ?: 0.0,
             x[5].toDoubleOrNull() ?: 0.0, x.getOrNull(6)?.toLongOrNull() ?: 0L,

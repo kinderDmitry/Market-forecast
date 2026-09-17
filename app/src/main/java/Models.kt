@@ -1,7 +1,7 @@
 package com.marketforecast.prox
 
 data class Candle(val time: Long, val open: Double, val high: Double, val low: Double, val close: Double, val volume: Double)
-data class SearchResult(val symbol: String, val name: String, val exchange: String, val type: String, val source: String = "")
+data class SearchResult(val symbol: String, val name: String, val exchange: String, val type: String, val source: String = "", val classCode: String = "")
 data class ScanRow(
     val result: SearchResult,
     val timeframe: String,

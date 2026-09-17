@@ -20,17 +20,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 
 internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: Double?): Double {
-    val q = quoted?.takeIf { it.isFinite() && it > 0.0 }
-    val last = candles.lastOrNull()?.close?.takeIf { it.isFinite() && it > 0.0 }
-    if (q == null) return last ?: 0.0
-    if (last == null) return q
-
-    // BCS is the single canonical market-data source. The quote is the single
-    // canonical "now" price. Do not substitute a previous candle.
-    // candle merely because it is far from the live quote: sessions, corporate
-    // actions and stale candles can legitimately create large gaps. A valid quote
-    // must remain identical for every timeframe of the same instrument.
-    return q
+    // A historical candle close is not a live quote. If BCS did not return a
+    // current quote, fail closed instead of presenting stale data as "now".
+    return quoted?.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
 }
 
 /** Market-data repository. BCS is the sole market-data provider; news/dividends are separate informational feeds. */
@@ -45,11 +37,16 @@ class MarketRepository(
         // cache prevents repeated timeframe switches/scans from hammering the same provider.
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
-        private val stableQuoteCache = ConcurrentHashMap<String, Double>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
         private const val SEARCH_CACHE_MS = 60_000L
+        // BCS documents 10 RPS for reference and market-data HTTP APIs. Keep a
+        // single process-wide limiter because catalog, candles, quotes and order-book
+        // requests can run concurrently from scanner/UI/workers.
+        private val bcsHttpGate = Any()
+        private var bcsLastRequestAt = 0L
+        private const val BCS_MIN_REQUEST_GAP_MS = 115L
         private val searchCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         // Cache is keyed by the requested instrument-type set. A single global
         // catalogue used to let a previous STOCK search poison a later FX scan.
@@ -146,7 +143,7 @@ class MarketRepository(
             "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP",
             "лукойл" to "LKOH", "роснефть" to "ROSN", "новатэк" to "NVTK",
             "татнефть" to "TATN", "магнит" to "MGNT", "мосбиржа" to "MOEX",
-            "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CIAN",
+            "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
             "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS",
             "норникель" to "GMKN", "полюс" to "PLZL", "фосагро" to "PHOR",
             "ростелеком" to "RTKM", "алроса" to "ALRS", "совкомфлот" to "FLOT",
@@ -165,7 +162,8 @@ class MarketRepository(
                     o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
                     board?.optString("exchange").orEmpty().ifBlank { "БКС" },
                     o.optString("instrumentType").ifBlank { if (ticker.endsWith("=X")) "CURRENCY" else "STOCK" },
-                    "БКС"
+                    "БКС",
+                    board?.optString("classCode").orEmpty()
                 )
             }
         }
@@ -312,7 +310,8 @@ class MarketRepository(
                     .ifBlank { o.optString("issuerName") }
                     .ifBlank { ticker }
                 val typeName = o.optString("instrumentType").ifBlank { type }
-                out.putIfAbsent(ticker.uppercase(Locale.US), SearchResult(ticker, name, exchange, typeName, "БКС"))
+                val classCode = boardObj?.optString("classCode").orEmpty()
+                out.putIfAbsent(ticker.uppercase(Locale.US), SearchResult(ticker, name, exchange, typeName, "БКС", classCode))
             }
             // BCS documents that a full page requires requesting page + 1.
             if (arr.length() < 100) break
@@ -334,7 +333,7 @@ class MarketRepository(
     private fun popularSeeds(): List<SearchResult> = listOf(
         "SBER" to "Сбербанк", "GAZP" to "Газпром", "LKOH" to "Лукойл", "ROSN" to "Роснефть",
         "NVTK" to "Новатэк", "TATN" to "Татнефть", "MGNT" to "Магнит", "MOEX" to "Московская биржа",
-        "YDEX" to "Яндекс", "OZON" to "Ozon", "CIAN" to "ЦИАН", "AFLT" to "Аэрофлот",
+        "YDEX" to "Яндекс", "OZON" to "Ozon", "CNRU" to "ЦИАН", "AFLT" to "Аэрофлот",
         "VTBR" to "ВТБ", "MTSS" to "МТС", "GMKN" to "Норникель", "PLZL" to "Полюс",
         "PHOR" to "ФосАгро", "RTKM" to "Ростелеком", "ALRS" to "АЛРОСА", "FLOT" to "Совкомфлот",
         "IRAO" to "Интер РАО", "ENPG" to "Эн+", "USD000UTSTOM" to "Доллар / Рубль",
@@ -348,7 +347,7 @@ class MarketRepository(
         if (x.length != 6 || !x.all { it.isLetter() }) return null
         val base = x.take(3); val quote = x.takeLast(3)
         return if (bcsFx("${base}${quote}=X") != null)
-            SearchResult("${base}${quote}=X", "$base/$quote", "BCS", "CURRENCY", "БКС")
+            SearchResult(bcsFx("${base}${quote}=X")!!, "$base/$quote", "БКС", "CURRENCY", "БКС", "CETS")
         else null
     }
 
@@ -391,7 +390,7 @@ class MarketRepository(
         };return out
     }
     private fun parseRssDate(v:String):Long{val fs=listOf("EEE, dd MMM yyyy HH:mm:ss Z","EEE, dd MMM yyyy HH:mm Z","yyyy-MM-dd'T'HH:mm:ssXXX","yyyy-MM-dd'T'HH:mm:ss.SSSXXX");for(f in fs){val x=runCatching{SimpleDateFormat(f,Locale.US).parse(v.trim())?.time}.getOrNull();if(x!=null)return x};return 0L}
-    private fun extractInstrument(title:String,body:String):String{val text="$title $body".uppercase(Locale.US);val a=mapOf("SBER" to "SBER","СБЕР" to "SBER","ГАЗПРОМ" to "GAZP","GAZP" to "GAZP","ЛУКОЙЛ" to "LKOH","LKOH" to "LKOH","РОСНЕФТЬ" to "ROSN","НОВАТЭК" to "NVTK","ЯНДЕКС" to "YDEX","ОЗОН" to "OZON","ЦИАН" to "CIAN","CIAN" to "CIAN","ДОЛЛАР" to "USD000UTSTOM","ЕВРО" to "EUR_RUB__TOM","ЮАН" to "CNYRUB_TOM");return a.entries.firstOrNull{text.contains(it.key)}?.value.orEmpty()}
+    private fun extractInstrument(title:String,body:String):String{val text="$title $body".uppercase(Locale.US);val a=mapOf("SBER" to "SBER","СБЕР" to "SBER","ГАЗПРОМ" to "GAZP","GAZP" to "GAZP","ЛУКОЙЛ" to "LKOH","LKOH" to "LKOH","РОСНЕФТЬ" to "ROSN","НОВАТЭК" to "NVTK","ЯНДЕКС" to "YDEX","ОЗОН" to "OZON","ЦИАН" to "CNRU","CNRU" to "CNRU","ДОЛЛАР" to "USD000UTSTOM","ЕВРО" to "EUR_RUB__TOM","ЮАН" to "CNYRUB_TOM");return a.entries.firstOrNull{text.contains(it.key)}?.value.orEmpty()}
 
     private fun finamMarketNews(limit:Int,category:NewsCategory):List<NewsItem>{val html=getText("https://www.finam.ru/publications/section/market/",15000);val out=mutableListOf<NewsItem>();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val m=p.matcher(html);while(m.find()&&out.size<limit){val href=htmlDecode(m.group(1).orEmpty());val title=stripHtml(m.group(2).orEmpty());if(title.length<12)continue;val low=title.lowercase(Locale.US);val fx=listOf("рубл","доллар","евро","юань","валют","курс").any{low.contains(it)};val stock=listOf("акци","сбер","газпром","лукойл","роснефт","новатэк","дивиденд","яндекс","озон").any{low.contains(it)};val cat=when{fx&&!stock->NewsCategory.FX;stock->NewsCategory.STOCKS;else->NewsCategory.ALL};if(cat==NewsCategory.ALL||(category!=NewsCategory.ALL&&cat!=category))continue;val url=if(href.startsWith("http"))href else "https://www.finam.ru"+if(href.startsWith("/"))href else "/$href";out+=NewsItem(title,"Финам",url,0L,title,cat,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
     private fun moexNews(limit:Int,category:NewsCategory):List<NewsItem>{val url=when(category){NewsCategory.STOCKS->"https://www.moex.com/ru/news/?ncat=111";NewsCategory.FX->"https://www.moex.com/ru/news/?ncat=118";else->"https://www.moex.com/ru/news/"};val html=runCatching{getText(url,15000)}.getOrNull()?:return emptyList();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val out=mutableListOf<NewsItem>();val m=p.matcher(html);while(m.find()&&out.size<limit){val title=stripHtml(m.group(2).orEmpty());val href=htmlDecode(m.group(1).orEmpty());if(title.length<12)continue;val full=if(href.startsWith("http"))href else "https://www.moex.com"+href;out+=NewsItem(title,"Московская биржа",full,0L,title,category,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
@@ -493,7 +492,7 @@ class MarketRepository(
                 val candles = load(item.symbol, "1y", "1d")
                 val last = candles.lastOrNull() ?: return@runCatching null
                 val prev = candles.dropLast(1).lastOrNull()?.close ?: last.close
-                val live = quote(item.symbol) ?: last.close
+                val live = quote(item.symbol) ?: return@runCatching null
                 MarketIndex(item.symbol, item.name, live, if (prev == 0.0) 0.0 else (live - prev) / prev * 100.0, "БКС")
             }.getOrNull()
         }
@@ -509,26 +508,16 @@ class MarketRepository(
         if (cached != null && now - cached.first <= QUOTE_CACHE_MS && cached.second.isFinite() && cached.second > 0.0) {
             return cached.second
         }
-        val value = if (!bcsRefreshToken.isNullOrBlank()) {
-            runCatching { quoteBcs(clean) }
-                .getOrNull()
-                ?.takeIf { it.isFinite() && it > 0.0 }
-                ?: stableQuoteCache[quoteKey]
-                ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
-                    ?.takeIf { it.isFinite() && it > 0.0 }
-                ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
-        } else {
-            stableQuoteCache[quoteKey]
-                ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
-                    ?.takeIf { it.isFinite() && it > 0.0 }
-                ?: throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
-        }
+        if (bcsRefreshToken.isNullOrBlank()) throw IllegalStateException("БКС не подключен. Прогнозы и live-цены доступны только через БКС.")
+        val value = runCatching { quoteBcs(clean) }
+            .getOrNull()
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
         if (value != null) {
             // Never freeze a valid BCS quote because it differs sharply from the
             // previous value. A large move can be a real market move (or a
             // session transition). The old 15% clamp was exactly the kind of
             // hidden state that made tracking appear stuck on one price.
-            stableQuoteCache[quoteKey] = value
             quoteCache[quoteKey] = now to value
             prefs?.edit()
                 ?.putString("canonical_quote_$clean", value.toString())
@@ -548,13 +537,9 @@ class MarketRepository(
         if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
         val value = runCatching { quoteBcs(clean) }.getOrNull()
             ?.takeIf { it.isFinite() && it > 0.0 }
-            ?: stableQuoteCache["BCS|$clean"]
-            ?: prefs?.getString("canonical_quote_$clean", null)?.toDoubleOrNull()
-                ?.takeIf { it.isFinite() && it > 0.0 }
             ?: throw IllegalStateException("БКС не вернул актуальную цену для $symbol")
         val now = System.currentTimeMillis()
         val key = "BCS|$clean"
-        stableQuoteCache[key] = value
         quoteCache[key] = now to value
         prefs?.edit()
             ?.putString("canonical_quote_$clean", value.toString())
@@ -647,7 +632,7 @@ class MarketRepository(
     // Russian-equity board; the information service is still preferred whenever
     // it can provide a more specific class.
     private val bcsRuEquityTickers = setOf(
-        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT", "CIAN",
+        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT", "CNRU",
         "MOEX", "YDEX", "OZON", "PHOR", "MTSS", "IRAO", "GMKN", "NLMK",
         "CHMF", "ALRS", "SNGS", "SNGSP", "RTKM", "RTKMP", "VTBR", "AFLT",
         "RUAL", "PLZL", "HYDR", "ENPG", "PIKK", "MAGN", "CBOM", "AFKS",
@@ -686,12 +671,12 @@ class MarketRepository(
         val ticker = clean.substringBefore("@")
         val fx = bcsFx(symbol)
         if (fx != null) return fx to "CETS"
-        bcsInstrumentCache[ticker]?.let { return it }
         if (explicitBoard.isNotBlank()) {
             val pair = ticker to explicitBoard
-            bcsInstrumentCache[ticker] = pair
+            bcsInstrumentCache[clean] = pair
             return pair
         }
+        bcsInstrumentCache[ticker]?.let { return it }
 
         // First use the authoritative BCS instrument directory.  If that request
         // is temporarily unavailable (for example HTTP 429), use the deterministic
@@ -706,6 +691,7 @@ class MarketRepository(
         }
         val pair = ticker to board
         bcsInstrumentCache[ticker] = pair
+        bcsInstrumentCache[clean] = pair
         return pair
     }
 
@@ -880,7 +866,7 @@ class MarketRepository(
         if (clean.isBlank()) return false
         val text=(n.originalTitle+" "+n.body).uppercase(Locale.US)
         if (n.instrument.equals(clean, true)) return true
-        val aliases=mapOf("SBER" to listOf("СБЕР","СБЕРБАНК","SBER"),"GAZP" to listOf("ГАЗПРОМ","GAZPROM","GAZP"),"LKOH" to listOf("ЛУКОЙЛ","LKOH"),"USDRUB" to listOf("ДОЛЛАР","USD/RUB","USDRUB","РУБЛ"),"EURRUB" to listOf("ЕВРО","EUR/RUB","EURRUB"),"CIAN" to listOf("ЦИАН","CIAN"))
+        val aliases=mapOf("SBER" to listOf("СБЕР","СБЕРБАНК","SBER"),"GAZP" to listOf("ГАЗПРОМ","GAZPROM","GAZP"),"LKOH" to listOf("ЛУКОЙЛ","LKOH"),"USDRUB" to listOf("ДОЛЛАР","USD/RUB","USDRUB","РУБЛ"),"EURRUB" to listOf("ЕВРО","EUR/RUB","EURRUB"),"CNRU" to listOf("ЦИАН","CIAN","CNRU"))
         return (aliases[clean] ?: listOf(clean)).any { text.contains(it) }
     }
 
@@ -941,17 +927,47 @@ class MarketRepository(
         c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         return readResponse(c)
     }
+    private fun bcsPace() {
+        synchronized(bcsHttpGate) {
+            val now = System.currentTimeMillis()
+            val wait = BCS_MIN_REQUEST_GAP_MS - (now - bcsLastRequestAt)
+            if (wait > 0) Thread.sleep(wait)
+            bcsLastRequestAt = System.currentTimeMillis()
+        }
+    }
     private fun postJson(url: String, body: String, timeout: Int, headers: Map<String,String>): String {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.requestMethod = "POST"; c.connectTimeout = timeout; c.readTimeout = timeout; c.doOutput = true
-        c.setRequestProperty("Content-Type", "application/json"); headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
-        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        return readResponse(c)
+        var last: Throwable? = null
+        repeat(4) { attempt ->
+            try {
+                bcsPace()
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.requestMethod = "POST"; c.connectTimeout = timeout; c.readTimeout = timeout; c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json"); headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                return readResponse(c)
+            } catch (t: Throwable) {
+                last = t
+                if (!t.message.orEmpty().contains("HTTP 429")) throw t
+                Thread.sleep((400L shl attempt).coerceAtMost(5000L))
+            }
+        }
+        throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")
     }
     private fun getTextAuth(url: String, timeout: Int, headers: Map<String,String>): String {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.requestMethod = "GET"; c.connectTimeout = timeout; c.readTimeout = timeout; headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
-        return readResponse(c)
+        var last: Throwable? = null
+        repeat(4) { attempt ->
+            try {
+                bcsPace()
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.requestMethod = "GET"; c.connectTimeout = timeout; c.readTimeout = timeout; headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                return readResponse(c)
+            } catch (t: Throwable) {
+                last = t
+                if (!t.message.orEmpty().contains("HTTP 429")) throw t
+                Thread.sleep((400L shl attempt).coerceAtMost(5000L))
+            }
+        }
+        throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")
     }
     private fun readResponse(c: HttpURLConnection): String {
         val code = c.responseCode

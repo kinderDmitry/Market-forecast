@@ -93,6 +93,10 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                 reconcileLivePrice(t.symbol, candles, runCatching { repo.quote(t.symbol) }.getOrNull())
             }
             android.util.Log.d("MFP_TRACK", "id=${t.id} now=$now checkAt=${t.checkAt} candles=${candles.size} live=$livePrice")
+            if (livePrice <= 0.0) {
+                retryNeeded = true
+                continue
+            }
             val evaluation = TrackingEngine.evaluate(t, candles, livePrice, now)
             if (evaluation == null && now >= t.checkAt) {
                 retryNeeded = true
@@ -161,7 +165,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                 slots.withPermit {
                     val candles = runCatching { repo.load(symbol, "5y", "1d") }.getOrNull()
                     if (candles == null || candles.size < 30) return@withPermit null
-                    val live = runCatching { repo.quote(symbol) }.getOrNull() ?: candles.last().close
+                    val live = runCatching { repo.quote(symbol) }.getOrNull() ?: 0.0
                     val f = runCatching { AnalyticsEngine.analyze(candles, live) }.getOrNull() ?: return@withPermit null
                     FavoriteResult(symbol, f.signal, f.confidence, live)
                 }
