@@ -132,7 +132,8 @@ class ScannerForegroundService : Service() {
                             timeframes.map { currentTf ->
                                 async(Dispatchers.IO) {
                                     gate.withPermit {
-                                        val row = scanOne(repo, symbol, currentTf)
+                                        val meta = metadataBySymbol[repo.canonicalSymbol(symbol).uppercase(Locale.US)]
+                                        val row = scanOne(repo, symbol, currentTf, meta)
                                         val done = completed.incrementAndGet()
                                         val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
                                         if (done == 1L || done % 5L == 0L || done == total) {
@@ -221,7 +222,7 @@ class ScannerForegroundService : Service() {
         }
     }
 
-    private suspend fun scanOne(repo: MarketRepository, symbol: String, timeframe: String): ScanRow? {
+    private suspend fun scanOne(repo: MarketRepository, symbol: String, timeframe: String, metadata: SearchResult?): ScanRow? {
         val pair = when (timeframe) {
             "15M" -> "60d" to "15m"
             "1H" -> "2y" to "1h"
@@ -249,8 +250,9 @@ class ScannerForegroundService : Service() {
                     // identical to instrument forecasts and prevents low-quality trades.
                     val forecast = AnalyticsEngine.analyzeForScanner(merged, live)
                     if (forecast.signal == "NO TRADE") return@coroutineScope null
-                    val meta = metadataBySymbol[repo.canonicalSymbol(symbol).uppercase(Locale.US)]
-                        ?: SearchResult(repo.canonicalSymbol(symbol), repo.canonicalSymbol(symbol), "БКС", "", "БКС")
+                    // A scanner card must never fabricate an instrument name. The catalog
+                    // resolved before the scan is the source of truth for display metadata.
+                    val meta = metadata ?: return@coroutineScope null
                     val created = System.currentTimeMillis()
                     val horizon = timeframeHorizonSeconds(timeframe)
                     ScanRow(
