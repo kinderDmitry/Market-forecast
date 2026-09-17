@@ -115,6 +115,7 @@ class ScannerForegroundService : Service() {
                     if (old == null && rowKey(candidate) !in previous) notifySignal(stable)
                 }
 
+                setStatus("Инструментов к сканированию: ${symbols.size} • таймфреймов: ${timeframes.size} • задач: $total", 0f)
                 if (symbols.isEmpty()) {
                     setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
                 } else {
@@ -269,41 +270,49 @@ class ScannerForegroundService : Service() {
     }
 
     private fun resolveSymbols(repo: MarketRepository, scopeMode: String, type: String): List<String> {
+        fun matches(item: SearchResult): Boolean {
+            val t = item.type.uppercase(java.util.Locale.US)
+            val isFx = t.contains("CURRENCY") || t.contains("FOREX")
+            return when (type) {
+                "FX" -> isFx
+                "STOCKS" -> !isFx
+                else -> true
+            }
+        }
+
         if (scopeMode == "SELECTED") {
             val favorites = prefs.getStringSet("favorites", emptySet()).orEmpty().toList()
-            return when (type) {
-                "FX" -> {
-                    val fx = runCatching { repo.fxCatalog().map { it.symbol }.toSet() }.getOrDefault(emptySet())
-                    favorites.filter { it in fx || it.contains("/") || it.endsWith("=X") }
+            val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
+            val byCanonical = catalog.associateBy { repo.canonicalSymbol(it.symbol).uppercase(java.util.Locale.US) }
+            return favorites
+                .map { repo.canonicalSymbol(it) }
+                .distinct()
+                .mapNotNull { byCanonical[it.uppercase(java.util.Locale.US)]?.takeIf(::matches)?.let { meta -> repo.canonicalSymbol(meta.symbol) }
+                    ?: runCatching { repo.canonicalSymbol(it) }.getOrNull()?.takeIf { symbol ->
+                        type == "ALL" || (type == "FX" && (symbol.contains("RUB") || symbol.contains("/"))) || (type == "STOCKS" && !symbol.contains("RUB"))
+                    }
                 }
-                "STOCKS" -> favorites.filterNot { it.contains("/") || it.endsWith("=X") }
-                else -> favorites
-            }.distinct()
+                .distinct()
         }
 
         val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
-        // scannerCatalog() returns SearchResult objects. Keep the metadata until the
-        // final symbol projection; never treat SearchResult as a String.
-        // scannerCatalog(type) already applies the requested BCS instrument classes.
-        // Do not filter again by the provider's human-readable `type` field: BCS can
-        // return localized/provider-specific labels (e.g. "Акции", "Equity", etc.),
-        // which previously caused the whole market catalogue to collapse to zero
-        // symbols even though the API had returned valid instruments.
-        val catalogSymbols = catalog.map(SearchResult::symbol).filter { it.isNotBlank() }.distinct()
-        val stocks = if (type == "STOCKS" || type == "ALL") {
-            catalogSymbols.filterNot { it.contains("/") || it.endsWith("=X", ignoreCase = true) }
-        } else emptyList()
-        val fx = if (type == "FX" || type == "ALL") {
-            catalogSymbols.filter { it.endsWith("=X", ignoreCase = true) || it.contains("/") }
-        } else emptyList()
-        val resolved = (stocks + fx).filter { it.isNotBlank() }.distinct()
-        if (resolved.isNotEmpty()) return resolved
-        // BCS catalogue can temporarily be empty or expose provider-specific type names.
-        // These are only a seed universe: every item still goes through the real BCS
-        // candle + quote + Forecast engine, so no synthetic signal is created.
-        return listOf("SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON","CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT","IRAO","ENPG","USDRUB=X","EURRUB=X","CNYRUB=X")
-            .filter { symbol -> type == "ALL" || (type == "FX" && symbol.endsWith("=X")) || (type == "STOCKS" && !symbol.endsWith("=X")) }
+        // The scanner count is the real catalogue size after normalization/deduplication.
+        // Never cap it to an artificial value such as 110.
+        val resolved = catalog
+            .filter(::matches)
+            .map { repo.canonicalSymbol(it.symbol) }
+            .filter { it.isNotBlank() }
             .distinct()
+        if (resolved.isNotEmpty()) return resolved
+
+        // Real BCS identifiers only; this is a connectivity fallback, not a synthetic universe.
+        return listOf(
+            "SBER","GAZP","LKOH","ROSN","NVTK","TATN","MGNT","MOEX","YDEX","OZON",
+            "CIAN","AFLT","VTBR","MTSS","GMKN","PLZL","PHOR","RTKM","ALRS","FLOT",
+            "IRAO","ENPG","USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM"
+        ).filter { symbol ->
+            type == "ALL" || (type == "FX" && symbol in setOf("USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM")) || (type == "STOCKS" && symbol !in setOf("USD000UTSTOM","EUR_RUB__TOM","CNYRUB_TOM"))
+        }.distinct()
     }
 
     private fun loadScanRows(p: android.content.SharedPreferences): List<ScanRow> =

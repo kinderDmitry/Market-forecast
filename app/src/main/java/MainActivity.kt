@@ -140,7 +140,7 @@ fun MarketForecastApp(ctx: Context) {
     val fromNotification = launchIntent?.getBooleanExtra("mfp_from_notification", false) == true
     val launchSymbol = launchIntent?.getStringExtra("mfp_symbol")?.takeIf { it.isNotBlank() }
     val launchTarget = launchIntent?.getStringExtra("mfp_target")?.takeIf { fromNotification }
-    var selected by remember { mutableStateOf(launchSymbol ?: prefs.getString("selected", "SBER.ME") ?: "SBER.ME") }
+    var selected by remember { mutableStateOf(launchSymbol ?: prefs.getString("selected", "SBER") ?: "SBER") }
     var tf by remember { mutableStateOf(launchIntent?.getStringExtra("mfp_timeframe") ?: "1D") }
     var screen by remember { mutableStateOf(when(launchTarget){"SCANNER"->Screen.SCANNER;"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;else->Screen.HOME}) }
     var query by remember { mutableStateOf("") }

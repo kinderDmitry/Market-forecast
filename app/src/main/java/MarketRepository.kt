@@ -367,20 +367,22 @@ class MarketRepository(
     fun marketToday(mode: String, limit: Int = 20): List<MarketPick> {
         // Market Today is latency-sensitive. Each instrument is isolated so one
         // provider failure cannot abort the whole scan.
-        val seeds = listOf(
-            "SBER.ME", "GAZP.ME", "LKOH.ME", "ROSN.ME", "NVTK.ME", "TATN.ME",
-            "MGNT.ME", "MOEX.ME", "YDEX.ME", "OZON.ME", "PHOR.ME", "MTSS.ME",
-            "IRAO.ME", "GMKN.ME", "NLMK.ME", "CHMF.ME", "ALRS.ME", "SNGS.ME",
-            "RTKM.ME", "VTBR.ME", "AFLT.ME", "RUAL.ME", "USDRUB=X", "EURRUB=X",
-            "CNYRUB=X", "EURUSD=X", "GBPUSD=X", "USDJPY=X"
-        )
-        val stockCandidates = seeds.filter { it.endsWith(".ME") }
-        val fxCandidates = seeds.filter { it.endsWith("=X") }
+        val catalog = runCatching { scannerCatalog("ALL") }.getOrDefault(emptyList())
+        val normalizedCatalog = catalog
+            .map { it.copy(symbol = canonicalSymbol(it.symbol)) }
+            .distinctBy { it.symbol.uppercase(Locale.US) }
+        val stockCandidates = normalizedCatalog.filterNot {
+            it.type.contains("CURRENCY", true) || it.type.contains("FOREX", true)
+        }.map { it.symbol }
+        val fxCandidates = normalizedCatalog.filter {
+            it.type.contains("CURRENCY", true) || it.type.contains("FOREX", true)
+        }.map { it.symbol }
         val candidates = when (mode) {
             "FX" -> fxCandidates
             "STOCKS", "LIQUID", "GROWTH", "FALL" -> stockCandidates
             else -> stockCandidates + fxCandidates
-        }.distinct()
+        }.distinct().take(32)
+        val metaBySymbol = normalizedCatalog.associateBy { it.symbol.uppercase(Locale.US) }
 
         val futures = candidates.map { symbol ->
             // Keep the worker body as a single expression. Besides being simpler, this
@@ -403,11 +405,12 @@ class MarketRepository(
                             } else {
                                 0.0
                             }
-                            val type = if (symbol.endsWith("=X")) "FX" else "STOCK"
+                            val meta = metaBySymbol[symbol.uppercase(Locale.US)]
+                            val type = if (meta?.type.orEmpty().contains("CURRENCY", true) || meta?.type.orEmpty().contains("FOREX", true)) "FX" else "STOCK"
 
                             MarketPick(
                                 symbol = symbol,
-                                name = symbol.removeSuffix(".ME"),
+                                name = meta?.name?.ifBlank { symbol } ?: symbol,
                                 price = live,
                                 signal = forecast.signal,
                                 confidence = forecast.confidence,
@@ -621,6 +624,23 @@ class MarketRepository(
         "SIBN", "T", "FIXP", "HHRU", "RENI", "SOFL", "GECO", "BSPB", "ROLO"
     )
 
+    /**
+     * Canonical internal symbol normalization. Legacy Yahoo-style suffixes are
+     * accepted only at the boundary; the rest of the app uses one identifier.
+     * For legacy RUB FX aliases we use the real BCS instrument identifier.
+     */
+    fun canonicalSymbol(symbol: String): String {
+        val raw = symbol.trim().uppercase(Locale.US)
+        return when (raw) {
+            "USDRUB=X", "USD/RUB", "USDRUB" -> "USD000UTSTOM"
+            "EURRUB=X", "EUR/RUB", "EURRUB" -> "EUR_RUB__TOM"
+            "CNYRUB=X", "CNY/RUB", "CNYRUB" -> "CNYRUB_TOM"
+            "GBPRUB=X", "GBP/RUB", "GBPRUB" -> "GBP_RUB__TOM"
+            "JPYRUB=X", "JPY/RUB", "JPYRUB" -> "JPY_RUB__TOM"
+            else -> raw.removeSuffix(".ME").substringBefore("@")
+        }
+    }
+
     private fun bcsSupported(symbol: String): Boolean {
         if (!isBcsConfigured()) return false
         if (bcsFx(symbol) != null) return true
@@ -629,7 +649,7 @@ class MarketRepository(
     }
 
     private fun bcsInstrument(symbol: String): Pair<String, String> {
-        val clean = symbol.uppercase(Locale.US).removeSuffix(".ME")
+        val clean = canonicalSymbol(symbol)
         val explicitBoard = clean.substringAfter("@", "")
         val ticker = clean.substringBefore("@")
         val fx = bcsFx(symbol)
@@ -673,7 +693,7 @@ class MarketRepository(
     }
 
     private fun bcsInstrumentInfo(symbol: String): JSONObject {
-        val ticker = symbol.uppercase(Locale.US).removeSuffix(".ME").substringBefore("@")
+        val ticker = canonicalSymbol(symbol).substringBefore("@")
         val body = JSONObject().put("tickers", JSONArray().put(ticker)).toString()
         val root = JSONObject(postJson("https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-tickers", body, 12000, bcsHeaders()))
         val arr = root.optJSONArray("instruments") ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
