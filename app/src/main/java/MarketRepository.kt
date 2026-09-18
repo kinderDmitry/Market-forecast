@@ -380,12 +380,30 @@ class MarketRepository(
     /** Force-download the complete BCS directory and atomically replace the local snapshot. */
     fun refreshFullCatalog(onProgress: ((String) -> Unit)? = null): List<SearchResult> {
         check(isBcsConfigured()) { "БКС не подключён" }
+        val totalTypes = ALL_BCS_INSTRUMENT_TYPES.size
+        prefs?.edit()?.putBoolean("catalog_refresh_running", true)
+            ?.putInt("catalog_refresh_types_total", totalTypes)
+            ?.putInt("catalog_refresh_types_done", 0)
+            ?.putInt("catalog_refresh_current_page", 0)
+            ?.putInt("catalog_refresh_items", 0)
+            ?.putString("catalog_refresh_current_type", "Подготовка")
+            ?.putString("catalog_refresh_status", "Подготовка полного каталога БКС…")
+            ?.apply()
         onProgress?.invoke("Подготовка полного каталога БКС…")
         val fresh = loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE, forceRefresh = true)
         check(fresh.isNotEmpty()) { "БКС вернул пустой каталог" }
         persistFullCatalogSnapshot(fresh)
         catalogCaches[ALL_BCS_INSTRUMENT_TYPES.sorted().joinToString(",")] = System.currentTimeMillis() to fresh
         rebuildSearchIndex(fresh)
+        prefs?.edit()?.putBoolean("catalog_refresh_running", false)
+            ?.putFloat("catalog_refresh_progress", 1f)
+            ?.putInt("catalog_refresh_types_done", totalTypes)
+            ?.putInt("catalog_refresh_items", fresh.size)
+            ?.putString("catalog_refresh_current_type", "Готово")
+            ?.putString("catalog_refresh_status", "Каталог сохранён: ${fresh.size} инструментов")
+            ?.putString("catalog_refresh_error", "")
+            ?.putLong("catalog_refresh_finished_at", System.currentTimeMillis())
+            ?.apply()
         onProgress?.invoke("Каталог БКС сохранён: ${fresh.size} инструментов")
         return fresh
     }
@@ -449,19 +467,40 @@ class MarketRepository(
         // BCS exposes the catalogue by instrument type. Fetch different types in
         // parallel, while keeping pagination for each type ordered. This removes the
         // old 4-7x sequential network penalty without changing the authoritative source.
-        val futures = types.distinct().map { type ->
-            catalogPool.submit<List<SearchResult>> { loadCatalogType(type, maxPagesPerType) }
-        }
+        val distinctTypes = types.distinct()
+        val completedTypes = java.util.concurrent.atomic.AtomicInteger(0)
         val out = LinkedHashMap<String, SearchResult>()
         var failedTypes = 0
-        futures.forEach { future ->
+        val futures = distinctTypes.map { type ->
+            catalogPool.submit<List<SearchResult>> {
+                prefs?.edit()?.putString("catalog_refresh_current_type", type)
+                    ?.putInt("catalog_refresh_current_page", 0)
+                    ?.putString("catalog_refresh_status", "БКС: загрузка $type…")?.apply()
+                loadCatalogType(type, maxPagesPerType) { page, pageItems, finished ->
+                    val done = completedTypes.get()
+                    val progress = if (distinctTypes.isNotEmpty()) (done.toFloat() / distinctTypes.size.toFloat()).coerceIn(0f, .97f) else 0f
+                    prefs?.edit()?.putFloat("catalog_refresh_progress", progress)
+                        ?.putInt("catalog_refresh_types_done", done)
+                        ?.putInt("catalog_refresh_types_total", distinctTypes.size)
+                        ?.putInt("catalog_refresh_current_page", page + 1)
+                        ?.putInt("catalog_refresh_items", out.size + pageItems)
+                        ?.putString("catalog_refresh_current_type", type)
+                        ?.putString("catalog_refresh_status", "БКС: $type • страница ${page + 1}${if (finished) " • завершено" else ""}")
+                        ?.apply()
+                }
+            }
+        }
+        futures.forEachIndexed { index, future ->
             try {
                 future.get(20, TimeUnit.MINUTES).forEach { item ->
-                    out.putIfAbsent(catalogIdentity(item), item)
+                    synchronized(out) { out.putIfAbsent(catalogIdentity(item), item) }
                 }
+                val done = completedTypes.incrementAndGet()
+                prefs?.edit()?.putFloat("catalog_refresh_progress", (done.toFloat() / distinctTypes.size.toFloat()).coerceIn(0f, .97f))
+                    ?.putInt("catalog_refresh_types_done", done)
+                    ?.putString("catalog_refresh_status", "БКС: тип ${done}/${distinctTypes.size} завершён")
+                    ?.apply()
             } catch (_: Throwable) {
-                // Never publish/cache a partial BCS universe as if it were the full one.
-                // The scanner will retry the affected catalogue request on the next pass.
                 failedTypes++
             }
         }
@@ -476,7 +515,7 @@ class MarketRepository(
     private fun catalogIdentity(item: SearchResult): String =
         "${item.symbol.trim().uppercase(Locale.US)}@${item.classCode.trim().uppercase(Locale.US)}"
 
-    private fun loadCatalogType(type: String, maxPagesPerType: Int): List<SearchResult> {
+    private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()
         var page = 0
         var consecutiveFailures = 0
@@ -514,7 +553,7 @@ class MarketRepository(
                 continue
             }
             consecutiveFailures = 0
-            if (arr.length() == 0) break
+            if (arr.length() == 0) { onPage?.invoke(page, 0, true); break }
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val ticker = o.optString("ticker").trim()
@@ -530,6 +569,7 @@ class MarketRepository(
                 val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
                 out.putIfAbsent(catalogIdentity(item), item)
             }
+            onPage?.invoke(page, arr.length(), arr.length() < 100)
             // BCS documents that a full page requires requesting page + 1.
             if (arr.length() < 100) break
             page++

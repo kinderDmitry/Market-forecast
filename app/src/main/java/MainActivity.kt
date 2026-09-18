@@ -1528,56 +1528,101 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     var token by remember { mutableStateOf(prefs.getString("bcs_refresh_token", "") ?: "") }
     var visible by remember { mutableStateOf(false) }
     var saved by remember { mutableStateOf(false) }
-    var refreshing by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf(prefs.getBoolean("catalog_refresh_running", false)) }
+    var progress by remember { mutableFloatStateOf(prefs.getFloat("catalog_refresh_progress", 0f)) }
+    var typesDone by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_done", 0)) }
+    var typesTotal by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_total", 13)) }
+    var currentType by remember { mutableStateOf(prefs.getString("catalog_refresh_current_type", "") ?: "") }
+    var currentPage by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_current_page", 0)) }
+    var items by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_items", 0)) }
+    var status by remember { mutableStateOf(prefs.getString("catalog_refresh_status", "") ?: "") }
+    var error by remember { mutableStateOf(prefs.getString("catalog_refresh_error", "") ?: "") }
     var cachedCount by remember { mutableIntStateOf(0) }
     var cachedAt by remember { mutableLongStateOf(0L) }
-    val scope = rememberCoroutineScope()
-    val repo = remember(token) { MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx) }
+
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
+            val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx)
             cachedCount = repo.fullCatalogCached().size
             cachedAt = repo.fullCatalogUpdatedAt()
         }
-    }
-    SettingGroup(if (ru) "БКС — источник рыночных данных" else "BCS — market data source") {
-        Text(if (ru) "Каталог инструментов скачивается целиком один раз, сохраняется на телефоне и затем используется одновременно для поиска и сканера. Котировки и свечи для анализа остаются актуальными и запрашиваются отдельно." else "The full instrument directory is downloaded once, stored on the phone and then reused by search and scanner. Live quotes and candles are fetched separately for analysis.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        OutlinedTextField(value = token, onValueChange = { token = it; saved = false }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), singleLine = true, label = { Text(if (ru) "Токен обновления БКС (только чтение)" else "BCS read-only refresh token") }, visualTransformation = if (visible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(), trailingIcon = { TextButton(onClick = { visible = !visible }) { Text(if (visible) "Скрыть" else "Показать", fontSize = 8.sp) } })
-        Button(onClick = { prefs.edit().putString("bcs_refresh_token", token.trim()).apply(); saved = true; status = if (ru) "Токен сохранён" else "Token saved" }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent), shape = RoundedCornerShape(13.dp)) { Text(if (ru) "Сохранить токен БКС" else "Save BCS token", fontWeight = FontWeight.Black) }
-        Button(
-            enabled = token.isNotBlank() && !refreshing,
-            onClick = {
-                prefs.edit().putString("bcs_refresh_token", token.trim()).apply()
-                refreshing = true
-                status = if (ru) "Загрузка полного каталога БКС…" else "Downloading full BCS directory…"
-                scope.launch {
-                    val result = withContext(Dispatchers.IO) {
-                        runCatching { repo.refreshFullCatalog { status = it } }
-                    }
-                    result.onSuccess { items ->
-                        cachedCount = items.size
-                        cachedAt = repo.fullCatalogUpdatedAt()
-                        status = if (ru) "Готово: сохранено ${items.size} инструментов" else "Done: ${items.size} instruments saved"
-                    }.onFailure { e ->
-                        status = if (ru) "Ошибка обновления каталога: ${e.message.orEmpty().take(140)}" else "Catalog update error: ${e.message.orEmpty().take(140)}"
-                    }
-                    refreshing = false
+        while (true) {
+            running = prefs.getBoolean("catalog_refresh_running", false)
+            progress = prefs.getFloat("catalog_refresh_progress", 0f).coerceIn(0f, 1f)
+            typesDone = prefs.getInt("catalog_refresh_types_done", 0)
+            typesTotal = prefs.getInt("catalog_refresh_types_total", 13).coerceAtLeast(1)
+            currentType = prefs.getString("catalog_refresh_current_type", "") ?: ""
+            currentPage = prefs.getInt("catalog_refresh_current_page", 0)
+            items = prefs.getInt("catalog_refresh_items", 0)
+            status = prefs.getString("catalog_refresh_status", "") ?: ""
+            error = prefs.getString("catalog_refresh_error", "") ?: ""
+            if (!running) {
+                withContext(Dispatchers.IO) {
+                    val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx)
+                    cachedCount = repo.fullCatalogCached().size
+                    cachedAt = repo.fullCatalogUpdatedAt()
                 }
-            },
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            shape = RoundedCornerShape(13.dp)
-        ) {
-            Icon(if (refreshing) Icons.Default.Sync else Icons.Default.CloudDownload, null)
-            Spacer(Modifier.width(6.dp))
-            Text(if (refreshing) (if (ru) "Каталог загружается…" else "Catalog downloading…") else (if (ru) "Обновить каталог инструментов" else "Refresh instrument directory"), fontWeight = FontWeight.Black)
+            }
+            kotlinx.coroutines.delay(700)
         }
+    }
+
+    SettingGroup(if (ru) "БКС — источник рыночных данных" else "BCS — market data source") {
+        Text(
+            if (ru) "Полный каталог загружается отдельным фоновым процессом. Переход в другой раздел не прерывает загрузку. После завершения один и тот же кэш используется поиском и сканером; котировки и свечи остаются живыми." else "The full directory downloads in an independent background process. Leaving Settings does not cancel it. After completion the same cache is used by search and scanner; quotes and candles remain live.",
+            fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        OutlinedTextField(
+            value = token,
+            onValueChange = { token = it; saved = false },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            singleLine = true,
+            label = { Text(if (ru) "Токен обновления БКС (только чтение)" else "BCS read-only refresh token") },
+            visualTransformation = if (visible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = { TextButton(onClick = { visible = !visible }) { Text(if (visible) "Скрыть" else "Показать", fontSize = 8.sp) } }
+        )
+        Button(
+            onClick = { prefs.edit().putString("bcs_refresh_token", token.trim()).apply(); saved = true },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Accent),
+            shape = RoundedCornerShape(13.dp)
+        ) { Text(if (saved) (if (ru) "Токен сохранён" else "Token saved") else (if (ru) "Сохранить токен БКС" else "Save BCS token"), fontWeight = FontWeight.Black) }
+
+        if (running) {
+            val percent = (progress * 100f).roundToInt().coerceIn(0, 99)
+            val leftTypes = (typesTotal - typesDone).coerceAtLeast(0)
+            Text(if (ru) "Загрузка каталога • $percent%" else "Directory download • $percent%", fontWeight = FontWeight.Black, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
+            LinearProgressIndicator(progress = { progress.coerceIn(0f, 0.99f) }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
+            Text(if (ru) "Типы: $typesDone из $typesTotal • осталось типов: $leftTypes" else "Types: $typesDone of $typesTotal • types remaining: $leftTypes", fontSize = 9.sp, color = Accent, modifier = Modifier.padding(top = 6.dp))
+            Text(if (ru) "Текущий тип: ${currentType.ifBlank { "подготовка" }} • страницы: $currentPage • инструментов: $items" else "Current type: ${currentType.ifBlank { "preparing" }} • pages: $currentPage • instruments: $items", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
+            Text(if (ru) "Точное число оставшихся страниц БКС не публикует: конец типа определяется короткой страницей. Поэтому прогресс считается по завершённым типам, без выдуманных процентов." else "BCS does not publish the remaining page count: the end of a type is detected by a short page. Progress is therefore based on completed types, without fabricated percentages.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 5.dp))
+            OutlinedButton(onClick = { ctx.startService(Intent(ctx, CatalogRefreshService::class.java).setAction(CatalogRefreshService.ACTION_STOP)) }, modifier = Modifier.fillMaxWidth().padding(top = 7.dp)) {
+                Icon(Icons.Default.Stop, null); Spacer(Modifier.width(6.dp)); Text(if (ru) "Остановить загрузку" else "Stop download")
+            }
+        } else {
+            Button(
+                enabled = token.isNotBlank(),
+                onClick = {
+                    prefs.edit().putString("bcs_refresh_token", token.trim()).apply()
+                    error = ""
+                    running = true
+                    val intent = Intent(ctx, CatalogRefreshService::class.java).setAction(CatalogRefreshService.ACTION_START)
+                    androidx.core.content.ContextCompat.startForegroundService(ctx, intent)
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp), shape = RoundedCornerShape(13.dp)
+            ) {
+                Icon(Icons.Default.CloudDownload, null); Spacer(Modifier.width(6.dp)); Text(if (ru) "Обновить каталог инструментов" else "Refresh instrument directory", fontWeight = FontWeight.Black)
+            }
+        }
+
+        if (error.isNotBlank()) Text(if (ru) "Ошибка: $error" else "Error: $error", fontSize = 8.sp, color = Negative, modifier = Modifier.padding(top = 6.dp))
         if (cachedCount > 0) {
             val date = java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(java.util.Date(cachedAt))
-            Text(if (ru) "Кэш: $cachedCount инструментов • обновлён $date" else "Cache: $cachedCount instruments • updated $date", fontSize = 8.sp, color = Positive, modifier = Modifier.padding(top = 5.dp))
+            Text(if (ru) "Кэш: $cachedCount инструментов • обновлён $date" else "Cache: $cachedCount instruments • updated $date", fontSize = 8.sp, color = Positive, modifier = Modifier.padding(top = 7.dp))
         } else {
-            Text(if (ru) "Кэш каталога отсутствует. Нажми «Обновить каталог инструментов»." else "No directory cache. Tap “Refresh instrument directory”.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 5.dp))
+            Text(if (ru) "Кэш каталога отсутствует. Нажмите «Обновить каталог инструментов»." else "No directory cache. Tap “Refresh instrument directory”.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 7.dp))
         }
-        if (status.isNotBlank()) Text(status, fontSize = 8.sp, color = if (status.contains("Ошибка") || status.contains("error", true)) Negative else Accent, modifier = Modifier.padding(top = 5.dp))
+        if (status.isNotBlank() && !running) Text(status, fontSize = 8.sp, color = Accent, modifier = Modifier.padding(top = 5.dp))
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(9.dp).clip(CircleShape).background(if (token.isNotBlank()) Positive else Negative))
             Spacer(Modifier.width(7.dp))
@@ -1586,7 +1631,6 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
         Text(if (ru) "Нужен refresh-токен БКС с правами «Только для чтения»." else "A BCS read-only refresh token is required.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 6.dp))
     }
 }
-
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=10.sp);Switch(checked = value, onCheckedChange = on)}}
 
 @Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SCANNER to Icons.Default.Radar,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";Screen.SCANNER->"Сканер";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";Screen.SCANNER->"Scanner";else->"Settings"},fontSize=7.sp)})}}}

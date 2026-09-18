@@ -87,6 +87,12 @@ class ScannerForegroundService : Service() {
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
+                // A full catalogue refresh owns the BCS reference-data channel. Do not
+                // compete with it and do not scan against a half-updated directory.
+                while (prefs.getBoolean("catalog_refresh_running", false) && currentCoroutineContext().isActive && running.get()) {
+                    setStatus("⏳ БКС: обновляется каталог • сканер ждёт завершения", 0f)
+                    delay(1500L)
+                }
                 val instruments: List<SearchResult>
                 try {
                     instruments = withContext(Dispatchers.IO) { resolveInstruments(repo, scopeMode, instrumentType) }
