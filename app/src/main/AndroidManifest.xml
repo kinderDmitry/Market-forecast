@@ -13,6 +13,7 @@
         android:allowBackup="true"
         android:supportsRtl="true">
         <service android:name=".ScannerForegroundService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync"/>
+        <service android:name=".CatalogRefreshService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync"/>
         <receiver android:name=".BootReceiver" android:enabled="true" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
