@@ -103,7 +103,7 @@ class MarketRepository(
                 arr.put(JSONObject().put("s", item.symbol).put("n", item.name)
                     .put("e", item.exchange).put("t", item.type).put("c", item.classCode))
             }
-            prefs.edit().putString(LOCAL_INDEX_KEY, arr.toString()).apply()
+            prefs?.edit()?.putString(LOCAL_INDEX_KEY, arr.toString())?.apply()
         }
     }
 
@@ -143,7 +143,7 @@ class MarketRepository(
         }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }
             .thenBy { it.second.name.length }
             .thenBy { it.second.name.lowercase(Locale.ROOT) })
-            .map { it.second }.distinctBy { it.symbol.uppercase(Locale.US) }.take(limit)
+            .map { it.second }.distinctBy { it.symbol.uppercase(Locale.US) }.take(limit).toList()
     }
 
     private fun normalizeSearchText(value: String): String =
