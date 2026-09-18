@@ -11,8 +11,8 @@ test -f app/src/main/java/ScannerForegroundService.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 133' app/build.gradle.kts
-grep -q 'versionName = "4.8.94"' app/build.gradle.kts
+grep -q 'versionCode = 134' app/build.gradle.kts
+grep -q 'versionName = "4.8.95"' app/build.gradle.kts
 
 echo "[3/6] Scanner/forecast consistency"
 grep -q 'fun analyzeForScanner' app/src/main/java/AnalyticsEngine.kt
