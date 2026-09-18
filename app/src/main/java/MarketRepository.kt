@@ -373,10 +373,20 @@ class MarketRepository(
             catalogPool.submit<List<SearchResult>> { loadCatalogType(type, maxPagesPerType) }
         }
         val out = LinkedHashMap<String, SearchResult>()
+        var failedTypes = 0
         futures.forEach { future ->
-            runCatching { future.get(10, TimeUnit.MINUTES) }.getOrDefault(emptyList()).forEach { item ->
-                out.putIfAbsent(catalogIdentity(item), item)
+            try {
+                future.get(20, TimeUnit.MINUTES).forEach { item ->
+                    out.putIfAbsent(catalogIdentity(item), item)
+                }
+            } catch (_: Throwable) {
+                // Never publish/cache a partial BCS universe as if it were the full one.
+                // The scanner will retry the affected catalogue request on the next pass.
+                failedTypes++
             }
+        }
+        if (failedTypes > 0) {
+            throw IllegalStateException("БКС: каталог неполный, не загружено типов: $failedTypes")
         }
         val result = out.values.toList()
         if (result.isNotEmpty()) catalogCaches[cacheKey] = System.currentTimeMillis() to result
@@ -393,26 +403,34 @@ class MarketRepository(
         while (maxPagesPerType == Int.MAX_VALUE || page < maxPagesPerType) {
             val arr = runCatching {
                 var last: Throwable? = null
-                for (attempt in 0..3) {
+                for (attempt in 0..7) {
                     try {
                         val root = JSONObject(getTextAuth(
                             "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
-                            15000, bcsHeaders()
+                            20000, bcsHeaders()
                         ))
                         return@runCatching root.optJSONArray("instruments") ?: JSONArray()
                     } catch (t: Throwable) {
                         last = t
-                        if (!t.message.orEmpty().contains("429")) break
-                        Thread.sleep((350L shl attempt).coerceAtMost(4000L))
+                        val message = t.message.orEmpty()
+                        val retryable = message.contains("429") || message.contains("408") ||
+                            message.contains("500") || message.contains("502") ||
+                            message.contains("503") || message.contains("504") ||
+                            message.contains("timeout", true) || message.contains("timed out", true)
+                        if (!retryable) break
+                        Thread.sleep((500L shl attempt.coerceAtMost(3)).coerceAtMost(6000L))
                     }
                 }
                 throw last ?: IllegalStateException("БКС: пустой ответ каталога")
             }.getOrNull()
 
             if (arr == null) {
+                // Do not advance the page after a transient error. Advancing would
+                // silently skip a whole page and produce a fake partial universe.
                 consecutiveFailures++
-                if (consecutiveFailures >= 2) break
-                page++
+                if (consecutiveFailures >= 3) {
+                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type")
+                }
                 continue
             }
             consecutiveFailures = 0

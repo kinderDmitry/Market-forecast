@@ -86,8 +86,14 @@ class ScannerForegroundService : Service() {
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
-                val instruments = withContext(Dispatchers.IO) {
-                    resolveInstruments(repo, scopeMode, instrumentType)
+                val instruments: List<SearchResult>
+                try {
+                    instruments = withContext(Dispatchers.IO) { resolveInstruments(repo, scopeMode, instrumentType) }
+                } catch (error: Throwable) {
+                    val message = error.message.orEmpty().take(180)
+                    setStatus("⏳ БКС: загрузка полного каталога • $message", 0f)
+                    delay(3000L)
+                    continue
                 }
                 // Preserve ticker + classCode as the scanner identity. A ticker can
                 // legitimately exist on more than one BCS board; collapsing by ticker
@@ -122,7 +128,7 @@ class ScannerForegroundService : Service() {
                     if (old == null && rowKey(candidate) !in previous) notifySignal(stable)
                 }
 
-                setStatus("Инструментов к сканированию: ${symbols.size} • таймфреймов: ${timeframes.size} • задач: $total", 0f)
+                setStatus("БКС: инструментов ${symbols.size} • с board-id ${scanItems.count { it.classCode.isNotBlank() }} • таймфреймов ${timeframes.size} • задач $total", 0f)
                 if (symbols.isEmpty()) {
                     setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
                 } else {
@@ -240,7 +246,7 @@ class ScannerForegroundService : Service() {
             else -> "2y" to "1d"
         }
         return runCatching {
-            withTimeout(12_000L) {
+            withTimeout(60_000L) {
                 // Candle history and the canonical live quote are independent BCS
                 // requests. Resolve the exact BCS ticker + classCode from metadata so
                 // an instrument such as CIAN/CNRU cannot silently jump to another board.
@@ -326,25 +332,18 @@ class ScannerForegroundService : Service() {
                 .distinctBy { scanIdentity(it) }
         }
 
-        val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
-        // Keep the authoritative BCS ticker + display name together. Do not
-        // canonicalize a real BCS ticker into a Yahoo-style or synthetic symbol.
+        val catalog = repo.scannerCatalog(type)
+        if (catalog.isEmpty()) throw IllegalStateException("БКС: полный каталог пуст")
+        val distinctBoards = catalog.count { it.classCode.isNotBlank() }
+        // Full scanner mode must never silently downgrade to a partial catalogue.
+        // Keep every real BCS ticker + classCode pair; the same ticker may exist on
+        // multiple boards and collapsing by ticker can drop instruments.
         val resolved = catalog
             .filter(::matches)
             .filter { it.symbol.isNotBlank() }
-            .distinctBy { it.symbol.uppercase(Locale.US) }
+            .distinctBy { scanIdentity(it) }
         if (resolved.isNotEmpty()) return resolved
-
-        // Connectivity fallback only; all identifiers are real BCS tickers.
-        return listOf(
-            SearchResult("SBER", "Сбербанк", "БКС", "STOCK", "БКС"),
-            SearchResult("GAZP", "Газпром", "БКС", "STOCK", "БКС"),
-            SearchResult("LKOH", "ЛУКОЙЛ", "БКС", "STOCK", "БКС"),
-            SearchResult("ROSN", "Роснефть", "БКС", "STOCK", "БКС"),
-            SearchResult("USD000UTSTOM", "Доллар США", "БКС", "CURRENCY", "БКС"),
-            SearchResult("EUR_RUB__TOM", "Евро", "БКС", "CURRENCY", "БКС"),
-            SearchResult("CNYRUB_TOM", "Юань", "БКС", "CURRENCY", "БКС")
-        ).filter(::matches)
+        throw IllegalStateException("БКС: каталог не содержит пригодных инструментов (получено ${catalog.size}, board-id: $distinctBoards)")
     }
 
     private fun loadScanRows(p: android.content.SharedPreferences): List<ScanRow> =
