@@ -82,7 +82,8 @@ class ScannerForegroundService : Service() {
         try {
             val repo = MarketRepository(
                 bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null },
-                prefs = prefs
+                prefs = prefs,
+                context = this@ScannerForegroundService
             )
 
             while (currentCoroutineContext().isActive && running.get()) {

@@ -123,7 +123,7 @@ fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
     val bcsToken = prefs.getString("bcs_refresh_token", "") ?: ""
-    val repo = remember(bcsToken) { MarketRepository(bcsRefreshToken = bcsToken.ifBlank { null }, prefs = prefs) }
+    val repo = remember(bcsToken) { MarketRepository(bcsRefreshToken = bcsToken.ifBlank { null }, prefs = prefs, context = ctx) }
     var ru by remember { mutableStateOf(prefs.getBoolean("ru", true)) }
     var interval by remember { mutableIntStateOf(prefs.getInt("notify_interval", 15).coerceAtLeast(15)) }
     var notifications by remember { mutableStateOf(prefs.getBoolean("notifications_enabled", false)) }
@@ -543,7 +543,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick, { row -> pendingScanTrack = row.result.symbol to row.timeframe; load(row.result.symbol, row.timeframe) })
-                        Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow)
+                        Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
@@ -854,7 +854,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
         tfForecasts = withContext(Dispatchers.IO) {
             tfs.mapNotNull { timeframe ->
                 val pair = timeframePair(timeframe)
-                val c = runCatching { MarketRepository(bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null }, prefs = prefs).load(state.symbol, pair.first, pair.second) }.getOrNull()
+                val c = runCatching { MarketRepository(bcsRefreshToken = prefs.getString("bcs_refresh_token", "")?.ifBlank { null }, prefs = prefs, context = ctx).load(state.symbol, pair.first, pair.second) }.getOrNull()
                 val live = currentLive ?: c?.lastOrNull()?.close
                 val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, timeframe, System.currentTimeMillis(), state.symbol) else c.orEmpty()
                 val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live) }.getOrNull() else null
@@ -1501,7 +1501,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun Stats(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean) { val done=history.filter{it.directionOk!=null};val wins=done.count{it.directionOk==true};val longs=history.count{it.signal.contains("LONG")};val shorts=history.count{it.signal.contains("SHORT")};val avg=if(history.isEmpty())0 else history.map{it.confidence}.average().roundToInt();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard(if(ru) "ПРОГНОЗЫ" else "FORECASTS",history.size.toString(),Accent,Modifier.weight(1f));MetricCard(if(ru) "УСПЕШНЫЕ" else "WINS",wins.toString(),Positive,Modifier.weight(1f));MetricCard(if(ru) "ТОЧНОСТЬ" else "ACCURACY",if(done.isEmpty())"—" else "${wins*100/done.size}%",Warning,Modifier.weight(1f))}};item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard("LONG",longs.toString(),Positive,Modifier.weight(1f));MetricCard("SHORT",shorts.toString(),Negative,Modifier.weight(1f));MetricCard(if(ru) "СРЕДНЯЯ УВЕРЕННОСТЬ" else "AVG CONF","$avg%",Blue,Modifier.weight(1f))}};item{GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Активные отслеживания" else "Active monitoring",fontWeight=FontWeight.Black);Text(tracked.count{it.result=="PENDING"}.toString(),fontSize=28.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=5.dp));Text(if(ru)"Уникальность обеспечивается парой инструмент + таймфрейм." else "Uniqueness is enforced by instrument + timeframe.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
 }
 
-@Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit){
+@Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit,repo:MarketRepository){
     val ctx = LocalContext.current
     var alertSignal by remember{mutableStateOf(prefs.getBoolean("alert_signal",true))}; var alertNews by remember{mutableStateOf(prefs.getBoolean("alert_news",true))}; var alertDividends by remember{mutableStateOf(prefs.getBoolean("alert_dividends",true))}; var alertResult by remember{mutableStateOf(prefs.getBoolean("alert_result",true))}; var alertTp1 by remember{mutableStateOf(prefs.getBoolean("alert_tp1",true))}; var alertTp2 by remember{mutableStateOf(prefs.getBoolean("alert_tp2",true))}; var alertTp3 by remember{mutableStateOf(prefs.getBoolean("alert_tp3",true))}; var alertSl by remember{mutableStateOf(prefs.getBoolean("alert_sl",true))}; var alertPrice by remember{mutableStateOf(prefs.getBoolean("alert_price",false))}
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
@@ -1523,20 +1523,66 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     }
 }
 @Composable private fun BcsSettingsCard(ru: Boolean, prefs: android.content.SharedPreferences) {
+    val ctx = LocalContext.current
     var token by remember { mutableStateOf(prefs.getString("bcs_refresh_token", "") ?: "") }
     var visible by remember { mutableStateOf(false) }
     var saved by remember { mutableStateOf(false) }
+    var refreshing by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+    var cachedCount by remember { mutableIntStateOf(0) }
+    var cachedAt by remember { mutableLongStateOf(0L) }
+    val scope = rememberCoroutineScope()
+    val repo = remember(token) { MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx) }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            cachedCount = repo.fullCatalogCached().size
+            cachedAt = repo.fullCatalogUpdatedAt()
+        }
+    }
     SettingGroup(if (ru) "БКС — источник рыночных данных" else "BCS — market data source") {
-        Text(if (ru) "Если указан токен обновления БКС, приложение использует БКС как единственный источник котировок и свечей для поддерживаемых инструментов. Все таймфреймы и прогноз используют одну и ту же актуальную цену." else "When a BCS refresh token is configured, BCS is the only source for supported quotes and candles. All timeframes and forecasts use the same canonical live price.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(if (ru) "Каталог инструментов скачивается целиком один раз, сохраняется на телефоне и затем используется одновременно для поиска и сканера. Котировки и свечи для анализа остаются актуальными и запрашиваются отдельно." else "The full instrument directory is downloaded once, stored on the phone and then reused by search and scanner. Live quotes and candles are fetched separately for analysis.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedTextField(value = token, onValueChange = { token = it; saved = false }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), singleLine = true, label = { Text(if (ru) "Токен обновления БКС (только чтение)" else "BCS read-only refresh token") }, visualTransformation = if (visible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(), trailingIcon = { TextButton(onClick = { visible = !visible }) { Text(if (visible) "Скрыть" else "Показать", fontSize = 8.sp) } })
-        Button(onClick = { prefs.edit().putString("bcs_refresh_token", token.trim()).apply(); saved = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent), shape = RoundedCornerShape(13.dp)) { Text(if (ru) "Сохранить токен БКС" else "Save BCS token", fontWeight = FontWeight.Black) }
-        if (saved) Text(if (ru) "Сохранено. Перезапусти экран/приложение для полного обновления источника." else "Saved. Restart the screen/app to fully refresh the source.", fontSize = 8.sp, color = Positive, modifier = Modifier.padding(top = 5.dp))
+        Button(onClick = { prefs.edit().putString("bcs_refresh_token", token.trim()).apply(); saved = true; status = if (ru) "Токен сохранён" else "Token saved" }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent), shape = RoundedCornerShape(13.dp)) { Text(if (ru) "Сохранить токен БКС" else "Save BCS token", fontWeight = FontWeight.Black) }
+        Button(
+            enabled = token.isNotBlank() && !refreshing,
+            onClick = {
+                prefs.edit().putString("bcs_refresh_token", token.trim()).apply()
+                refreshing = true
+                status = if (ru) "Загрузка полного каталога БКС…" else "Downloading full BCS directory…"
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { repo.refreshFullCatalog { status = it } }
+                    }
+                    result.onSuccess { items ->
+                        cachedCount = items.size
+                        cachedAt = repo.fullCatalogUpdatedAt()
+                        status = if (ru) "Готово: сохранено ${items.size} инструментов" else "Done: ${items.size} instruments saved"
+                    }.onFailure { e ->
+                        status = if (ru) "Ошибка обновления каталога: ${e.message.orEmpty().take(140)}" else "Catalog update error: ${e.message.orEmpty().take(140)}"
+                    }
+                    refreshing = false
+                }
+            },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            shape = RoundedCornerShape(13.dp)
+        ) {
+            Icon(if (refreshing) Icons.Default.Sync else Icons.Default.CloudDownload, null)
+            Spacer(Modifier.width(6.dp))
+            Text(if (refreshing) (if (ru) "Каталог загружается…" else "Catalog downloading…") else (if (ru) "Обновить каталог инструментов" else "Refresh instrument directory"), fontWeight = FontWeight.Black)
+        }
+        if (cachedCount > 0) {
+            val date = java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(java.util.Date(cachedAt))
+            Text(if (ru) "Кэш: $cachedCount инструментов • обновлён $date" else "Cache: $cachedCount instruments • updated $date", fontSize = 8.sp, color = Positive, modifier = Modifier.padding(top = 5.dp))
+        } else {
+            Text(if (ru) "Кэш каталога отсутствует. Нажми «Обновить каталог инструментов»." else "No directory cache. Tap “Refresh instrument directory”.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 5.dp))
+        }
+        if (status.isNotBlank()) Text(status, fontSize = 8.sp, color = if (status.contains("Ошибка") || status.contains("error", true)) Negative else Accent, modifier = Modifier.padding(top = 5.dp))
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(9.dp).clip(CircleShape).background(if (token.isNotBlank()) Positive else Negative))
             Spacer(Modifier.width(7.dp))
-            Text(if (token.isNotBlank()) if (ru) "БКС настроен • прогнозы используют только БКС" else "BCS configured • forecasts use BCS only" else if (ru) "БКС не подключён • прогнозы не запускаются через другой источник" else "BCS not connected • forecasts will not fall back to another source", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = if (token.isNotBlank()) Positive else Negative)
+            Text(if (token.isNotBlank()) if (ru) "БКС настроен • каталог и рыночные данные используют БКС" else "BCS configured • directory and market data use BCS" else if (ru) "БКС не подключён" else "BCS not connected", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = if (token.isNotBlank()) Positive else Negative)
         }
-        Text(if (ru) "Важно: нужен refresh-токен с правами «Только для чтения», а не торговый токен. Его можно выпустить бесплатно в веб-версии БКС Мир инвестиций → Профиль → Счета и тарифы → нужный счёт → Токены API." else "Important: use a read-only refresh token, not a trading token. It can be issued free in BCS web version → Profile → Accounts and tariffs → account → API tokens.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 6.dp))
+        Text(if (ru) "Нужен refresh-токен БКС с правами «Только для чтения»." else "A BCS read-only refresh token is required.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 6.dp))
     }
 }
 

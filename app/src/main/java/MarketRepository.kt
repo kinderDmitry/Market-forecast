@@ -9,6 +9,7 @@ import java.util.zip.GZIPInputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.regex.Pattern
+import android.content.Context
 import android.util.Xml
 import org.xmlpull.v1.XmlPullParser
 import java.io.StringReader
@@ -29,7 +30,8 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
 class MarketRepository(
     private val alphaVantageKey: String? = null,
     private val bcsRefreshToken: String? = null,
-    private val prefs: android.content.SharedPreferences? = null
+    private val prefs: android.content.SharedPreferences? = null,
+    private val context: Context? = null
 ) {
     companion object {
         const val BCS_DIVIDEND_CALENDAR_URL = "https://bcs-express.ru/dividednyj-kalendar"
@@ -43,6 +45,8 @@ class MarketRepository(
         private const val SEARCH_CACHE_MS = 60_000L
         private const val LOCAL_INDEX_VERSION = 1
         private const val LOCAL_INDEX_KEY = "mfp_search_index_v1"
+        private const val FULL_CATALOG_META_KEY = "mfp_full_catalog_meta_v1"
+        private const val FULL_CATALOG_FILE = "bcs_full_catalog_v1.json"
         private val ALL_BCS_INSTRUMENT_TYPES = listOf(
             "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY",
             "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS",
@@ -324,11 +328,77 @@ class MarketRepository(
         return finalResults
     }
 
+    /**
+     * Persistent authoritative BCS directory. The instrument directory is configuration data,
+     * not live market data, so it is downloaded explicitly and then reused by search/scanner.
+     * Quotes/candles are still fetched live when a signal is calculated.
+     */
+    private fun fullCatalogFile(): java.io.File? = context?.filesDir?.resolve(FULL_CATALOG_FILE)
+
+    private fun readFullCatalogSnapshot(): List<SearchResult> {
+        val file = fullCatalogFile() ?: return emptyList()
+        if (!file.exists() || file.length() <= 0L) return emptyList()
+        return runCatching {
+            val root = JSONArray(file.readText(Charsets.UTF_8))
+            val out = ArrayList<SearchResult>(root.length())
+            for (i in 0 until root.length()) {
+                val o = root.optJSONObject(i) ?: continue
+                val symbol = o.optString("s").trim()
+                if (symbol.isBlank()) continue
+                out += SearchResult(
+                    symbol, o.optString("n", symbol), o.optString("e", "БКС"),
+                    o.optString("t", "STOCK"), "БКС", o.optString("c", "")
+                )
+            }
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    private fun persistFullCatalogSnapshot(items: List<SearchResult>) {
+        val file = fullCatalogFile() ?: return
+        runCatching {
+            val arr = JSONArray()
+            items.forEach { item ->
+                arr.put(JSONObject().put("s", item.symbol).put("n", item.name)
+                    .put("e", item.exchange).put("t", item.type).put("c", item.classCode))
+            }
+            val tmp = java.io.File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(arr.toString(), Charsets.UTF_8)
+            if (!tmp.renameTo(file)) {
+                file.delete()
+                if (!tmp.renameTo(file)) throw IllegalStateException("Не удалось сохранить кэш каталога БКС")
+            }
+            if (!file.exists() || file.length() <= 0L) throw IllegalStateException("Кэш каталога БКС не создан")
+            prefs?.edit()?.putLong(FULL_CATALOG_META_KEY, System.currentTimeMillis())?.apply()
+        }.getOrElse { throw IllegalStateException("Не удалось сохранить кэш каталога БКС", it) }
+    }
+
+    fun fullCatalogCached(): List<SearchResult> = readFullCatalogSnapshot()
+
+    fun fullCatalogUpdatedAt(): Long = prefs?.getLong(FULL_CATALOG_META_KEY, 0L) ?: 0L
+
+    /** Force-download the complete BCS directory and atomically replace the local snapshot. */
+    fun refreshFullCatalog(onProgress: ((String) -> Unit)? = null): List<SearchResult> {
+        check(isBcsConfigured()) { "БКС не подключён" }
+        onProgress?.invoke("Подготовка полного каталога БКС…")
+        val fresh = loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE, forceRefresh = true)
+        check(fresh.isNotEmpty()) { "БКС вернул пустой каталог" }
+        persistFullCatalogSnapshot(fresh)
+        catalogCaches[ALL_BCS_INSTRUMENT_TYPES.sorted().joinToString(",")] = System.currentTimeMillis() to fresh
+        rebuildSearchIndex(fresh)
+        onProgress?.invoke("Каталог БКС сохранён: ${fresh.size} инструментов")
+        return fresh
+    }
+
     /** Search-oriented catalogue: only tradable equity/FX classes needed by the app. */
-    private fun searchCatalog(): List<SearchResult> = loadCatalog(
-        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY"),
-        maxPagesPerType = 40
-    )
+    private fun searchCatalog(): List<SearchResult> {
+        val cached = readFullCatalogSnapshot()
+        if (cached.isNotEmpty()) return cached
+        return loadCatalog(
+            listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY"),
+            maxPagesPerType = 40
+        )
+    }
 
     /** Warm the searchable BCS directory without blocking the UI. */
     fun warmSearchIndex() {
@@ -348,23 +418,33 @@ class MarketRepository(
      * the remaining universe.
      */
     fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
-        "FX" -> loadCatalog(listOf("CURRENCY"), Int.MAX_VALUE)
-        "STOCKS" -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), Int.MAX_VALUE)
-        else -> loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE)
+        "ALL" -> readFullCatalogSnapshot().ifEmpty { loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE) }
+        "FX" -> {
+            val full = readFullCatalogSnapshot()
+            if (full.isNotEmpty()) full.filter { it.type.contains("CURRENCY", true) }
+            else loadCatalog(listOf("CURRENCY"), Int.MAX_VALUE)
+        }
+        "STOCKS" -> {
+            val full = readFullCatalogSnapshot()
+            if (full.isNotEmpty()) full.filter { it.type.contains("STOCK", true) || it.type.contains("ETF", true) || it.type.contains("FUND", true) || it.type.contains("DEPOSITARY", true) }
+            else loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), Int.MAX_VALUE)
+        }
+        else -> readFullCatalogSnapshot().ifEmpty { loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE) }
     }
 
     /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
-    fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> = loadCatalog(
-        ALL_BCS_INSTRUMENT_TYPES,
-        Int.MAX_VALUE
-    ).let { if (limit == Int.MAX_VALUE) it else it.take(limit) }
+    fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> {
+        val full = readFullCatalogSnapshot()
+        val source = if (full.isNotEmpty()) full else loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE)
+        return if (limit == Int.MAX_VALUE) source else source.take(limit)
+    }
 
-    private fun loadCatalog(types: List<String>, maxPagesPerType: Int): List<SearchResult> {
+    private fun loadCatalog(types: List<String>, maxPagesPerType: Int, forceRefresh: Boolean = false): List<SearchResult> {
         if (!isBcsConfigured()) return emptyList()
         val now = System.currentTimeMillis()
         val cacheKey = types.map { it.uppercase(Locale.US) }.distinct().sorted().joinToString(",")
         val cached = catalogCaches[cacheKey]
-        if (cached != null && cached.second.isNotEmpty() && now - cached.first <= CATALOG_CACHE_MS) return cached.second
+        if (!forceRefresh && cached != null && cached.second.isNotEmpty() && now - cached.first <= CATALOG_CACHE_MS) return cached.second
 
         // BCS exposes the catalogue by instrument type. Fetch different types in
         // parallel, while keeping pagination for each type ordered. This removes the

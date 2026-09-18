@@ -22,7 +22,8 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
         val ru = p.getBoolean("ru", true)
         val repo = MarketRepository(
             bcsRefreshToken = p.getString("bcs_refresh_token", "")?.ifBlank { null },
-            prefs = p
+            prefs = p,
+            context = applicationContext
         )
         val tracked = readTracked(p).toMutableList()
         val history = readHistory(p).toMutableList()
