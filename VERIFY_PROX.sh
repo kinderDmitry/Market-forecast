@@ -11,8 +11,8 @@ test -f app/src/main/java/ScannerForegroundService.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 128' app/build.gradle.kts
-grep -q 'versionName = "4.8.89"' app/build.gradle.kts
+grep -q 'versionCode = 130' app/build.gradle.kts
+grep -q 'versionName = "4.8.91"' app/build.gradle.kts
 
 echo "[3/6] Scanner/forecast consistency"
 grep -q 'fun analyzeForScanner' app/src/main/java/AnalyticsEngine.kt
@@ -49,5 +49,9 @@ echo "[8/9] No stale live-price fallback"
 echo "[9/9] Scanner persists exact BCS classCode"
 grep -q 'limit = 17' app/src/main/java/ScannerForegroundService.kt
 grep -q 'it.result.classCode' app/src/main/java/ScannerForegroundService.kt
+grep -q 'ALL_BCS_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
+grep -q 'Int.MAX_VALUE' app/src/main/java/MarketRepository.kt
+grep -q 'monotonically increasing index' app/src/main/java/ScannerForegroundService.kt
+grep -q 'distinctBy { scanIdentity(it) }' app/src/main/java/ScannerForegroundService.kt
 
 echo "VERIFY_PROX: OK"
