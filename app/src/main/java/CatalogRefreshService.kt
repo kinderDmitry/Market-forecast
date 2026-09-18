@@ -64,7 +64,7 @@ class CatalogRefreshService : Service() {
         prefs.edit()
             .putBoolean("catalog_refresh_running", true)
             .putFloat("catalog_refresh_progress", 0f)
-            .putInt("catalog_refresh_types_total", 13)
+            .putInt("catalog_refresh_types_total", 4)
             .putInt("catalog_refresh_types_done", 0)
             .putInt("catalog_refresh_current_page", 0)
             .putInt("catalog_refresh_items", 0)

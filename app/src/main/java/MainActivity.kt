@@ -1015,8 +1015,8 @@ private fun regimeRu(regime: String): String = when (regime) {
         }
         item {
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("ALL","STOCK","FX","ETF","INDEX").forEach { f ->
-                    FilterChip(selected = searchFilter == f, onClick = { searchFilter=f; prefs.edit().putString("search_filter", f).apply() }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";"ETF"->"ETF";"INDEX"->"Индексы";else->"Все"} else f,fontSize=8.sp) })
+                listOf("ALL","STOCK","FX").forEach { f ->
+                    FilterChip(selected = searchFilter == f, onClick = { searchFilter=f; prefs.edit().putString("search_filter", f).apply() }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";else->"Все"} else when(f){"STOCK"->"Stocks";"FX"->"Currencies";else->"All"},fontSize=8.sp) })
                 }
             }
         }
@@ -1531,7 +1531,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     var running by remember { mutableStateOf(prefs.getBoolean("catalog_refresh_running", false)) }
     var progress by remember { mutableFloatStateOf(prefs.getFloat("catalog_refresh_progress", 0f)) }
     var typesDone by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_done", 0)) }
-    var typesTotal by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_total", 13)) }
+    var typesTotal by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_total", 4)) }
     var currentType by remember { mutableStateOf(prefs.getString("catalog_refresh_current_type", "") ?: "") }
     var currentPage by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_current_page", 0)) }
     var items by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_items", 0)) }
@@ -1550,7 +1550,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
             running = prefs.getBoolean("catalog_refresh_running", false)
             progress = prefs.getFloat("catalog_refresh_progress", 0f).coerceIn(0f, 1f)
             typesDone = prefs.getInt("catalog_refresh_types_done", 0)
-            typesTotal = prefs.getInt("catalog_refresh_types_total", 13).coerceAtLeast(1)
+            typesTotal = prefs.getInt("catalog_refresh_types_total", 4).coerceAtLeast(1)
             currentType = prefs.getString("catalog_refresh_current_type", "") ?: ""
             currentPage = prefs.getInt("catalog_refresh_current_page", 0)
             items = prefs.getInt("catalog_refresh_items", 0)
@@ -1634,7 +1634,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=10.sp);Switch(checked = value, onCheckedChange = on)}}
 
 @Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SCANNER to Icons.Default.Radar,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";Screen.SCANNER->"Сканер";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";Screen.SCANNER->"Scanner";else->"Settings"},fontSize=7.sp)})}}}
-@Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций, индексов, валют, ETF…" else "Search stocks, indices, FX, ETFs…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=11.sp)}}
+@Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=11.sp)}}
 @Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){GradientCard(modifier.clickable(onClick=on)){Column(Modifier.padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(icon,null,tint=Accent,modifier=Modifier.size(22.dp));Text(title,fontWeight=FontWeight.Bold,fontSize=8.sp,modifier=Modifier.padding(top=5.dp))}}}
 @Composable private fun SectionHeader(t:String,s:String){
     Column {
@@ -1688,7 +1688,11 @@ private fun loadFavoriteOrder(p: android.content.SharedPreferences, favs: Set<St
 private fun loadSearchHistory(p: android.content.SharedPreferences): List<String> = p.getString("search_history", "").orEmpty().split("\n").filter { it.isNotBlank() }.take(20)
 private fun saveSearchHistory(p: android.content.SharedPreferences, q: String): List<String> { val out = (listOf(q) + loadSearchHistory(p).filterNot { it.equals(q, true) }).take(20); p.edit().putString("search_history", out.joinToString("\n")).apply(); return out }
 
-private fun matchesSearchFilter(r: SearchResult, filter:String):Boolean=when(filter){"STOCK"->r.type.contains("EQUITY",true)||r.type.contains("STOCK",true)||r.symbol.endsWith(".ME");"FX"->r.type.contains("CURRENCY",true)||r.exchange.contains("FOREX",true)||r.symbol.endsWith("=X");"ETF"->r.type.contains("ETF",true);"INDEX"->r.type.contains("INDEX",true)||r.symbol.startsWith("^");else->true}
+private fun matchesSearchFilter(r: SearchResult, filter:String):Boolean=when(filter){
+    "STOCK"->r.type.uppercase(Locale.US) in setOf("STOCK","FOREIGN_STOCK","DEPOSITARY_RECEIPTS")
+    "FX"->r.type.contains("CURRENCY",true)||r.exchange.contains("FOREX",true)||r.symbol.endsWith("=X")
+    else->r.type.uppercase(Locale.US) in setOf("STOCK","FOREIGN_STOCK","DEPOSITARY_RECEIPTS","CURRENCY")
+}
 
 private fun signalColor(s:String)=when{ s.contains("LONG")->Positive; s.contains("SHORT")->Negative; else->Warning }
 private fun fmt(v:Double):String=when{abs(v)>=1000->String.format(Locale.US,"%,.2f",v);abs(v)>=1->String.format(Locale.US,"%.2f",v);else->String.format(Locale.US,"%.6f",v)}

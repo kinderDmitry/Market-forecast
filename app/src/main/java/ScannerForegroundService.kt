@@ -304,10 +304,12 @@ class ScannerForegroundService : Service() {
         fun matches(item: SearchResult): Boolean {
             val t = item.type.uppercase(Locale.US)
             val isFx = t.contains("CURRENCY") || t.contains("FOREX")
+            val isStock = t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
             return when (type) {
                 "FX" -> isFx
-                "STOCKS" -> !isFx
-                else -> true
+                "STOCKS" -> isStock
+                "ALL" -> isFx || isStock
+                else -> false
             }
         }
 

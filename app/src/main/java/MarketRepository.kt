@@ -46,11 +46,12 @@ class MarketRepository(
         private const val LOCAL_INDEX_VERSION = 1
         private const val LOCAL_INDEX_KEY = "mfp_search_index_v1"
         private const val FULL_CATALOG_META_KEY = "mfp_full_catalog_meta_v1"
-        private const val FULL_CATALOG_FILE = "bcs_full_catalog_v1.json"
-        private val ALL_BCS_INSTRUMENT_TYPES = listOf(
-            "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY",
-            "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS",
-            "BONDS", "NOTES", "EURO_BONDS", "GOODS"
+        private const val FULL_CATALOG_FILE = "bcs_trading_catalog_v2.json"
+        // Only instruments the app can actually search/scan: shares (including
+        // foreign shares/DRs) and currencies. Do not download ETFs, indices,
+        // bonds, futures, options or other BCS directory types.
+        private val TRADING_INSTRUMENT_TYPES = listOf(
+            "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY"
         )
         // BCS documents 10 RPS for reference and market-data HTTP APIs. Keep a
         // single process-wide limiter because catalog, candles, quotes and order-book
@@ -345,9 +346,11 @@ class MarketRepository(
                 val o = root.optJSONObject(i) ?: continue
                 val symbol = o.optString("s").trim()
                 if (symbol.isBlank()) continue
+                val type = o.optString("t", "STOCK").uppercase(Locale.US)
+                if (type !in TRADING_INSTRUMENT_TYPES) continue
                 out += SearchResult(
                     symbol, o.optString("n", symbol), o.optString("e", "БКС"),
-                    o.optString("t", "STOCK"), "БКС", o.optString("c", "")
+                    type, "БКС", o.optString("c", "")
                 )
             }
             out
@@ -380,20 +383,20 @@ class MarketRepository(
     /** Force-download the complete BCS directory and atomically replace the local snapshot. */
     fun refreshFullCatalog(onProgress: ((String) -> Unit)? = null): List<SearchResult> {
         check(isBcsConfigured()) { "БКС не подключён" }
-        val totalTypes = ALL_BCS_INSTRUMENT_TYPES.size
+        val totalTypes = TRADING_INSTRUMENT_TYPES.size
         prefs?.edit()?.putBoolean("catalog_refresh_running", true)
             ?.putInt("catalog_refresh_types_total", totalTypes)
             ?.putInt("catalog_refresh_types_done", 0)
             ?.putInt("catalog_refresh_current_page", 0)
             ?.putInt("catalog_refresh_items", 0)
             ?.putString("catalog_refresh_current_type", "Подготовка")
-            ?.putString("catalog_refresh_status", "Подготовка полного каталога БКС…")
+            ?.putString("catalog_refresh_status", "Подготовка каталога акций и валют БКС…")
             ?.apply()
-        onProgress?.invoke("Подготовка полного каталога БКС…")
-        val fresh = loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE, forceRefresh = true)
+        onProgress?.invoke("Подготовка каталога акций и валют БКС…")
+        val fresh = loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE, forceRefresh = true)
         check(fresh.isNotEmpty()) { "БКС вернул пустой каталог" }
         persistFullCatalogSnapshot(fresh)
-        catalogCaches[ALL_BCS_INSTRUMENT_TYPES.sorted().joinToString(",")] = System.currentTimeMillis() to fresh
+        catalogCaches[TRADING_INSTRUMENT_TYPES.sorted().joinToString(",")] = System.currentTimeMillis() to fresh
         rebuildSearchIndex(fresh)
         prefs?.edit()?.putBoolean("catalog_refresh_running", false)
             ?.putFloat("catalog_refresh_progress", 1f)
@@ -413,8 +416,8 @@ class MarketRepository(
         val cached = readFullCatalogSnapshot()
         if (cached.isNotEmpty()) return cached
         return loadCatalog(
-            listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY"),
-            maxPagesPerType = 40
+            TRADING_INSTRUMENT_TYPES,
+            maxPagesPerType = Int.MAX_VALUE
         )
     }
 
@@ -436,7 +439,7 @@ class MarketRepository(
      * the remaining universe.
      */
     fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
-        "ALL" -> readFullCatalogSnapshot().ifEmpty { loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE) }
+        "ALL" -> readFullCatalogSnapshot().ifEmpty { loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE) }
         "FX" -> {
             val full = readFullCatalogSnapshot()
             if (full.isNotEmpty()) full.filter { it.type.contains("CURRENCY", true) }
@@ -444,16 +447,16 @@ class MarketRepository(
         }
         "STOCKS" -> {
             val full = readFullCatalogSnapshot()
-            if (full.isNotEmpty()) full.filter { it.type.contains("STOCK", true) || it.type.contains("ETF", true) || it.type.contains("FUND", true) || it.type.contains("DEPOSITARY", true) }
-            else loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), Int.MAX_VALUE)
+            if (full.isNotEmpty()) full.filter { it.type.uppercase(Locale.US) in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS") }
+            else loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS"), Int.MAX_VALUE)
         }
-        else -> readFullCatalogSnapshot().ifEmpty { loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE) }
+        else -> readFullCatalogSnapshot().ifEmpty { loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE) }
     }
 
     /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
     fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> {
         val full = readFullCatalogSnapshot()
-        val source = if (full.isNotEmpty()) full else loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE)
+        val source = if (full.isNotEmpty()) full else loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE)
         return if (limit == Int.MAX_VALUE) source else source.take(limit)
     }
 
