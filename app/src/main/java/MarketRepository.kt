@@ -41,6 +41,13 @@ class MarketRepository(
         private const val QUOTE_CACHE_MS = 5_000L
         private const val CATALOG_CACHE_MS = 900_000L
         private const val SEARCH_CACHE_MS = 60_000L
+        private const val LOCAL_INDEX_VERSION = 1
+        private const val LOCAL_INDEX_KEY = "mfp_search_index_v1"
+        private val ALL_BCS_INSTRUMENT_TYPES = listOf(
+            "STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY",
+            "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS",
+            "BONDS", "NOTES", "EURO_BONDS", "GOODS"
+        )
         // BCS documents 10 RPS for reference and market-data HTTP APIs. Keep a
         // single process-wide limiter because catalog, candles, quotes and order-book
         // requests can run concurrently from scanner/UI/workers.
@@ -55,8 +62,98 @@ class MarketRepository(
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
         private val catalogPool = Executors.newFixedThreadPool(6)
+        private val searchIndex = java.util.concurrent.atomic.AtomicReference<List<SearchResult>>(emptyList())
+        private val searchIndexReady = java.util.concurrent.atomic.AtomicBoolean(false)
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
+
+    init {
+        // Search must be usable before any network request completes. Restore the
+        // last BCS-backed directory snapshot synchronously (small JSON payload) and
+        // refresh it in the background from warmSearchIndex().
+        restoreSearchIndex()
+    }
+
+    private fun restoreSearchIndex() {
+        val raw = prefs?.getString(LOCAL_INDEX_KEY, null) ?: return
+        runCatching {
+            val root = JSONArray(raw)
+            val out = ArrayList<SearchResult>(root.length())
+            for (i in 0 until root.length()) {
+                val o = root.optJSONObject(i) ?: continue
+                val symbol = o.optString("s")
+                if (symbol.isBlank()) continue
+                out += SearchResult(
+                    symbol, o.optString("n", symbol), o.optString("e", "БКС"),
+                    o.optString("t", "STOCK"), "БКС", o.optString("c", "")
+                )
+            }
+            if (out.isNotEmpty()) {
+                searchIndex.set(out)
+                searchIndexReady.set(true)
+            }
+        }
+    }
+
+    private fun persistSearchIndex(items: List<SearchResult>) {
+        if (prefs == null || items.isEmpty()) return
+        runCatching {
+            val arr = JSONArray()
+            items.forEach { item ->
+                arr.put(JSONObject().put("s", item.symbol).put("n", item.name)
+                    .put("e", item.exchange).put("t", item.type).put("c", item.classCode))
+            }
+            prefs.edit().putString(LOCAL_INDEX_KEY, arr.toString()).apply()
+        }
+    }
+
+    private fun rebuildSearchIndex(items: List<SearchResult>) {
+        val merged = LinkedHashMap<String, SearchResult>()
+        popularSeeds().forEach { merged[it.symbol.uppercase(Locale.US)] = it }
+        items.forEach { merged[it.symbol.uppercase(Locale.US)] = it }
+        val result = merged.values.toList()
+        searchIndex.set(result)
+        searchIndexReady.set(result.isNotEmpty())
+        persistSearchIndex(result)
+    }
+
+    private fun localSearch(query: String, limit: Int = 50): List<SearchResult> {
+        val needle = normalizeSearchText(query)
+        if (needle.isBlank()) return emptyList()
+        val translit = transliterateRuToLat(needle)
+        return searchIndex.get().asSequence().mapNotNull { item ->
+            val symbol = normalizeSearchText(item.symbol)
+            val name = normalizeSearchText(item.name)
+            val symbolCompact = compactSearch(symbol)
+            val nameCompact = compactSearch(name)
+            val translitName = transliterateRuToLat(name)
+            val score = when {
+                symbol == needle || name == needle -> 0
+                symbol.startsWith(needle) -> 10
+                name.startsWith(needle) -> 20
+                symbolCompact.startsWith(compactSearch(needle)) -> 25
+                nameCompact.startsWith(compactSearch(needle)) -> 30
+                translit.isNotBlank() && symbol.startsWith(translit) -> 35
+                translit.isNotBlank() && translitName.startsWith(translit) -> 40
+                symbol.contains(needle) -> 50
+                name.contains(needle) -> 60
+                else -> return@mapNotNull null
+            }
+            score to item
+        }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }
+            .thenBy { it.second.name.length }
+            .thenBy { it.second.name.lowercase(Locale.ROOT) })
+            .map { it.second }.distinctBy { it.symbol.uppercase(Locale.US) }.take(limit)
+    }
+
+    private fun normalizeSearchText(value: String): String =
+        value.trim().lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
+
+    private fun compactSearch(value: String): String =
+        value.replace(" ", "").replace("-", "").replace("/", "")
+
+    fun searchLocal(query: String): List<SearchResult> = localSearch(query)
+
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -118,6 +215,14 @@ class MarketRepository(
         val now = System.currentTimeMillis()
         searchCaches[searchKey]?.let { cached ->
             if (now - cached.first <= SEARCH_CACHE_MS) return cached.second
+        }
+
+        // Primary path: local BCS directory snapshot. This is deliberately before
+        // all HTTP work, so normal autocomplete does not wait on network latency.
+        val local = localSearch(q)
+        if (local.isNotEmpty()) {
+            searchCaches[searchKey] = now to local
+            return local
         }
         // A single character is handled entirely from the local BCS-backed seed
         // index. This is critical for responsive autocomplete: one keystroke must
@@ -228,20 +333,30 @@ class MarketRepository(
     /** Warm the searchable BCS directory without blocking the UI. */
     fun warmSearchIndex() {
         if (!isBcsConfigured()) return
-        runCatching { searchCatalog() }
+        // If a persisted snapshot exists, it is already serving searches. Refresh
+        // the authoritative BCS directory in the background and atomically swap it.
+        runCatching {
+            val fresh = searchCatalog()
+            if (fresh.isNotEmpty()) rebuildSearchIndex(fresh)
+        }
     }
 
-    /** Scanner universe. Avoid loading bonds/options/futures when the scanner asks for stocks/FX. */
+    /**
+     * Scanner universe. ALL means the complete BCS instrument directory, not a
+     * hardcoded subset and not a fixed page cap. Instruments without candle/quote
+     * data are handled by the scanner as unsupported and skipped without stopping
+     * the remaining universe.
+     */
     fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
-        "FX" -> loadCatalog(listOf("CURRENCY"), 40)
-        "STOCKS" -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), 40)
-        else -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS", "CURRENCY"), 40)
+        "FX" -> loadCatalog(listOf("CURRENCY"), Int.MAX_VALUE)
+        "STOCKS" -> loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "ETF", "MUTUAL_FUNDS"), Int.MAX_VALUE)
+        else -> loadCatalog(ALL_BCS_INSTRUMENT_TYPES, Int.MAX_VALUE)
     }
 
     /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
     fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> = loadCatalog(
-        listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY", "ETF", "MUTUAL_FUNDS", "INDICES", "FUTURES", "OPTIONS", "BONDS", "NOTES", "EURO_BONDS", "GOODS"),
-        40
+        ALL_BCS_INSTRUMENT_TYPES,
+        Int.MAX_VALUE
     ).let { if (limit == Int.MAX_VALUE) it else it.take(limit) }
 
     private fun loadCatalog(types: List<String>, maxPagesPerType: Int): List<SearchResult> {
@@ -259,8 +374,8 @@ class MarketRepository(
         }
         val out = LinkedHashMap<String, SearchResult>()
         futures.forEach { future ->
-            runCatching { future.get(90, TimeUnit.SECONDS) }.getOrDefault(emptyList()).forEach { item ->
-                out.putIfAbsent(item.symbol.uppercase(Locale.US), item)
+            runCatching { future.get(10, TimeUnit.MINUTES) }.getOrDefault(emptyList()).forEach { item ->
+                out.putIfAbsent(catalogIdentity(item), item)
             }
         }
         val result = out.values.toList()
@@ -268,11 +383,14 @@ class MarketRepository(
         return result
     }
 
+    private fun catalogIdentity(item: SearchResult): String =
+        "${item.symbol.trim().uppercase(Locale.US)}@${item.classCode.trim().uppercase(Locale.US)}"
+
     private fun loadCatalogType(type: String, maxPagesPerType: Int): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()
         var page = 0
         var consecutiveFailures = 0
-        while (page < maxPagesPerType) {
+        while (maxPagesPerType == Int.MAX_VALUE || page < maxPagesPerType) {
             val arr = runCatching {
                 var last: Throwable? = null
                 for (attempt in 0..3) {
@@ -311,7 +429,8 @@ class MarketRepository(
                     .ifBlank { ticker }
                 val typeName = o.optString("instrumentType").ifBlank { type }
                 val classCode = boardObj?.optString("classCode").orEmpty()
-                out.putIfAbsent(ticker.uppercase(Locale.US), SearchResult(ticker, name, exchange, typeName, "БКС", classCode))
+                val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
+                out.putIfAbsent(catalogIdentity(item), item)
             }
             // BCS documents that a full page requires requesting page + 1.
             if (arr.length() < 100) break

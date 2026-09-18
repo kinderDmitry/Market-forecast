@@ -89,8 +89,13 @@ class ScannerForegroundService : Service() {
                 val instruments = withContext(Dispatchers.IO) {
                     resolveInstruments(repo, scopeMode, instrumentType)
                 }
-                val symbols = instruments.map { it.symbol }.distinct()
-                val metadataBySymbol = instruments.associateBy { repo.canonicalSymbol(it.symbol).uppercase(Locale.US) }
+                // Preserve ticker + classCode as the scanner identity. A ticker can
+                // legitimately exist on more than one BCS board; collapsing by ticker
+                // would silently drop instruments from the full BCS universe.
+                val scanItems = instruments
+                    .filter { it.symbol.isNotBlank() }
+                    .distinctBy { scanIdentity(it) }
+                val symbols = scanItems.map { scanIdentity(it) }
                 val timeframes: List<String> = if (timeframe == "ANY") {
                     listOf("15M", "1H", "4H", "1D", "1W")
                 } else {
@@ -121,32 +126,36 @@ class ScannerForegroundService : Service() {
                 if (symbols.isEmpty()) {
                     setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
                 } else {
-                    // Worker-pool model: unlike the old fixed batches, workers keep
-                    // consuming symbols as soon as a request finishes. This removes
-                    // the "wait for the slowest 8th request" pauses on market-wide scans.
+                    // Bounded worker queue: do not create one coroutine per instrument.
+                    // The previous flatMap created thousands of deferred jobs for a full
+                    // BCS catalogue. Workers now pull one task at a time, so memory stays
+                    // bounded while every instrument/timeframe pair is processed. No giant
+                    // task list is materialized: a monotonically increasing index maps to
+                    // instrument + timeframe on demand.
+                    val tfCount = timeframes.size.coerceAtLeast(1)
+                    val taskCount = scanItems.size.toLong() * tfCount.toLong()
                     val concurrency = if (scopeMode == "SELECTED") 8 else 12
-                    val gate = Semaphore(concurrency)
+                    val nextIndex = AtomicLong(0L)
                     coroutineScope {
-                        val jobs = symbols.flatMap { symbol ->
-                            if (!currentCoroutineContext().isActive || !running.get()) return@flatMap emptyList()
-                            timeframes.map { currentTf ->
-                                async(Dispatchers.IO) {
-                                    gate.withPermit {
-                                        val meta = metadataBySymbol[repo.canonicalSymbol(symbol).uppercase(Locale.US)]
-                                        val row = scanOne(repo, symbol, currentTf, meta)
-                                        val done = completed.incrementAndGet()
-                                        val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
-                                        if (done == 1L || done % 5L == 0L || done == total) {
-                                            setStatus("🔎 Сканирование: $done / $total", progress)
-                                        }
-                                        row
+                        val workers = List(concurrency) {
+                            async(Dispatchers.IO) {
+                                while (currentCoroutineContext().isActive && running.get()) {
+                                    val index = nextIndex.getAndIncrement()
+                                    if (index >= taskCount) break
+                                    val meta = scanItems[(index / tfCount).toInt()]
+                                    val tf = timeframes[(index % tfCount).toInt()]
+                                    val identity = scanIdentity(meta)
+                                    val row = scanOne(repo, identity, tf, meta)
+                                    val done = completed.incrementAndGet()
+                                    val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+                                    if (done == 1L || done % 10L == 0L || done == total) {
+                                        setStatus("🔎 Сканирование: $done / $total", progress)
                                     }
+                                    if (row != null) acceptRow(row)
                                 }
                             }
                         }
-                        jobs.awaitAll().forEach { row ->
-                            if (row != null) acceptRow(row)
-                        }
+                        workers.awaitAll()
                     }
                 }
 
@@ -314,7 +323,7 @@ class ScannerForegroundService : Service() {
                             }
                         }.getOrNull()
                 }
-                .distinctBy { repo.canonicalSymbol(it.symbol).uppercase(Locale.US) }
+                .distinctBy { scanIdentity(it) }
         }
 
         val catalog = runCatching { repo.scannerCatalog(type) }.getOrDefault(emptyList())
@@ -378,8 +387,13 @@ class ScannerForegroundService : Service() {
         p.edit().putStringSet("auto_scan_results", encoded).apply()
     }
 
+    private fun scanIdentity(item: SearchResult): String =
+        "${repoCanonical(item.symbol)}@${item.classCode.trim().uppercase(Locale.US)}"
+
+    private fun repoCanonical(symbol: String): String = symbol.trim().uppercase(Locale.US)
+
     private fun rowKey(row: ScanRow): String =
-        "${row.result.symbol}|${row.timeframe}|${row.signal}"
+        "${row.result.symbol}@${row.result.classCode}|${row.timeframe}|${row.signal}"
 
     private fun notifySignal(row: ScanRow) {
         val body = "${row.result.symbol} — ${row.result.name} • ${row.signal} • ${row.confidence}%\n" +

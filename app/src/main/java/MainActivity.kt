@@ -310,17 +310,22 @@ fun MarketForecastApp(ctx: Context) {
     LaunchedEffect(query) {
         val q = query.trim()
         if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
-        // One-character autocomplete must never hit the network. The local BCS-backed
-        // seed index is rendered immediately; network lookup starts only from 2 chars.
-        if (q.length == 1) {
-            searching = true
-            results = withContext(Dispatchers.Default) { repo.search(q) }
-            searching = false
+        // Local BCS-backed index is the first and normally only path for autocomplete.
+        // Render it immediately on every keystroke; network is used only when the local
+        // snapshot has no match. This removes the old 320 ms debounce from normal search.
+        searching = false
+        val local = withContext(Dispatchers.Default) { repo.searchLocal(q) }
+        if (local.isNotEmpty()) {
+            results = local
             return@LaunchedEffect
         }
-        delay(320)
-        searching = true
+        if (q.length == 1) {
+            results = emptyList()
+            return@LaunchedEffect
+        }
+        delay(80)
         val requested = q
+        searching = true
         val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested) }.getOrDefault(emptyList()) }
         // Do not let an older, slower HTTP response overwrite a newer query.
         if (query.trim().equals(requested, true)) {
