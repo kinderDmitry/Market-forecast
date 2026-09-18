@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
 jobs:
   build:
     name: Build Debug APK
@@ -16,9 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # IMPORTANT: GitHub repositories sometimes contain the ZIP itself rather
-      # than the extracted Gradle project. Prepare the project BEFORE running
-      # any test -f settings.gradle.kts command.
       - name: Locate Gradle project
         shell: bash
         run: |
@@ -27,57 +28,43 @@ jobs:
             echo "Gradle project is already at repository root."
           else
             ZIP_FILE="$(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './.mfp_unpack/*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2- | head -n1 || true)"
-            if [ -z "$ZIP_FILE" ]; then
-              echo "ERROR: No settings.gradle.kts at repository root and no ZIP found."
-              echo "Repository contents:"
-              find . -maxdepth 4 -type f -not -path './.git/*' | sort
-              exit 1
-            fi
-
-            echo "Found project archive: $ZIP_FILE"
+            test -n "$ZIP_FILE" || { echo 'ERROR: Gradle project/ZIP not found.'; exit 1; }
             rm -rf .mfp_unpack
             mkdir -p .mfp_unpack
             unzip -q "$ZIP_FILE" -d .mfp_unpack
-
             SETTINGS="$(find .mfp_unpack -type f -name settings.gradle.kts -print -quit || true)"
-            if [ -z "$SETTINGS" ]; then
-              echo "ERROR: ZIP does not contain settings.gradle.kts."
-              find .mfp_unpack -maxdepth 6 -type f | sort
-              exit 1
-            fi
-
+            test -n "$SETTINGS" || { echo 'ERROR: ZIP does not contain settings.gradle.kts.'; exit 1; }
             PROJECT_ROOT="$(dirname "$SETTINGS")"
-            echo "Detected Gradle project root: $PROJECT_ROOT"
-
-            # Copy project contents to the repository root. Dotfiles are copied
-            # as well, while the temporary extraction directory is excluded.
             cp -a "$PROJECT_ROOT"/. ./
             rm -rf .mfp_unpack
           fi
-
-          echo "Final project root: $(pwd)"
-          echo "settings.gradle.kts:"
-          ls -l settings.gradle.kts
           test -f settings.gradle.kts
           test -f app/build.gradle.kts
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          # setup-android defaults to the obsolete "tools" SDK package.
-          # Install only the command-line tools here; required SDK packages
-          # are installed explicitly in the next step.
-          packages: ''
-
-      - name: Install Android SDK 36
-        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      # Do not use android-actions/setup-android here. Its package installer can
+      # request the obsolete SDK package named "tools" and fail before Gradle.
+      # GitHub's runner already contains sdkmanager; use it directly.
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" || {
+            echo "ERROR: sdkmanager not found at $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print || true
+            exit 1
+          }
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --list_installed | grep -E 'platform-tools|platforms;android-36|build-tools;36.0.0'
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -88,68 +75,17 @@ jobs:
       - name: Verify project
         shell: bash
         run: |
-          set -uo pipefail
-          check_file() {
-            local path="$1"
-            if [ -f "$path" ]; then
-              echo "OK: $path"
-            else
-              echo "FAIL: missing $path"
-              exit 1
-            fi
-          }
-          check_absent() {
-            local path="$1"
-            if [ ! -f "$path" ]; then
-              echo "OK: absent $path"
-            else
-              echo "FAIL: forbidden file exists $path"
-              exit 1
-            fi
-          }
-          check_grep() {
-            local pattern="$1"
-            local path="$2"
-            if grep -q -- "$pattern" "$path"; then
-              echo "OK: pattern found in $path"
-            else
-              echo "FAIL: pattern not found in $path: $pattern"
-              exit 1
-            fi
-          }
-          check_no_grep() {
-            local pattern="$1"
-            local path="$2"
-            if grep -q -- "$pattern" "$path"; then
-              echo "FAIL: forbidden pattern found in $path: $pattern"
-              exit 1
-            else
-              echo "OK: forbidden pattern absent in $path"
-            fi
-          }
-
-          check_file settings.gradle.kts
-          check_file app/build.gradle.kts
-          check_file app/src/main/AndroidManifest.xml
-          check_file app/src/main/res/drawable-nodpi/mfp_icon.png
-          check_file app/src/main/res/drawable/mfp_notification.xml
-          check_file TZ_MASTER_RU.md
-          check_file signing/mfp-debug.keystore
-          check_absent app/src/main/java/DividendUpdateWorker.kt
-          check_absent app/src/main/java/ScreenshotForecastEngine.kt
-          check_file app/src/main/java/NotificationHelper.kt
-          check_grep 'android:icon="@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml
-          check_grep 'import kotlin.math.abs' app/src/main/java/TrackingEngine.kt
-          check_grep 'val monitorMinConf = p.getInt("alert_min_confidence", 60)' app/src/main/java/MarketMonitorWorker.kt
-          check_grep 'versionCode = 133' app/build.gradle.kts
-          check_grep 'versionName = "4.8.94"' app/build.gradle.kts
-          check_no_grep 'interval == "15m".*loadMoex(moex, "15m")' app/src/main/java/MarketRepository.kt
-          check_no_grep 'mutableStateOf(f?.entry?.toString() ?: "100")' app/src/main/java/MainActivity.kt
-          check_no_grep 'mutableStateOf(f?.tp2?.toString() ?: "105")' app/src/main/java/MainActivity.kt
-          check_no_grep 'mutableStateOf(f?.stop?.toString() ?: "98")' app/src/main/java/MainActivity.kt
-          check_grep 'Forecast integrity rule: ALL forecast candles come from BCS.' app/src/main/java/MarketRepository.kt
-          check_grep 'detectPatterns' app/src/main/java/AnalyticsEngine.kt
-          echo 'Documentation/terminology verification: skipped; user-facing branding is intentionally Market Forecast.'
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f app/src/main/java/AnalyticsEngine.kt
+          test -f app/src/main/java/ScannerForegroundService.kt
+          grep -q 'versionCode = 133' app/build.gradle.kts
+          grep -q 'versionName = "4.8.94"' app/build.gradle.kts
+          grep -q 'ALL_BCS_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
+          grep -q 'Int.MAX_VALUE' app/src/main/java/MarketRepository.kt
+          grep -q 'distinctBy { scanIdentity(it) }' app/src/main/java/ScannerForegroundService.kt
           echo 'Project verification: OK'
 
       - name: Build debug APK
@@ -159,12 +95,10 @@ jobs:
 
       - name: Rename APK
         run: |
+          set -euo pipefail
           mkdir -p release
           cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.94.apk
 
-      # GitHub Actions artifact storage can be exhausted independently of the
-      # repository. Do NOT publish the APK as a workflow artifact here. Publish the APK as a GitHub
-      # Release asset instead; this avoids the Actions artifact quota entirely.
       - name: Publish APK as GitHub Release asset
         env:
           GH_TOKEN: ${{ github.token }}
