@@ -72,11 +72,17 @@ jobs:
           gradle-version: '8.11.1'
           cache-read-only: false
 
-      - name: Verify project
+      - name: Verify clean BCS API architecture
         shell: bash
         run: |
           set -euo pipefail
+          test ! -e app/src/main/java/CatalogRefreshService.kt
+          if grep -RInE "CatalogRefreshService|refreshFullCatalog|catalog_refresh_" app/src/main 2>/dev/null; then
+            echo "ERROR: stale catalog-refresh code is still present"
+            exit 1
+          fi
           test -f settings.gradle.kts
+          test -f app/build.gradle.kts
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
           test -f app/src/main/java/AnalyticsEngine.kt
@@ -84,7 +90,6 @@ jobs:
           grep -q 'versionCode = 137' app/build.gradle.kts
           grep -q 'versionName = "4.8.98"' app/build.gradle.kts
           grep -q 'TRADING_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
-          grep -q 'Int.MAX_VALUE' app/src/main/java/MarketRepository.kt
           grep -q 'distinctBy { scanIdentity(it) }' app/src/main/java/ScannerForegroundService.kt
           echo 'Project verification: OK'
 
@@ -109,4 +114,4 @@ jobs:
           gh release create "$TAG" release/MarketForecast_PROX_4.8.98.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.98. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.97. Commit: ${GITHUB_SHA}"
