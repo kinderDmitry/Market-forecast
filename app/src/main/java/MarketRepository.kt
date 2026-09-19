@@ -179,26 +179,31 @@ class MarketRepository(
         val needle = normalizeSearchText(q)
         val compact = compactSearch(needle)
         val transliterated = transliterateRuToLat(needle)
-        val out = mutableListOf<Pair<Int, SearchResult>>()
-        for (type in wanted) {
-            val items = runCatching { loadCatalogType(type, 4) }.getOrElse { emptyList() }
-            for (item in items) {
-                if (!matchesType(item)) continue
-                val symbol = normalizeSearchText(item.symbol)
-                val name = normalizeSearchText(item.name)
-                val nameCompact = compactSearch(name)
-                val rank = when {
-                    symbol == needle || name == needle -> 0
-                    symbol.startsWith(needle) || name.startsWith(needle) -> 1
-                    compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
-                    transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
-                    symbol.contains(needle) || name.contains(needle) -> 3
-                    else -> continue
+        val out = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, SearchResult>>())
+        // BCS has no name-search endpoint. Search the authoritative directory, but
+        // query the selected instrument types concurrently. The global BCS request
+        // gate still enforces the provider rate limit.
+        val jobs = wanted.map { type ->
+            analysisPool.submit {
+                val items = runCatching { loadCatalogType(type, 4) }.getOrElse { emptyList() }
+                for (item in items) {
+                    if (!matchesType(item)) continue
+                    val symbol = normalizeSearchText(item.symbol)
+                    val name = normalizeSearchText(item.name)
+                    val nameCompact = compactSearch(name)
+                    val rank = when {
+                        symbol == needle || name == needle -> 0
+                        symbol.startsWith(needle) || name.startsWith(needle) -> 1
+                        compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
+                        transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
+                        symbol.contains(needle) || name.contains(needle) -> 3
+                        else -> continue
+                    }
+                    out += rank to item
                 }
-                out += rank to item
             }
-            if (out.any { it.first == 0 }) break
         }
+        jobs.forEach { runCatching { it.get(18, TimeUnit.SECONDS) } }
         val result = out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
             .map { it.second }
             .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }

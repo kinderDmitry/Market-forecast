@@ -247,12 +247,15 @@ class ScannerForegroundService : Service() {
     }
 
     private suspend fun scanOne(repo: MarketRepository, symbol: String, timeframe: String, metadata: SearchResult?): ScanRow? {
+        // Scanner does not need the multi-year chart history. These bounded windows
+        // still provide enough bars for the same AnalyticsEngine while avoiding extra
+        // BCS candle HTTP chunks (BCS caps a response at 1440 candles).
         val pair = when (timeframe) {
-            "15M" -> "60d" to "15m"
-            "1H" -> "2y" to "1h"
-            "4H" -> "2y" to "4h"
+            "15M" -> "15d" to "15m"
+            "1H" -> "60d" to "1h"
+            "4H" -> "240d" to "4h"
             "1W" -> "10y" to "1wk"
-            else -> "2y" to "1d"
+            else -> "3y" to "1d"
         }
         return runCatching {
             withTimeout(60_000L) {

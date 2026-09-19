@@ -305,7 +305,7 @@ fun MarketForecastApp(ctx: Context) {
     LaunchedEffect(query, searchFilter) {
         val q = query.trim()
         if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
-        delay(80)
+        delay(300)
         val requested = q
         val requestedFilter = searchFilter
         searching = true
