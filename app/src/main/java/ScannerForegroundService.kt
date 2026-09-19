@@ -150,26 +150,28 @@ class ScannerForegroundService : Service() {
                     // calculation. This removes the old "one instrument at a time" idle
                     // gaps without hammering BCS with an unbounded number of requests.
                     setStatus("БКС: получаю инструменты и запускаю поток анализа…", 0f)
-                    val queue = Channel<SearchResult>(capacity = 24)
-                    val producer = launch(Dispatchers.IO) {
-                        try {
-                            repo.streamScannerInstruments(instrumentType) { meta ->
-                                if (running.get()) runBlocking { queue.send(meta) }
-                            }
-                        } finally {
-                            queue.close()
-                        }
-                    }
-                    val workers = (0 until 4).map {
-                        launch(Dispatchers.IO) {
-                            for (meta in queue) {
-                                if (!running.get()) break
-                                processInstrument(meta)
+                    coroutineScope {
+                        val queue = Channel<SearchResult>(capacity = 24)
+                        val producer = launch(Dispatchers.IO) {
+                            try {
+                                repo.streamScannerInstruments(instrumentType) { meta ->
+                                    if (running.get()) runBlocking { queue.send(meta) }
+                                }
+                            } finally {
+                                queue.close()
                             }
                         }
+                        val workers = (0 until 4).map {
+                            launch(Dispatchers.IO) {
+                                for (meta in queue) {
+                                    if (!running.get()) break
+                                    processInstrument(meta)
+                                }
+                            }
+                        }
+                        workers.joinAll()
+                        producer.cancelAndJoin()
                     }
-                    workers.joinAll()
-                    producer.cancelAndJoin()
                 }
 
                 val now = System.currentTimeMillis()

@@ -151,7 +151,7 @@ class MarketRepository(
         // by-ticker endpoint immediately. This avoids a directory walk for the searches
         // people make most often (and still verifies the instrument against BCS).
         val seedTicker = aliases[q.lowercase(Locale.ROOT)] ?: popularSeeds()
-            .firstOrNull { normalizeSearchText(it.second) == normalizeSearchText(q) }?.first
+            .firstOrNull { normalizeSearchText(it.name) == normalizeSearchText(q) }?.symbol
         val directTicker = seedTicker ?: q.uppercase(Locale.US)
             .replace("/", "").replace("-", "")
             .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
