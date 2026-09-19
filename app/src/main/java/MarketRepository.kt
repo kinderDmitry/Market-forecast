@@ -41,12 +41,6 @@ class MarketRepository(
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
-        private const val CATALOG_CACHE_MS = 900_000L
-        private const val SEARCH_CACHE_MS = 60_000L
-        private const val LOCAL_INDEX_VERSION = 1
-        private const val LOCAL_INDEX_KEY = "mfp_search_index_v1"
-        private const val FULL_CATALOG_META_KEY = "mfp_full_catalog_meta_v1"
-        private const val FULL_CATALOG_FILE = "bcs_trading_catalog_v2.json"
         // Only instruments the app can actually search/scan: shares (including
         // foreign shares/DRs) and currencies. Do not download ETFs, indices,
         // bonds, futures, options or other BCS directory types.
@@ -59,106 +53,11 @@ class MarketRepository(
         private val bcsHttpGate = Any()
         private var bcsLastRequestAt = 0L
         private const val BCS_MIN_REQUEST_GAP_MS = 115L
-        private val searchCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
-        // Cache is keyed by the requested instrument-type set. A single global
-        // catalogue used to let a previous STOCK search poison a later FX scan.
-        private val catalogCaches = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
-        private val catalogPool = Executors.newFixedThreadPool(6)
-        private val searchIndex = java.util.concurrent.atomic.AtomicReference<List<SearchResult>>(emptyList())
-        private val searchIndexReady = java.util.concurrent.atomic.AtomicBoolean(false)
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
-
-    init {
-        // Search must be usable before any network request completes. Restore the
-        // last BCS-backed directory snapshot synchronously (small JSON payload) and
-        // refresh it in the background from warmSearchIndex().
-        restoreSearchIndex()
-    }
-
-    private fun restoreSearchIndex() {
-        val raw = prefs?.getString(LOCAL_INDEX_KEY, null) ?: return
-        runCatching {
-            val root = JSONArray(raw)
-            val out = ArrayList<SearchResult>(root.length())
-            for (i in 0 until root.length()) {
-                val o = root.optJSONObject(i) ?: continue
-                val symbol = o.optString("s")
-                if (symbol.isBlank()) continue
-                out += SearchResult(
-                    symbol, o.optString("n", symbol), o.optString("e", "БКС"),
-                    o.optString("t", "STOCK"), "БКС", o.optString("c", "")
-                )
-            }
-            if (out.isNotEmpty()) {
-                searchIndex.set(out)
-                searchIndexReady.set(true)
-            }
-        }
-    }
-
-    private fun persistSearchIndex(items: List<SearchResult>) {
-        if (prefs == null || items.isEmpty()) return
-        runCatching {
-            val arr = JSONArray()
-            items.forEach { item ->
-                arr.put(JSONObject().put("s", item.symbol).put("n", item.name)
-                    .put("e", item.exchange).put("t", item.type).put("c", item.classCode))
-            }
-            prefs?.edit()?.putString(LOCAL_INDEX_KEY, arr.toString())?.apply()
-        }
-    }
-
-    private fun rebuildSearchIndex(items: List<SearchResult>) {
-        val merged = LinkedHashMap<String, SearchResult>()
-        popularSeeds().forEach { merged[it.symbol.uppercase(Locale.US)] = it }
-        items.forEach { merged[it.symbol.uppercase(Locale.US)] = it }
-        val result = merged.values.toList()
-        searchIndex.set(result)
-        searchIndexReady.set(result.isNotEmpty())
-        persistSearchIndex(result)
-    }
-
-    private fun localSearch(query: String, limit: Int = 50): List<SearchResult> {
-        val needle = normalizeSearchText(query)
-        if (needle.isBlank()) return emptyList()
-        val translit = transliterateRuToLat(needle)
-        return searchIndex.get().asSequence().mapNotNull { item ->
-            val symbol = normalizeSearchText(item.symbol)
-            val name = normalizeSearchText(item.name)
-            val symbolCompact = compactSearch(symbol)
-            val nameCompact = compactSearch(name)
-            val translitName = transliterateRuToLat(name)
-            val score = when {
-                symbol == needle || name == needle -> 0
-                symbol.startsWith(needle) -> 10
-                name.startsWith(needle) -> 20
-                symbolCompact.startsWith(compactSearch(needle)) -> 25
-                nameCompact.startsWith(compactSearch(needle)) -> 30
-                translit.isNotBlank() && symbol.startsWith(translit) -> 35
-                translit.isNotBlank() && translitName.startsWith(translit) -> 40
-                symbol.contains(needle) -> 50
-                name.contains(needle) -> 60
-                else -> return@mapNotNull null
-            }
-            score to item
-        }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }
-            .thenBy { it.second.name.length }
-            .thenBy { it.second.name.lowercase(Locale.ROOT) })
-            .map { it.second }.distinctBy { it.symbol.uppercase(Locale.US) }.take(limit).toList()
-    }
-
-    private fun normalizeSearchText(value: String): String =
-        value.trim().lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
-
-    private fun compactSearch(value: String): String =
-        value.replace(" ", "").replace("-", "").replace("/", "")
-
-    fun searchLocal(query: String): List<SearchResult> = localSearch(query)
-
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -213,53 +112,32 @@ class MarketRepository(
         tasks.forEach { runCatching { it.get(20, TimeUnit.SECONDS) } }
     }
 
-    fun search(query: String): List<SearchResult> {
+    /** Search always resolves against BCS API. No local catalogue/cache is used as the source of search results. */
+    fun search(query: String, filter: String = "ALL"): List<SearchResult> {
         val q = query.trim()
-        if (q.length < 1 || !isBcsConfigured()) return emptyList()
-        val searchKey = q.lowercase(Locale.ROOT)
-        val now = System.currentTimeMillis()
-        searchCaches[searchKey]?.let { cached ->
-            if (now - cached.first <= SEARCH_CACHE_MS) return cached.second
+        if (q.isBlank() || !isBcsConfigured()) return emptyList()
+        val wanted = when (filter.uppercase(Locale.US)) {
+            "FX" -> listOf("CURRENCY")
+            "STOCK" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+            else -> TRADING_INSTRUMENT_TYPES
         }
-
-        // Primary path: local BCS directory snapshot. This is deliberately before
-        // all HTTP work, so normal autocomplete does not wait on network latency.
-        val local = localSearch(q)
-        if (local.isNotEmpty()) {
-            searchCaches[searchKey] = now to local
-            return local
-        }
-        // A single character is handled entirely from the local BCS-backed seed
-        // index. This is critical for responsive autocomplete: one keystroke must
-        // never start an HTTP request or a multi-page catalogue scan.
-        if (q.length == 1) {
-            val needleOne = q.lowercase(Locale.ROOT)
-            val translitOne = transliterateRuToLat(needleOne)
-            val instant = popularSeeds().filter { seed ->
-                val symbol = seed.symbol.lowercase(Locale.ROOT)
-                val name = seed.name.lowercase(Locale.ROOT)
-                symbol.startsWith(needleOne) || name.startsWith(needleOne) ||
-                    (translitOne.isNotBlank() && (symbol.startsWith(translitOne) || transliterateRuToLat(name).startsWith(translitOne)))
-            }.take(50)
-            searchCaches[searchKey] = now to instant
-            return instant
-        }
-
-        // Fast path: the BCS directory has a dedicated "by tickers" endpoint.
-        // Do not wait for the whole catalogue when the user typed a ticker/name
-        // that can be resolved directly (e.g. CIAN/ЦИАН, SBER/СБЕР).
-        val direct = LinkedHashMap<String, SearchResult>()
         val aliases = mapOf(
-            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP",
-            "лукойл" to "LKOH", "роснефть" to "ROSN", "новатэк" to "NVTK",
-            "татнефть" to "TATN", "магнит" to "MGNT", "мосбиржа" to "MOEX",
-            "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
-            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS",
-            "норникель" to "GMKN", "полюс" to "PLZL", "фосагро" to "PHOR",
-            "ростелеком" to "RTKM", "алроса" to "ALRS", "совкомфлот" to "FLOT",
-            "полиметалл" to "POLY", "интер рао" to "IRAO", "эн+" to "ENPG",
-            "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM", "юань" to "CNYRUB_TOM"
+            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
+            "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
+            "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
+            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
+            "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
+            "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
+            "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
         )
+        fun matchesType(item: SearchResult): Boolean {
+            val t = item.type.uppercase(Locale.US)
+            return when (filter.uppercase(Locale.US)) {
+                "FX" -> t.contains("CURRENCY") || t.contains("FOREX")
+                "STOCK" -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+                else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
+            }
+        }
         val directTicker = aliases[q.lowercase(Locale.ROOT)] ?: q.uppercase(Locale.US)
             .replace("/", "").replace("-", "")
             .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
@@ -267,256 +145,63 @@ class MarketRepository(
             runCatching { bcsInstrumentInfo(directTicker) }.getOrNull()?.let { o ->
                 val ticker = o.optString("ticker").ifBlank { directTicker }
                 val board = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                direct[ticker.uppercase(Locale.US)] = SearchResult(
+                val item = SearchResult(
                     ticker,
                     o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
                     board?.optString("exchange").orEmpty().ifBlank { "БКС" },
                     o.optString("instrumentType").ifBlank { if (ticker.endsWith("=X")) "CURRENCY" else "STOCK" },
-                    "БКС",
-                    board?.optString("classCode").orEmpty()
+                    "БКС", board?.optString("classCode").orEmpty()
                 )
+                if (matchesType(item)) return listOf(item)
             }
         }
 
-        // Exact ticker/alias resolution is complete enough for the interactive search
-        // result. Do not block it behind a multi-page catalogue request. This keeps
-        // common searches (SBER, Сбер, Роснефть, USD/RUB, etc.) near-instant.
-        if (direct.isNotEmpty()) {
-            val exact = direct.values.take(50)
-            searchCaches[searchKey] = now to exact
-            return exact
-        }
-
-        // Name search still needs the directory. The catalogue loader is resilient
-        // to 429 and keeps partial pages instead of discarding the whole result set.
-        val universe = runCatching { searchCatalog() }.getOrElse { emptyList() }
-        val needle = q.lowercase(Locale.ROOT)
-        val compact = needle.replace(" ", "").replace("-", "").replace("/", "")
+        // Name search is also API-only: walk only the selected BCS instrument types,
+        // page by page, and match the returned BCS display/short names.
+        val needle = normalizeSearchText(q)
+        val compact = compactSearch(needle)
         val transliterated = transliterateRuToLat(needle)
-        val matched = universe.mapNotNull { item ->
-            val symbol = item.symbol.lowercase(Locale.ROOT).removeSuffix(".me")
-            val name = item.name.lowercase(Locale.ROOT)
-            val nameCompact = name.replace(" ", "").replace("-", "").replace("/", "")
-            val symbolLat = symbol
-            val rank = when {
-                symbol == needle || name == needle -> 0
-                symbol.startsWith(needle) || name.startsWith(needle) -> 1
-                transliterated.isNotBlank() && (symbolLat.startsWith(transliterated) || name.startsWith(transliterated)) -> 1
-                symbol.contains(needle) || name.contains(needle) -> 3
-                symbol.startsWith(compact) || nameCompact.startsWith(compact) -> 2
-                else -> return@mapNotNull null
+        val out = mutableListOf<Pair<Int, SearchResult>>()
+        for (type in wanted) {
+            val items = runCatching { loadCatalogType(type, Int.MAX_VALUE) }.getOrElse { emptyList() }
+            for (item in items) {
+                if (!matchesType(item)) continue
+                val symbol = normalizeSearchText(item.symbol)
+                val name = normalizeSearchText(item.name)
+                val nameCompact = compactSearch(name)
+                val rank = when {
+                    symbol == needle || name == needle -> 0
+                    symbol.startsWith(needle) || name.startsWith(needle) -> 1
+                    compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
+                    transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
+                    symbol.contains(needle) || name.contains(needle) -> 3
+                    else -> continue
+                }
+                out += rank to item
             }
-            rank to item
-        }.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
+            if (out.any { it.first == 0 }) break
+        }
+        return out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
             .map { it.second }
-
-        // For one-character autocomplete, prefix matches are the primary result set.
-        // Keep a small set of direct seeds visible even while the BCS catalogue is warming.
-        // Autocomplete must react from the very first character. Keep a local
-        // BCS-backed seed index available immediately, while the full BCS catalogue
-        // is loading. This also makes Cyrillic input ("с", "ц", "р") useful.
-        val seedMatches = popularSeeds().filter { seed ->
-            val symbol = seed.symbol.lowercase(Locale.ROOT)
-            val name = seed.name.lowercase(Locale.ROOT)
-            val translitName = transliterateRuToLat(name)
-            symbol.startsWith(needle) || name.startsWith(needle) ||
-                (transliterated.isNotBlank() && (symbol.startsWith(transliterated) || translitName.startsWith(transliterated)))
-        }
-        val finalResults = (direct.values + seedMatches + matched)
-            .distinctBy { it.symbol.uppercase(Locale.US) }
+            .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
             .take(50)
-        searchCaches[searchKey] = now to finalResults
-        return finalResults
     }
 
-    /**
-     * Persistent authoritative BCS directory. The instrument directory is configuration data,
-     * not live market data, so it is downloaded explicitly and then reused by search/scanner.
-     * Quotes/candles are still fetched live when a signal is calculated.
-     */
-    private fun fullCatalogFile(): java.io.File? = context?.filesDir?.resolve(FULL_CATALOG_FILE)
-
-    private fun readFullCatalogSnapshot(): List<SearchResult> {
-        val file = fullCatalogFile() ?: return emptyList()
-        if (!file.exists() || file.length() <= 0L) return emptyList()
-        return runCatching {
-            val root = JSONArray(file.readText(Charsets.UTF_8))
-            val out = ArrayList<SearchResult>(root.length())
-            for (i in 0 until root.length()) {
-                val o = root.optJSONObject(i) ?: continue
-                val symbol = o.optString("s").trim()
-                if (symbol.isBlank()) continue
-                val type = o.optString("t", "STOCK").uppercase(Locale.US)
-                if (type !in TRADING_INSTRUMENT_TYPES) continue
-                out += SearchResult(
-                    symbol, o.optString("n", symbol), o.optString("e", "БКС"),
-                    type, "БКС", o.optString("c", "")
-                )
-            }
-            out
-        }.getOrDefault(emptyList())
-    }
-
-    private fun persistFullCatalogSnapshot(items: List<SearchResult>) {
-        val file = fullCatalogFile() ?: return
-        runCatching {
-            val arr = JSONArray()
-            items.forEach { item ->
-                arr.put(JSONObject().put("s", item.symbol).put("n", item.name)
-                    .put("e", item.exchange).put("t", item.type).put("c", item.classCode))
-            }
-            val tmp = java.io.File(file.parentFile, file.name + ".tmp")
-            tmp.writeText(arr.toString(), Charsets.UTF_8)
-            if (!tmp.renameTo(file)) {
-                file.delete()
-                if (!tmp.renameTo(file)) throw IllegalStateException("Не удалось сохранить кэш каталога БКС")
-            }
-            if (!file.exists() || file.length() <= 0L) throw IllegalStateException("Кэш каталога БКС не создан")
-            prefs?.edit()?.putLong(FULL_CATALOG_META_KEY, System.currentTimeMillis())?.apply()
-        }.getOrElse { throw IllegalStateException("Не удалось сохранить кэш каталога БКС", it) }
-    }
-
-    fun fullCatalogCached(): List<SearchResult> = readFullCatalogSnapshot()
-
-    fun fullCatalogUpdatedAt(): Long = prefs?.getLong(FULL_CATALOG_META_KEY, 0L) ?: 0L
-
-    /** Force-download the complete BCS directory and atomically replace the local snapshot. */
-    fun refreshFullCatalog(onProgress: ((String) -> Unit)? = null): List<SearchResult> {
-        check(isBcsConfigured()) { "БКС не подключён" }
-        val totalTypes = TRADING_INSTRUMENT_TYPES.size
-        prefs?.edit()?.putBoolean("catalog_refresh_running", true)
-            ?.putInt("catalog_refresh_types_total", totalTypes)
-            ?.putInt("catalog_refresh_types_done", 0)
-            ?.putInt("catalog_refresh_current_page", 0)
-            ?.putInt("catalog_refresh_items", 0)
-            ?.putString("catalog_refresh_current_type", "Подготовка")
-            ?.putString("catalog_refresh_status", "Подготовка каталога акций и валют БКС…")
-            ?.apply()
-        onProgress?.invoke("Подготовка каталога акций и валют БКС…")
-        val fresh = loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE, forceRefresh = true)
-        check(fresh.isNotEmpty()) { "БКС вернул пустой каталог" }
-        persistFullCatalogSnapshot(fresh)
-        catalogCaches[TRADING_INSTRUMENT_TYPES.sorted().joinToString(",")] = System.currentTimeMillis() to fresh
-        rebuildSearchIndex(fresh)
-        prefs?.edit()?.putBoolean("catalog_refresh_running", false)
-            ?.putFloat("catalog_refresh_progress", 1f)
-            ?.putInt("catalog_refresh_types_done", totalTypes)
-            ?.putInt("catalog_refresh_items", fresh.size)
-            ?.putString("catalog_refresh_current_type", "Готово")
-            ?.putString("catalog_refresh_status", "Каталог сохранён: ${fresh.size} инструментов")
-            ?.putString("catalog_refresh_error", "")
-            ?.putLong("catalog_refresh_finished_at", System.currentTimeMillis())
-            ?.apply()
-        onProgress?.invoke("Каталог БКС сохранён: ${fresh.size} инструментов")
-        return fresh
-    }
-
-    /** Search-oriented catalogue: only tradable equity/FX classes needed by the app. */
-    private fun searchCatalog(): List<SearchResult> {
-        val cached = readFullCatalogSnapshot()
-        if (cached.isNotEmpty()) return cached
-        return loadCatalog(
-            TRADING_INSTRUMENT_TYPES,
-            maxPagesPerType = Int.MAX_VALUE
-        )
-    }
-
-    /** Warm the searchable BCS directory without blocking the UI. */
-    fun warmSearchIndex() {
-        if (!isBcsConfigured()) return
-        // If a persisted snapshot exists, it is already serving searches. Refresh
-        // the authoritative BCS directory in the background and atomically swap it.
-        runCatching {
-            val fresh = searchCatalog()
-            if (fresh.isNotEmpty()) rebuildSearchIndex(fresh)
+    /** Scanner universe comes directly from BCS, page-by-page, with no catalogue cache. */
+    fun scannerCatalog(type: String): List<SearchResult> {
+        val types = when (type.uppercase(Locale.US)) {
+            "FX" -> listOf("CURRENCY")
+            "STOCKS" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+            else -> TRADING_INSTRUMENT_TYPES
         }
-    }
-
-    /**
-     * Scanner universe. ALL means the complete BCS instrument directory, not a
-     * hardcoded subset and not a fixed page cap. Instruments without candle/quote
-     * data are handled by the scanner as unsupported and skipped without stopping
-     * the remaining universe.
-     */
-    fun scannerCatalog(type: String): List<SearchResult> = when (type.uppercase(Locale.US)) {
-        "ALL" -> readFullCatalogSnapshot().ifEmpty { loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE) }
-        "FX" -> {
-            val full = readFullCatalogSnapshot()
-            if (full.isNotEmpty()) full.filter { it.type.contains("CURRENCY", true) }
-            else loadCatalog(listOf("CURRENCY"), Int.MAX_VALUE)
-        }
-        "STOCKS" -> {
-            val full = readFullCatalogSnapshot()
-            if (full.isNotEmpty()) full.filter { it.type.uppercase(Locale.US) in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS") }
-            else loadCatalog(listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS"), Int.MAX_VALUE)
-        }
-        else -> readFullCatalogSnapshot().ifEmpty { loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE) }
-    }
-
-    /** Dynamic BCS instrument catalogue. No MOEX/Yahoo catalogue is used. */
-    fun catalog(limit: Int = Int.MAX_VALUE): List<SearchResult> {
-        val full = readFullCatalogSnapshot()
-        val source = if (full.isNotEmpty()) full else loadCatalog(TRADING_INSTRUMENT_TYPES, Int.MAX_VALUE)
-        return if (limit == Int.MAX_VALUE) source else source.take(limit)
-    }
-
-    private fun loadCatalog(types: List<String>, maxPagesPerType: Int, forceRefresh: Boolean = false): List<SearchResult> {
-        if (!isBcsConfigured()) return emptyList()
-        val now = System.currentTimeMillis()
-        val cacheKey = types.map { it.uppercase(Locale.US) }.distinct().sorted().joinToString(",")
-        val cached = catalogCaches[cacheKey]
-        if (!forceRefresh && cached != null && cached.second.isNotEmpty() && now - cached.first <= CATALOG_CACHE_MS) return cached.second
-
-        // BCS exposes the catalogue by instrument type. Fetch different types in
-        // parallel, while keeping pagination for each type ordered. This removes the
-        // old 4-7x sequential network penalty without changing the authoritative source.
-        val distinctTypes = types.distinct()
-        val completedTypes = java.util.concurrent.atomic.AtomicInteger(0)
         val out = LinkedHashMap<String, SearchResult>()
-        var failedTypes = 0
-        val futures = distinctTypes.map { type ->
-            catalogPool.submit<List<SearchResult>> {
-                prefs?.edit()?.putString("catalog_refresh_current_type", type)
-                    ?.putInt("catalog_refresh_current_page", 0)
-                    ?.putString("catalog_refresh_status", "БКС: загрузка $type…")?.apply()
-                loadCatalogType(type, maxPagesPerType) { page, pageItems, finished ->
-                    val done = completedTypes.get()
-                    val progress = if (distinctTypes.isNotEmpty()) (done.toFloat() / distinctTypes.size.toFloat()).coerceIn(0f, .97f) else 0f
-                    prefs?.edit()?.putFloat("catalog_refresh_progress", progress)
-                        ?.putInt("catalog_refresh_types_done", done)
-                        ?.putInt("catalog_refresh_types_total", distinctTypes.size)
-                        ?.putInt("catalog_refresh_current_page", page + 1)
-                        ?.putInt("catalog_refresh_items", out.size + pageItems)
-                        ?.putString("catalog_refresh_current_type", type)
-                        ?.putString("catalog_refresh_status", "БКС: $type • страница ${page + 1}${if (finished) " • завершено" else ""}")
-                        ?.apply()
-                }
+        for (instrumentType in types) {
+            loadCatalogType(instrumentType, Int.MAX_VALUE).forEach { item ->
+                out.putIfAbsent(catalogIdentity(item), item)
             }
         }
-        futures.forEachIndexed { index, future ->
-            try {
-                future.get(20, TimeUnit.MINUTES).forEach { item ->
-                    synchronized(out) { out.putIfAbsent(catalogIdentity(item), item) }
-                }
-                val done = completedTypes.incrementAndGet()
-                prefs?.edit()?.putFloat("catalog_refresh_progress", (done.toFloat() / distinctTypes.size.toFloat()).coerceIn(0f, .97f))
-                    ?.putInt("catalog_refresh_types_done", done)
-                    ?.putString("catalog_refresh_status", "БКС: тип ${done}/${distinctTypes.size} завершён")
-                    ?.apply()
-            } catch (_: Throwable) {
-                failedTypes++
-            }
-        }
-        if (failedTypes > 0) {
-            throw IllegalStateException("БКС: каталог неполный, не загружено типов: $failedTypes")
-        }
-        val result = out.values.toList()
-        if (result.isNotEmpty()) catalogCaches[cacheKey] = System.currentTimeMillis() to result
-        return result
+        return out.values.toList()
     }
-
-    private fun catalogIdentity(item: SearchResult): String =
-        "${item.symbol.trim().uppercase(Locale.US)}@${item.classCode.trim().uppercase(Locale.US)}"
 
     private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()

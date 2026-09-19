@@ -146,6 +146,7 @@ fun MarketForecastApp(ctx: Context) {
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
+    var searchFilter by remember { mutableStateOf(prefs.getString("search_filter", "ALL") ?: "ALL") }
     var state by remember { mutableStateOf(MarketState(selected, loading = true, dataSource = repo.forecastSource(selected))) }
     var news by remember { mutableStateOf(loadCachedNews(prefs)) }
     var marketNews by remember { mutableStateOf(loadCachedNews(prefs)) }
@@ -301,36 +302,17 @@ fun MarketForecastApp(ctx: Context) {
         }
     }
 
-    LaunchedEffect(Unit) {
-        // Warm only the searchable BCS directory. The previous full-market warmup
-        // loaded stocks, FX, funds, indices, futures, options and bonds before the
-        // user had asked for anything; that made startup and the first search feel slow.
-        withContext(Dispatchers.IO) { repo.warmSearchIndex() }
-    }
-    LaunchedEffect(query) {
+    LaunchedEffect(query, searchFilter) {
         val q = query.trim()
         if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
-        // Local BCS-backed index is the first and normally only path for autocomplete.
-        // Render it immediately on every keystroke; network is used only when the local
-        // snapshot has no match. This removes the old 320 ms debounce from normal search.
-        searching = false
-        val local = withContext(Dispatchers.Default) { repo.searchLocal(q) }
-        if (local.isNotEmpty()) {
-            results = local
-            return@LaunchedEffect
-        }
-        if (q.length == 1) {
-            results = emptyList()
-            return@LaunchedEffect
-        }
         delay(80)
         val requested = q
+        val requestedFilter = searchFilter
         searching = true
-        val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested) }.getOrDefault(emptyList()) }
-        // Do not let an older, slower HTTP response overwrite a newer query.
-        if (query.trim().equals(requested, true)) {
+        val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested, requestedFilter) }.getOrDefault(emptyList()) }
+        if (query.trim().equals(requested, true) && searchFilter == requestedFilter) {
             results = found
-            message = if (ru) "Поиск завершён: найдено ${results.size}" else "Search completed: ${results.size} found"
+            message = if (ru) "Поиск БКС завершён: найдено ${results.size}" else "BCS search completed: ${results.size} found"
         }
         searching = false
     }
@@ -539,7 +521,7 @@ fun MarketForecastApp(ctx: Context) {
                 AnimatedContent(targetState = screen, label = "screen") { s ->
                     when (s) {
                         Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, marketPicks, marketLoading, marketMode, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, { marketMode = it }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
-                        Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, ::saveFav) { load(it.symbol) }
+                        Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick, { row -> pendingScanTrack = row.result.symbol to row.timeframe; load(row.result.symbol, row.timeframe) })
@@ -981,11 +963,10 @@ private fun regimeRu(regime: String): String = when (regime) {
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
 @Composable private fun TrackedForSymbol(tracked: List<TrackedForecast>, symbol: String, ru: Boolean) { val items = tracked.filter { it.symbol == symbol }.take(6); if (items.isEmpty()) return; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Отслеживание" else "Monitoring", "${items.size} • ${if (ru) "без дублей по TF" else "unique by timeframe"}"); items.forEach { t -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("${t.signal} • ${t.timeframe}", fontWeight = FontWeight.Bold, fontSize = 10.sp); Text(if (ru) "Вход ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}" else "Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(t.result, fontWeight = FontWeight.Black, fontSize = 9.sp, color = when(t.result){"PENDING"->Warning;"FLAT"->Warning;"FAIL"->Negative;else->Positive}) } } } }
 
-@Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
+@Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, searchFilter: String, onFilterChange: (String) -> Unit, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
     val ctx = LocalContext.current
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
     var searchHistory by remember { mutableStateOf(loadSearchHistory(prefs)) }
-    var searchFilter by remember { mutableStateOf(prefs.getString("search_filter", "ALL") ?: "ALL") }
     val filtered = results.filter { matchesSearchFilter(it, searchFilter) }
     val prefix = q.trim()
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -1016,7 +997,7 @@ private fun regimeRu(regime: String): String = when (regime) {
         item {
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("ALL","STOCK","FX").forEach { f ->
-                    FilterChip(selected = searchFilter == f, onClick = { searchFilter=f; prefs.edit().putString("search_filter", f).apply() }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";else->"Все"} else when(f){"STOCK"->"Stocks";"FX"->"Currencies";else->"All"},fontSize=8.sp) })
+                    FilterChip(selected = searchFilter == f, onClick = { onFilterChange(f) }, label = { Text(if (ru) when(f){"STOCK"->"Акции";"FX"->"Валюты";else->"Все"} else when(f){"STOCK"->"Stocks";"FX"->"Currencies";else->"All"},fontSize=8.sp) })
                 }
             }
         }
@@ -1502,14 +1483,24 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun Stats(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean) { val done=history.filter{it.directionOk!=null};val wins=done.count{it.directionOk==true};val longs=history.count{it.signal.contains("LONG")};val shorts=history.count{it.signal.contains("SHORT")};val avg=if(history.isEmpty())0 else history.map{it.confidence}.average().roundToInt();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard(if(ru) "ПРОГНОЗЫ" else "FORECASTS",history.size.toString(),Accent,Modifier.weight(1f));MetricCard(if(ru) "УСПЕШНЫЕ" else "WINS",wins.toString(),Positive,Modifier.weight(1f));MetricCard(if(ru) "ТОЧНОСТЬ" else "ACCURACY",if(done.isEmpty())"—" else "${wins*100/done.size}%",Warning,Modifier.weight(1f))}};item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard("LONG",longs.toString(),Positive,Modifier.weight(1f));MetricCard("SHORT",shorts.toString(),Negative,Modifier.weight(1f));MetricCard(if(ru) "СРЕДНЯЯ УВЕРЕННОСТЬ" else "AVG CONF","$avg%",Blue,Modifier.weight(1f))}};item{GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Активные отслеживания" else "Active monitoring",fontWeight=FontWeight.Black);Text(tracked.count{it.result=="PENDING"}.toString(),fontSize=28.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=5.dp));Text(if(ru)"Уникальность обеспечивается парой инструмент + таймфрейм." else "Uniqueness is enforced by instrument + timeframe.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
 }
 
+@Composable private fun BcsConnectionSettings(ru:Boolean,prefs:android.content.SharedPreferences){
+    var token by remember { mutableStateOf(prefs.getString("bcs_refresh_token","").orEmpty()) }
+    var saved by remember { mutableStateOf(token.isNotBlank()) }
+    SettingGroup(if(ru)"БКС" else "BCS"){
+        Text(if(ru)"Поиск и сканер получают список инструментов напрямую из API БКС. Каталог в приложении не загружается и не кэшируется." else "Search and scanner obtain instruments directly from the BCS API. No instrument catalogue is downloaded or cached in the app.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedTextField(value=token,onValueChange={token=it;saved=false},modifier=Modifier.fillMaxWidth().padding(top=8.dp),singleLine=true,label={Text(if(ru)"Refresh-токен БКС" else "BCS refresh token")},visualTransformation=PasswordVisualTransformation())
+        Button(onClick={prefs.edit().putString("bcs_refresh_token",token.trim()).apply();saved=token.isNotBlank()},enabled=token.isNotBlank(),modifier=Modifier.fillMaxWidth().padding(top=7.dp),shape=RoundedCornerShape(13.dp)){Text(if(ru)if(saved)"БКС подключён" else "Сохранить токен" else if(saved)"BCS connected" else "Save token",fontWeight=FontWeight.Black)}
+        Text(if(token.isNotBlank()&&saved)if(ru)"Источник инструментов и рыночных данных: БКС API" else "Instrument and market-data source: BCS API" else if(ru)"Введите refresh-токен БКС с правами только для чтения." else "Enter a BCS read-only refresh token.",fontSize=8.sp,color=if(token.isNotBlank()&&saved)Positive else Warning,modifier=Modifier.padding(top=5.dp))
+    }
+}
 @Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit,repo:MarketRepository){
     val ctx = LocalContext.current
     var alertSignal by remember{mutableStateOf(prefs.getBoolean("alert_signal",true))}; var alertNews by remember{mutableStateOf(prefs.getBoolean("alert_news",true))}; var alertDividends by remember{mutableStateOf(prefs.getBoolean("alert_dividends",true))}; var alertResult by remember{mutableStateOf(prefs.getBoolean("alert_result",true))}; var alertTp1 by remember{mutableStateOf(prefs.getBoolean("alert_tp1",true))}; var alertTp2 by remember{mutableStateOf(prefs.getBoolean("alert_tp2",true))}; var alertTp3 by remember{mutableStateOf(prefs.getBoolean("alert_tp3",true))}; var alertSl by remember{mutableStateOf(prefs.getBoolean("alert_sl",true))}; var alertPrice by remember{mutableStateOf(prefs.getBoolean("alert_price",false))}
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=10.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang)}}
+        item{BcsConnectionSettings(ru,prefs)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=8.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=10.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
-        item { BcsSettingsCard(ru, prefs) }
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=8.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=8.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=9.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}
         item { SettingGroup(if (ru) "Фоновый мониторинг" else "Background monitoring") {
@@ -1521,114 +1512,6 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
             }
         } }
         item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){Button(onClick=runNow,modifier=Modifier.weight(1f),shape=RoundedCornerShape(15.dp)){Icon(Icons.Default.Refresh,null);Spacer(Modifier.width(5.dp));Text(if(ru)"Проверить" else "Check",fontWeight=FontWeight.Bold)};Button(onClick=clearHistory,modifier=Modifier.weight(1f),shape=RoundedCornerShape(15.dp),colors=ButtonDefaults.buttonColors(containerColor=Negative)){Icon(Icons.Default.Delete,null);Spacer(Modifier.width(5.dp));Text(if(ru)"Очистить" else "Clear",fontWeight=FontWeight.Bold)}}}
-    }
-}
-@Composable private fun BcsSettingsCard(ru: Boolean, prefs: android.content.SharedPreferences) {
-    val ctx = LocalContext.current
-    var token by remember { mutableStateOf(prefs.getString("bcs_refresh_token", "") ?: "") }
-    var visible by remember { mutableStateOf(false) }
-    var saved by remember { mutableStateOf(false) }
-    var running by remember { mutableStateOf(prefs.getBoolean("catalog_refresh_running", false)) }
-    var progress by remember { mutableFloatStateOf(prefs.getFloat("catalog_refresh_progress", 0f)) }
-    var typesDone by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_done", 0)) }
-    var typesTotal by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_types_total", 4)) }
-    var currentType by remember { mutableStateOf(prefs.getString("catalog_refresh_current_type", "") ?: "") }
-    var currentPage by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_current_page", 0)) }
-    var items by remember { mutableIntStateOf(prefs.getInt("catalog_refresh_items", 0)) }
-    var status by remember { mutableStateOf(prefs.getString("catalog_refresh_status", "") ?: "") }
-    var error by remember { mutableStateOf(prefs.getString("catalog_refresh_error", "") ?: "") }
-    var cachedCount by remember { mutableIntStateOf(0) }
-    var cachedAt by remember { mutableLongStateOf(0L) }
-
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx)
-            cachedCount = repo.fullCatalogCached().size
-            cachedAt = repo.fullCatalogUpdatedAt()
-        }
-        while (true) {
-            running = prefs.getBoolean("catalog_refresh_running", false)
-            progress = prefs.getFloat("catalog_refresh_progress", 0f).coerceIn(0f, 1f)
-            typesDone = prefs.getInt("catalog_refresh_types_done", 0)
-            typesTotal = prefs.getInt("catalog_refresh_types_total", 4).coerceAtLeast(1)
-            currentType = prefs.getString("catalog_refresh_current_type", "") ?: ""
-            currentPage = prefs.getInt("catalog_refresh_current_page", 0)
-            items = prefs.getInt("catalog_refresh_items", 0)
-            status = prefs.getString("catalog_refresh_status", "") ?: ""
-            error = prefs.getString("catalog_refresh_error", "") ?: ""
-            if (!running) {
-                withContext(Dispatchers.IO) {
-                    val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = prefs, context = ctx)
-                    cachedCount = repo.fullCatalogCached().size
-                    cachedAt = repo.fullCatalogUpdatedAt()
-                }
-            }
-            kotlinx.coroutines.delay(700)
-        }
-    }
-
-    SettingGroup(if (ru) "БКС — источник рыночных данных" else "BCS — market data source") {
-        Text(
-            if (ru) "Полный каталог загружается отдельным фоновым процессом. Переход в другой раздел не прерывает загрузку. После завершения один и тот же кэш используется поиском и сканером; котировки и свечи остаются живыми." else "The full directory downloads in an independent background process. Leaving Settings does not cancel it. After completion the same cache is used by search and scanner; quotes and candles remain live.",
-            fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        OutlinedTextField(
-            value = token,
-            onValueChange = { token = it; saved = false },
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            singleLine = true,
-            label = { Text(if (ru) "Токен обновления БКС (только чтение)" else "BCS read-only refresh token") },
-            visualTransformation = if (visible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
-            trailingIcon = { TextButton(onClick = { visible = !visible }) { Text(if (visible) "Скрыть" else "Показать", fontSize = 8.sp) } }
-        )
-        Button(
-            onClick = { prefs.edit().putString("bcs_refresh_token", token.trim()).apply(); saved = true },
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Accent),
-            shape = RoundedCornerShape(13.dp)
-        ) { Text(if (saved) (if (ru) "Токен сохранён" else "Token saved") else (if (ru) "Сохранить токен БКС" else "Save BCS token"), fontWeight = FontWeight.Black) }
-
-        if (running) {
-            val percent = (progress * 100f).roundToInt().coerceIn(0, 99)
-            val leftTypes = (typesTotal - typesDone).coerceAtLeast(0)
-            Text(if (ru) "Загрузка каталога • $percent%" else "Directory download • $percent%", fontWeight = FontWeight.Black, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
-            LinearProgressIndicator(progress = { progress.coerceIn(0f, 0.99f) }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
-            Text(if (ru) "Типы: $typesDone из $typesTotal • осталось типов: $leftTypes" else "Types: $typesDone of $typesTotal • types remaining: $leftTypes", fontSize = 9.sp, color = Accent, modifier = Modifier.padding(top = 6.dp))
-            Text(if (ru) "Текущий тип: ${currentType.ifBlank { "подготовка" }} • страницы: $currentPage • инструментов: $items" else "Current type: ${currentType.ifBlank { "preparing" }} • pages: $currentPage • instruments: $items", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
-            Text(if (ru) "Точное число оставшихся страниц БКС не публикует: конец типа определяется короткой страницей. Поэтому прогресс считается по завершённым типам, без выдуманных процентов." else "BCS does not publish the remaining page count: the end of a type is detected by a short page. Progress is therefore based on completed types, without fabricated percentages.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 5.dp))
-            OutlinedButton(onClick = { ctx.startService(Intent(ctx, CatalogRefreshService::class.java).setAction(CatalogRefreshService.ACTION_STOP)) }, modifier = Modifier.fillMaxWidth().padding(top = 7.dp)) {
-                Icon(Icons.Default.Stop, null); Spacer(Modifier.width(6.dp)); Text(if (ru) "Остановить загрузку" else "Stop download")
-            }
-        } else {
-            Button(
-                enabled = token.isNotBlank(),
-                onClick = {
-                    prefs.edit().putString("bcs_refresh_token", token.trim()).apply()
-                    error = ""
-                    running = true
-                    val intent = Intent(ctx, CatalogRefreshService::class.java).setAction(CatalogRefreshService.ACTION_START)
-                    androidx.core.content.ContextCompat.startForegroundService(ctx, intent)
-                },
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp), shape = RoundedCornerShape(13.dp)
-            ) {
-                Icon(Icons.Default.CloudDownload, null); Spacer(Modifier.width(6.dp)); Text(if (ru) "Обновить каталог инструментов" else "Refresh instrument directory", fontWeight = FontWeight.Black)
-            }
-        }
-
-        if (error.isNotBlank()) Text(if (ru) "Ошибка: $error" else "Error: $error", fontSize = 8.sp, color = Negative, modifier = Modifier.padding(top = 6.dp))
-        if (cachedCount > 0) {
-            val date = java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(java.util.Date(cachedAt))
-            Text(if (ru) "Кэш: $cachedCount инструментов • обновлён $date" else "Cache: $cachedCount instruments • updated $date", fontSize = 8.sp, color = Positive, modifier = Modifier.padding(top = 7.dp))
-        } else {
-            Text(if (ru) "Кэш каталога отсутствует. Нажмите «Обновить каталог инструментов»." else "No directory cache. Tap “Refresh instrument directory”.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 7.dp))
-        }
-        if (status.isNotBlank() && !running) Text(status, fontSize = 8.sp, color = Accent, modifier = Modifier.padding(top = 5.dp))
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(9.dp).clip(CircleShape).background(if (token.isNotBlank()) Positive else Negative))
-            Spacer(Modifier.width(7.dp))
-            Text(if (token.isNotBlank()) if (ru) "БКС настроен • каталог и рыночные данные используют БКС" else "BCS configured • directory and market data use BCS" else if (ru) "БКС не подключён" else "BCS not connected", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = if (token.isNotBlank()) Positive else Negative)
-        }
-        Text(if (ru) "Нужен refresh-токен БКС с правами «Только для чтения»." else "A BCS read-only refresh token is required.", fontSize = 8.sp, color = Warning, modifier = Modifier.padding(top = 6.dp))
     }
 }
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=10.sp);Switch(checked = value, onCheckedChange = on)}}

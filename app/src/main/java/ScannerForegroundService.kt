@@ -87,12 +87,6 @@ class ScannerForegroundService : Service() {
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
-                // A full catalogue refresh owns the BCS reference-data channel. Do not
-                // compete with it and do not scan against a half-updated directory.
-                while (prefs.getBoolean("catalog_refresh_running", false) && currentCoroutineContext().isActive && running.get()) {
-                    setStatus("⏳ БКС: обновляется каталог • сканер ждёт завершения", 0f)
-                    delay(1500L)
-                }
                 val instruments: List<SearchResult>
                 try {
                     instruments = withContext(Dispatchers.IO) { resolveInstruments(repo, scopeMode, instrumentType) }
@@ -147,7 +141,7 @@ class ScannerForegroundService : Service() {
                     // instrument + timeframe on demand.
                     val tfCount = timeframes.size.coerceAtLeast(1)
                     val taskCount = scanItems.size.toLong() * tfCount.toLong()
-                    val concurrency = if (scopeMode == "SELECTED") 8 else 12
+                    val concurrency = 1 // BCS scanner is intentionally sequential: one API instrument after another
                     val nextIndex = AtomicLong(0L)
                     coroutineScope {
                         val workers = List(concurrency) {
