@@ -46,12 +46,13 @@ echo "[8/9] No stale live-price fallback"
 ! grep -q 'stableQuoteCache' app/src/main/java/MarketRepository.kt
 ! grep -q 'repo.quote(symbol) }.getOrNull() ?: candles.last().close' app/src/main/java/MarketMonitorWorker.kt
 
-echo "[9/9] Scanner persists exact BCS classCode"
-grep -q 'limit = 17' app/src/main/java/ScannerForegroundService.kt
-grep -q 'it.result.classCode' app/src/main/java/ScannerForegroundService.kt
+echo "[9/10] BCS API-only architecture"
+test ! -e app/src/main/java/CatalogRefreshService.kt
+! grep -RInE "CatalogRefreshService|refreshFullCatalog|catalog_refresh_" app/src/main 2>/dev/null
 grep -q 'TRADING_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
-grep -q 'Int.MAX_VALUE' app/src/main/java/MarketRepository.kt
-grep -q 'monotonically increasing index' app/src/main/java/ScannerForegroundService.kt
 grep -q 'distinctBy { scanIdentity(it) }' app/src/main/java/ScannerForegroundService.kt
+
+echo "[10/10] Scanner uses sequential API processing"
+grep -q 'val concurrency = 1' app/src/main/java/ScannerForegroundService.kt
 
 echo "VERIFY_PROX: OK"
