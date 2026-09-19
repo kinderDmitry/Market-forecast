@@ -24,6 +24,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.Locale
@@ -87,82 +88,65 @@ class ScannerForegroundService : Service() {
             )
 
             while (currentCoroutineContext().isActive && running.get()) {
-                val instruments: List<SearchResult>
-                try {
-                    instruments = withContext(Dispatchers.IO) { resolveInstruments(repo, scopeMode, instrumentType) }
-                } catch (error: Throwable) {
-                    val message = error.message.orEmpty().take(180)
-                    setStatus("⏳ БКС: получение списка инструментов через API • $message", 0f)
-                    delay(3000L)
-                    continue
-                }
-                // Preserve ticker + classCode as the scanner identity. A ticker can
-                // legitimately exist on more than one BCS board; collapsing by ticker
-                // would silently drop instruments from the full BCS universe.
-                val scanItems = instruments
-                    .filter { it.symbol.isNotBlank() }
-                    .distinctBy { scanIdentity(it) }
-                val symbols = scanItems.map { scanIdentity(it) }
                 val timeframes: List<String> = if (timeframe == "ANY") {
                     listOf("15M", "1H", "4H", "1D", "1W")
                 } else {
                     listOf(timeframe)
                 }
-
-                val total = (symbols.size.toLong() * timeframes.size.toLong()).coerceAtLeast(1L)
-                val completed = AtomicLong(0L)
                 val activeRows = loadScanRows(prefs)
                     .filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }
                 val previous = activeRows.map { rowKey(it) }.toSet()
                 val found = mutableListOf<ScanRow>()
+                val completed = AtomicLong(0L)
+                val startedAt = System.currentTimeMillis()
 
                 fun acceptRow(candidate: ScanRow) {
                     val old = (activeRows + found).firstOrNull { rowKey(it) == rowKey(candidate) && (it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis()) }
-                    // Every completed scan is a fresh validation event. Keep the same row key,
-                    // but renew its action horizon so the countdown never gets stuck on
-                    // the previous scan cycle.
-                    val stable = candidate
                     synchronized(found) {
-                        found.removeAll { rowKey(it) == rowKey(stable) }
-                        found.add(stable)
+                        found.removeAll { rowKey(it) == rowKey(candidate) }
+                        found.add(candidate)
                     }
-                    if (old == null && rowKey(candidate) !in previous) notifySignal(stable)
+                    if (old == null && rowKey(candidate) !in previous) notifySignal(candidate)
                 }
 
-                setStatus("БКС: инструментов ${symbols.size} • с board-id ${scanItems.count { it.classCode.isNotBlank() }} • таймфреймов ${timeframes.size} • задач $total", 0f)
-                if (symbols.isEmpty()) {
-                    setStatus("Нет инструментов для сканирования. Проверьте БКС и избранное.", 1f)
-                } else {
-                    // Bounded worker queue: do not create one coroutine per instrument.
-                    // The previous flatMap created thousands of deferred jobs for a full
-                    // BCS catalogue. Workers now pull one task at a time, so memory stays
-                    // bounded while every instrument/timeframe pair is processed. No giant
-                    // task list is materialized: a monotonically increasing index maps to
-                    // instrument + timeframe on demand.
-                    val tfCount = timeframes.size.coerceAtLeast(1)
-                    val taskCount = scanItems.size.toLong() * tfCount.toLong()
-                    val concurrency = 1 // BCS scanner is intentionally sequential: one API instrument after another
-                    val nextIndex = AtomicLong(0L)
-                    coroutineScope {
-                        val workers = List(concurrency) {
-                            async(Dispatchers.IO) {
-                                while (currentCoroutineContext().isActive && running.get()) {
-                                    val index = nextIndex.getAndIncrement()
-                                    if (index >= taskCount) break
-                                    val meta = scanItems[(index / tfCount).toInt()]
-                                    val tf = timeframes[(index % tfCount).toInt()]
-                                    val identity = scanIdentity(meta)
-                                    val row = scanOne(repo, identity, tf, meta)
-                                    val done = completed.incrementAndGet()
-                                    val progress = (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
-                                    if (done == 1L || done % 10L == 0L || done == total) {
-                                        setStatus("🔎 Сканирование: $done / $total", progress)
-                                    }
-                                    if (row != null) acceptRow(row)
-                                }
-                            }
+                fun processInstrument(meta: SearchResult) {
+                    if (!running.get()) return
+                    val identity = scanIdentity(meta)
+                    for (tf in timeframes) {
+                        if (!running.get()) break
+                        val row = runBlocking { scanOne(repo, identity, tf, meta) }
+                        val done = completed.incrementAndGet()
+                        if (done == 1L || done % 10L == 0L) {
+                            val elapsed = ((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(1L)
+                            setStatus("🔎 Проверено инструментов: $done • ${elapsed} сек", 0f)
                         }
-                        workers.awaitAll()
+                        if (row != null) acceptRow(row)
+                    }
+                }
+
+                if (scopeMode == "SELECTED") {
+                    val favorites = prefs.getStringSet("favorites", emptySet()).orEmpty().toList()
+                    if (favorites.isEmpty()) {
+                        setStatus("Нет инструментов в избранном для сканирования.", 1f)
+                    } else {
+                        setStatus("БКС: поиск избранных через API…", 0f)
+                        favorites.forEach { favorite ->
+                            if (!running.get()) return@forEach
+                            val meta = withContext(Dispatchers.IO) {
+                                repo.resolveSelectedInstrument(favorite, instrumentType)
+                            }
+                            if (meta != null) processInstrument(meta)
+                        }
+                    }
+                } else {
+                    // Stream BCS directory pages directly into the scanner. The old
+                    // implementation downloaded the complete directory first, which
+                    // made the scanner appear stuck before the first analysis.
+                    setStatus("БКС: получаю инструменты и сразу сканирую…", 0f)
+                    withContext(Dispatchers.IO) {
+                        repo.streamScannerInstruments(instrumentType) { meta ->
+                            if (running.get()) processInstrument(meta)
+                        }
                     }
                 }
 

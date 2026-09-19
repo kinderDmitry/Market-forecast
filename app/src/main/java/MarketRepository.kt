@@ -163,7 +163,7 @@ class MarketRepository(
         val transliterated = transliterateRuToLat(needle)
         val out = mutableListOf<Pair<Int, SearchResult>>()
         for (type in wanted) {
-            val items = runCatching { loadCatalogType(type, Int.MAX_VALUE) }.getOrElse { emptyList() }
+            val items = runCatching { loadCatalogType(type, 12) }.getOrElse { emptyList() }
             for (item in items) {
                 if (!matchesType(item)) continue
                 val symbol = normalizeSearchText(item.symbol)
@@ -189,21 +189,54 @@ class MarketRepository(
 
     /** Scanner universe comes directly from BCS, page-by-page, with no catalogue cache. */
     fun scannerCatalog(type: String): List<SearchResult> {
+        val out = LinkedHashMap<String, SearchResult>()
+        streamScannerInstruments(type) { item -> out.putIfAbsent(catalogIdentity(item), item) }
+        return out.values.toList()
+    }
+
+    /**
+     * Streaming scanner source. The previous implementation downloaded the entire
+     * BCS directory before the first instrument could be analysed. That made the
+     * scanner look frozen for several minutes. Now each BCS page is delivered to the
+     * scanner immediately and the next page is requested only after the current page
+     * has been processed. No local catalogue is created.
+     */
+    fun streamScannerInstruments(type: String, onInstrument: (SearchResult) -> Unit) {
         val types = when (type.uppercase(Locale.US)) {
             "FX" -> listOf("CURRENCY")
             "STOCKS" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
             else -> TRADING_INSTRUMENT_TYPES
         }
-        val out = LinkedHashMap<String, SearchResult>()
         for (instrumentType in types) {
-            loadCatalogType(instrumentType, Int.MAX_VALUE).forEach { item ->
-                out.putIfAbsent(catalogIdentity(item), item)
-            }
+            loadCatalogType(instrumentType, Int.MAX_VALUE, onItem = onInstrument)
         }
-        return out.values.toList()
     }
 
-    private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null): List<SearchResult> {
+    /** Resolves selected favourites directly through BCS, without downloading a catalogue. */
+    fun resolveSelectedInstrument(symbol: String, filter: String): SearchResult? {
+        if (!isBcsConfigured()) return null
+        val clean = canonicalSymbol(symbol).substringBefore("@")
+        val info = runCatching { bcsInstrumentInfo(clean) }.getOrNull() ?: return null
+        val board = info.optJSONArray("boards")?.let { chooseBoard(it) }
+        val type = info.optString("instrumentType").ifBlank {
+            if (clean in setOf("USD000UTSTOM", "EUR_RUB__TOM", "CNYRUB_TOM", "GBP_RUB__TOM", "JPY_RUB__TOM")) "CURRENCY" else "STOCK"
+        }
+        val item = SearchResult(
+            info.optString("ticker").ifBlank { clean },
+            info.optString("displayName").ifBlank { info.optString("shortName") }.ifBlank { clean },
+            board?.optString("exchange").orEmpty().ifBlank { "БКС" },
+            type, "БКС", board?.optString("classCode").orEmpty()
+        )
+        val t = type.uppercase(Locale.US)
+        val ok = when (filter.uppercase(Locale.US)) {
+            "FX" -> t.contains("CURRENCY") || t.contains("FOREX")
+            "STOCKS" -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+            else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
+        }
+        return item.takeIf { ok }
+    }
+
+    private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null, onItem: ((SearchResult) -> Unit)? = null): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()
         var page = 0
         var consecutiveFailures = 0
@@ -256,6 +289,7 @@ class MarketRepository(
                 val classCode = boardObj?.optString("classCode").orEmpty()
                 val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
                 out.putIfAbsent(catalogIdentity(item), item)
+                onItem?.invoke(item)
             }
             onPage?.invoke(page, arr.length(), arr.length() < 100)
             // BCS documents that a full page requires requesting page + 1.
