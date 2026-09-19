@@ -20,7 +20,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -109,16 +112,16 @@ class ScannerForegroundService : Service() {
                     if (old == null && rowKey(candidate) !in previous) notifySignal(candidate)
                 }
 
-                fun processInstrument(meta: SearchResult) {
+                suspend fun processInstrument(meta: SearchResult) {
                     if (!running.get()) return
                     val identity = scanIdentity(meta)
                     for (tf in timeframes) {
                         if (!running.get()) break
-                        val row = runBlocking { scanOne(repo, identity, tf, meta) }
+                        val row = scanOne(repo, identity, tf, meta)
                         val done = completed.incrementAndGet()
                         if (done == 1L || done % 10L == 0L) {
                             val elapsed = ((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(1L)
-                            setStatus("🔎 Проверено инструментов: $done • ${elapsed} сек", 0f)
+                            setStatus("🔎 Проверено: $done • ${elapsed} сек", 0f)
                         }
                         if (row != null) acceptRow(row)
                     }
@@ -129,25 +132,44 @@ class ScannerForegroundService : Service() {
                     if (favorites.isEmpty()) {
                         setStatus("Нет инструментов в избранном для сканирования.", 1f)
                     } else {
-                        setStatus("БКС: поиск избранных через API…", 0f)
-                        favorites.forEach { favorite ->
-                            if (!running.get()) return@forEach
-                            val meta = withContext(Dispatchers.IO) {
-                                repo.resolveSelectedInstrument(favorite, instrumentType)
+                        setStatus("БКС: быстрый запуск по избранному…", 0f)
+                        coroutineScope {
+                            val jobs = favorites.map { favorite ->
+                                async(Dispatchers.IO) {
+                                    if (!running.get()) return@async
+                                    val meta = repo.resolveSelectedInstrument(favorite, instrumentType)
+                                    if (meta != null) processInstrument(meta)
+                                }
                             }
-                            if (meta != null) processInstrument(meta)
+                            jobs.awaitAll()
                         }
                     }
                 } else {
-                    // Stream BCS directory pages directly into the scanner. The old
-                    // implementation downloaded the complete directory first, which
-                    // made the scanner appear stuck before the first analysis.
-                    setStatus("БКС: получаю инструменты и сразу сканирую…", 0f)
-                    withContext(Dispatchers.IO) {
-                        repo.streamScannerInstruments(instrumentType) { meta ->
-                            if (running.get()) processInstrument(meta)
+                    // Pipeline scanner: BCS directory pages are streamed into a bounded
+                    // queue while a small worker pool performs the full AnalyticsEngine
+                    // calculation. This removes the old "one instrument at a time" idle
+                    // gaps without hammering BCS with an unbounded number of requests.
+                    setStatus("БКС: получаю инструменты и запускаю поток анализа…", 0f)
+                    val queue = Channel<SearchResult>(capacity = 24)
+                    val producer = launch(Dispatchers.IO) {
+                        try {
+                            repo.streamScannerInstruments(instrumentType) { meta ->
+                                if (running.get()) runBlocking { queue.send(meta) }
+                            }
+                        } finally {
+                            queue.close()
                         }
                     }
+                    val workers = (0 until 4).map {
+                        launch(Dispatchers.IO) {
+                            for (meta in queue) {
+                                if (!running.get()) break
+                                processInstrument(meta)
+                            }
+                        }
+                    }
+                    workers.joinAll()
+                    producer.cancelAndJoin()
                 }
 
                 val now = System.currentTimeMillis()

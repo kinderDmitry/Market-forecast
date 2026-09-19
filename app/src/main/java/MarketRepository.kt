@@ -56,6 +56,10 @@ class MarketRepository(
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
+        // Search results are metadata only; a short TTL makes repeated typing/navigation
+        // effectively instant without turning this into a downloaded instrument catalogue.
+        private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
+        private const val SEARCH_CACHE_MS = 10 * 60_000L
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
 
@@ -116,6 +120,11 @@ class MarketRepository(
     fun search(query: String, filter: String = "ALL"): List<SearchResult> {
         val q = query.trim()
         if (q.isBlank() || !isBcsConfigured()) return emptyList()
+        val cacheKey = "${filter.uppercase(Locale.US)}|${normalizeSearchText(q)}"
+        searchCache[cacheKey]?.let { cached ->
+            if (System.currentTimeMillis() - cached.first <= SEARCH_CACHE_MS && cached.second.isNotEmpty()) return cached.second
+            searchCache.remove(cacheKey)
+        }
         val wanted = when (filter.uppercase(Locale.US)) {
             "FX" -> listOf("CURRENCY")
             "STOCK" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
@@ -138,7 +147,12 @@ class MarketRepository(
                 else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
             }
         }
-        val directTicker = aliases[q.lowercase(Locale.ROOT)] ?: q.uppercase(Locale.US)
+        // Common Russian/global instruments are resolved through the authoritative BCS
+        // by-ticker endpoint immediately. This avoids a directory walk for the searches
+        // people make most often (and still verifies the instrument against BCS).
+        val seedTicker = aliases[q.lowercase(Locale.ROOT)] ?: popularSeeds()
+            .firstOrNull { normalizeSearchText(it.second) == normalizeSearchText(q) }?.first
+        val directTicker = seedTicker ?: q.uppercase(Locale.US)
             .replace("/", "").replace("-", "")
             .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
         if (!directTicker.isNullOrBlank()) {
@@ -152,7 +166,11 @@ class MarketRepository(
                     o.optString("instrumentType").ifBlank { if (ticker.endsWith("=X")) "CURRENCY" else "STOCK" },
                     "БКС", board?.optString("classCode").orEmpty()
                 )
-                if (matchesType(item)) return listOf(item)
+                if (matchesType(item)) {
+                    val result = listOf(item)
+                    searchCache[cacheKey] = System.currentTimeMillis() to result
+                    return result
+                }
             }
         }
 
@@ -163,7 +181,7 @@ class MarketRepository(
         val transliterated = transliterateRuToLat(needle)
         val out = mutableListOf<Pair<Int, SearchResult>>()
         for (type in wanted) {
-            val items = runCatching { loadCatalogType(type, 12) }.getOrElse { emptyList() }
+            val items = runCatching { loadCatalogType(type, 4) }.getOrElse { emptyList() }
             for (item in items) {
                 if (!matchesType(item)) continue
                 val symbol = normalizeSearchText(item.symbol)
@@ -181,10 +199,12 @@ class MarketRepository(
             }
             if (out.any { it.first == 0 }) break
         }
-        return out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
+        val result = out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
             .map { it.second }
             .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
             .take(50)
+        if (result.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to result
+        return result
     }
 
     /** Scanner universe comes directly from BCS, page-by-page, with no catalogue cache. */
