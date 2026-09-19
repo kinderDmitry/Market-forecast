@@ -266,9 +266,20 @@ class MarketRepository(
         return out.values.toList()
     }
 
-    /** BCS-only FX catalogue. */
+    /** BCS-only FX catalogue. No local catalogue/cache is used. */
     fun fxCatalog(): List<SearchResult> = if (!isBcsConfigured()) emptyList() else
-        catalog(Int.MAX_VALUE).filter { it.type.contains("CURRENCY", true) }
+        scannerCatalog("FX")
+
+    private fun normalizeSearchText(value: String): String =
+        value.trim().lowercase(Locale.ROOT)
+            .replace('ё', 'е')
+            .replace(Regex("\\s+"), " ")
+
+    private fun compactSearch(value: String): String =
+        normalizeSearchText(value).replace(Regex("[^\\p{L}\\p{Nd}]+"), "")
+
+    private fun catalogIdentity(item: SearchResult): String =
+        "${item.symbol.trim().uppercase(Locale.US)}@${item.classCode.trim().uppercase(Locale.US)}"
 
     private fun transliterateRuToLat(value: String): String {
         val map = mapOf('а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ё' to "e", 'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m", 'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r", 'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f", 'х' to "h", 'ц' to "c", 'ч' to "ch", 'ш' to "sh", 'щ' to "sch", 'ъ' to "", 'ы' to "y", 'ь' to "", 'э' to "e", 'ю' to "yu", 'я' to "ya")
@@ -432,7 +443,7 @@ class MarketRepository(
 
     fun marketIndices(): List<MarketIndex> {
         if (!isBcsConfigured()) return emptyList()
-        return catalog(Int.MAX_VALUE).filter { it.type.contains("INDEX", true) }.take(12).mapNotNull { item ->
+        return loadCatalogType("INDEX", Int.MAX_VALUE).filter { it.type.contains("INDEX", true) }.take(12).mapNotNull { item ->
             runCatching {
                 val candles = load(item.symbol, "1y", "1d")
                 val last = candles.lastOrNull() ?: return@runCatching null
