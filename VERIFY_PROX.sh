@@ -11,8 +11,8 @@ test -f app/src/main/java/ScannerForegroundService.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 138' app/build.gradle.kts
-grep -q 'versionName = "4.8.99"' app/build.gradle.kts
+grep -q 'versionCode = 139' app/build.gradle.kts
+grep -q 'versionName = "4.8.100"' app/build.gradle.kts
 
 echo "[3/6] Scanner/forecast consistency"
 grep -q 'fun analyzeForScanner' app/src/main/java/AnalyticsEngine.kt
@@ -53,6 +53,7 @@ grep -q 'TRADING_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
 grep -q 'distinctBy { scanIdentity(it) }' app/src/main/java/ScannerForegroundService.kt
 
 echo "[10/10] Scanner uses sequential API processing"
-grep -q 'val concurrency = 1' app/src/main/java/ScannerForegroundService.kt
+grep -q 'streamScannerInstruments' app/src/main/java/ScannerForegroundService.kt
+grep -q 'runBlocking { scanOne' app/src/main/java/ScannerForegroundService.kt
 
 echo "VERIFY_PROX: OK"
