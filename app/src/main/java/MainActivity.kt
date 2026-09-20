@@ -71,6 +71,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -720,12 +721,14 @@ private fun ScannerScreen(
         item {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("15M", "1H", "4H", "1D").forEach { tf ->
-                    FilterChip(selected = tf in timeframes, onClick = {
-                        if (!running) {
-                            val next = if (tf in timeframes) timeframes - tf else timeframes + tf
-                            setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D").indexOf(it) })
-                        }
-                    }, label = { Text(tf, fontSize = 10.sp) })
+                    item(key = "scanner_tf_$tf") {
+                        FilterChip(selected = tf in timeframes, onClick = {
+                            if (!running) {
+                                val next = if (tf in timeframes) timeframes - tf else timeframes + tf
+                                setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D").indexOf(it) })
+                            }
+                        }, label = { Text(tf, fontSize = 10.sp) })
+                    }
                 }
             }
         }
