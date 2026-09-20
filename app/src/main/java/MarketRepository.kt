@@ -62,7 +62,7 @@ class MarketRepository(
         private const val SEARCH_CACHE_MS = 10 * 60_000L
         private const val SEARCH_INDEX_PREFS = "mfp_search_index_v2"
     }
-    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
+    private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.107"
     private val searchEngine = InstrumentSearchEngine(popularSeeds()).also { engine ->
         loadSearchIndex().forEach { engine.addAll(listOf(it)) }
     }
@@ -153,138 +153,75 @@ class MarketRepository(
         tasks.forEach { runCatching { it.get(20, TimeUnit.SECONDS) } }
     }
 
-    /** Search always resolves against BCS API. No local catalogue/cache is used as the source of search results. */
+    /**
+     * Fast two-stage search: internet metadata first, BCS only for exact ticker
+     * confirmation when it is cheap/necessary. No BCS directory walk is performed
+     * for autocomplete and no full instrument catalogue is downloaded.
+     */
     fun search(query: String, filter: String = "ALL"): List<SearchResult> {
         val q = query.trim()
-        if (q.isBlank() || !isBcsConfigured()) return emptyList()
+        if (q.isBlank()) return emptyList()
         val cacheKey = "${filter.uppercase(Locale.US)}|${normalizeSearchText(q)}"
         searchCache[cacheKey]?.let { cached ->
             if (System.currentTimeMillis() - cached.first <= SEARCH_CACHE_MS && cached.second.isNotEmpty()) return cached.second
             searchCache.remove(cacheKey)
         }
-        val wanted = when (filter.uppercase(Locale.US)) {
-            "FX" -> listOf("CURRENCY")
-            "STOCK" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
-            else -> TRADING_INSTRUMENT_TYPES
-        }
-        val aliases = mapOf(
-            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
-            "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
-            "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
-            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
-            "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
-            "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
-            "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
-        )
-        fun matchesType(item: SearchResult): Boolean {
-            val t = item.type.uppercase(Locale.US)
-            return when (filter.uppercase(Locale.US)) {
-                "FX" -> t.contains("CURRENCY") || t.contains("FOREX")
-                "STOCK" -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
-                else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
-            }
-        }
-        // Common Russian/global instruments are resolved through the authoritative BCS
-        // by-ticker endpoint immediately. This avoids a directory walk for the searches
-        // people make most often (and still verifies the instrument against BCS).
-        val seedTicker = aliases[q.lowercase(Locale.ROOT)] ?: popularSeeds()
-            .firstOrNull { normalizeSearchText(it.name) == normalizeSearchText(q) }?.symbol
-        val normalizedFx = normalizeFx(q)?.symbol
-        val directTicker = seedTicker ?: normalizedFx ?: q.uppercase(Locale.US)
-            .replace("/", "").replace("-", "")
-            .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
-        if (!directTicker.isNullOrBlank()) {
-            runCatching { bcsInstrumentInfo(directTicker) }.getOrNull()?.let { o ->
-                val ticker = o.optString("ticker").ifBlank { directTicker }
-                val board = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                val item = SearchResult(
-                    ticker,
-                    o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
-                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
-                    o.optString("instrumentType").ifBlank { if (ticker.endsWith("=X")) "CURRENCY" else "STOCK" },
-                    "БКС", board?.optString("classCode").orEmpty()
-                )
-                if (matchesType(item)) {
-                    val result = listOf(item)
-                    searchCache[cacheKey] = System.currentTimeMillis() to result
-                    return result
-                }
-            }
+
+        // Internet autocomplete and direct BCS resolution run concurrently. Neither
+        // path performs a full directory walk, so typing stays responsive.
+        val internetFuture = prefetchPool.submit<List<SearchResult>> {
+            runCatching { InternetInstrumentSearch.search(q, filter) }.getOrDefault(emptyList())
         }
 
-        // Name search has no BCS name endpoint, so the authoritative directory is the
-        // fallback. Pages are fetched concurrently; the process-wide 10 RPS gate still
-        // protects BCS. This avoids the old type-by-type serial wait.
-        val needle = normalizeSearchText(q)
-        val compact = compactSearch(needle)
-        val transliterated = transliterateRuToLat(needle)
-        val out = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, SearchResult>>())
-
-        // First resolve bundled aliases/popular instruments through BCS. These are only
-        // candidates; every returned result is still verified against the live BCS API.
-        val seeds = popularSeeds().filter { item ->
-            matchesType(item) && run {
-                val s = normalizeSearchText(item.symbol)
-                val n = normalizeSearchText(item.name)
-                val nc = compactSearch(n)
-                s.startsWith(needle) || n.startsWith(needle) ||
-                    compact.isNotBlank() && (s.startsWith(compact) || nc.startsWith(compact)) ||
-                    transliterated.isNotBlank() && (s.startsWith(transliterated) || transliterateRuToLat(n).startsWith(transliterated))
-            }
-        }.take(12)
-        seeds.forEach { candidate ->
-            runCatching { bcsInstrumentInfo(candidate.symbol) }.getOrNull()?.let { o ->
-                val ticker = o.optString("ticker").ifBlank { candidate.symbol }
-                val board = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                val item = SearchResult(
-                    ticker,
-                    o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { candidate.name },
-                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
-                    o.optString("instrumentType").ifBlank { candidate.type },
-                    "БКС", board?.optString("classCode").orEmpty()
-                )
-                if (matchesType(item)) out += 0 to item
-            }
+        // In parallel with internet autocomplete, resolve a direct ticker/known alias
+        // through BCS. This gives exact BCS identity without ever scanning the directory.
+        val directFuture = analysisPool.submit<List<SearchResult>> {
+            if (!isBcsConfigured()) return@submit emptyList()
+            val normalized = normalizeSearchText(q)
+            val aliases = mapOf(
+                "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
+                "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
+                "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
+                "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
+                "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
+                "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
+                "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
+            )
+            val candidate = aliases[normalized] ?: normalizeFx(q)?.symbol ?: q.uppercase(Locale.US)
+                .replace("/", "").replace("-", "")
+                .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
+                ?: return@submit emptyList()
+            val info = runCatching { bcsInstrumentInfo(candidate) }.getOrNull() ?: return@submit emptyList()
+            val board = info.optJSONArray("boards")?.let { chooseBoard(it) }
+            val item = SearchResult(
+                info.optString("ticker").ifBlank { candidate },
+                info.optString("displayName").ifBlank { info.optString("shortName") }.ifBlank { candidate },
+                board?.optString("exchange").orEmpty().ifBlank { "БКС" },
+                info.optString("instrumentType").ifBlank { if (candidate.endsWith("=X")) "CURRENCY" else "STOCK" },
+                "БКС", board?.optString("classCode").orEmpty()
+            )
+            if (matchesSearchFilter(item, filter)) listOf(item) else emptyList()
         }
 
-        // Search enough directory pages to cover the normal BCS universe, but do it in
-        // parallel instead of serially. If an exact/seed match already exists, this is
-        // deliberately skipped: returning a verified result is much faster than proving
-        // that the same instrument is also present on a later directory page.
-        if (out.isEmpty()) {
-            val pageCount = if (needle.length <= 2) 6 else 12
-            val jobs = wanted.flatMap { type ->
-                (0 until pageCount).map { page ->
-                    analysisPool.submit {
-                        runCatching { loadCatalogPage(type, page) }.getOrElse { emptyList() }.forEach { item ->
-                            if (!matchesType(item)) return@forEach
-                            val symbol = normalizeSearchText(item.symbol)
-                            val name = normalizeSearchText(item.name)
-                            val nameCompact = compactSearch(name)
-                            val rank = when {
-                                symbol == needle || name == needle -> 0
-                                symbol.startsWith(needle) || name.startsWith(needle) -> 1
-                                compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
-                                transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
-                                symbol.contains(needle) || name.contains(needle) -> 3
-                                else -> return@forEach
-                            }
-                            out += rank to item
-                        }
-                    }
-                }
-            }
-            jobs.forEach { runCatching { it.get(10, TimeUnit.SECONDS) } }
-        }
-        val result = out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
-            .map { it.second }
+        val internet = runCatching { internetFuture.get(3000, TimeUnit.MILLISECONDS) }.getOrDefault(emptyList())
+        val direct = runCatching { directFuture.get(2200, TimeUnit.MILLISECONDS) }.getOrDefault(emptyList())
+        val merged = (direct + internet)
             .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
             .take(50)
-        if (result.isNotEmpty()) {
-            searchCache[cacheKey] = System.currentTimeMillis() to result
-            rememberSearchResults(result)
+        if (merged.isNotEmpty()) {
+            searchCache[cacheKey] = System.currentTimeMillis() to merged
+            rememberSearchResults(merged.filter { it.source == "БКС" })
         }
-        return result
+        return merged
+    }
+
+    private fun matchesSearchFilter(item: SearchResult, filter: String): Boolean {
+        val t = item.type.uppercase(Locale.US)
+        return when (filter.uppercase(Locale.US)) {
+            "FX" -> t.contains("CURRENCY") || t.contains("FOREX") || item.symbol.endsWith("=X")
+            "STOCK" -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+            else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
+        }
     }
 
     /** BCS instrument universe for market widgets. */
