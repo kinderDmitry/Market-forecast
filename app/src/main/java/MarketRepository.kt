@@ -231,6 +231,25 @@ class MarketRepository(
         return out.values.toList()
     }
 
+    /** Stream only scanner-eligible BCS instruments. The callback fires as each page arrives, so the scanner can start work before the full universe is downloaded. */
+    fun streamScannerUniverse(onInstrument: (SearchResult) -> Unit) {
+        val seen = HashSet<String>()
+        instrumentCatalogStream("STOCKS") { item ->
+            val t = item.type.uppercase(Locale.US)
+            if (t == "STOCK" || t == "FOREIGN_STOCK") {
+                val key = catalogIdentity(item)
+                if (seen.add(key)) onInstrument(item)
+            }
+        }
+        instrumentCatalogStream("FX") { item ->
+            val t = item.type.uppercase(Locale.US)
+            if (t.contains("CURRENCY") || t.contains("FOREX")) {
+                val key = catalogIdentity(item)
+                if (seen.add(key)) onInstrument(item)
+            }
+        }
+    }
+
     /** Stream BCS directory pages for market widgets without persisting a catalogue. */
     private fun instrumentCatalogStream(type: String, onInstrument: (SearchResult) -> Unit) {
         val types = when (type.uppercase(Locale.US)) {

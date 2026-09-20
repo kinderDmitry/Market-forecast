@@ -108,7 +108,7 @@ private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
 private val DarkMuted = Color(0xFF8FA7B8)
 
-private enum class Screen { HOME, SEARCH, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
+private enum class Screen { HOME, SEARCH, FAVORITES, HISTORY, SETTINGS, ANALYSIS, SCANNER, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -161,6 +161,8 @@ fun MarketForecastApp(ctx: Context) {
     var message by remember { mutableStateOf<String?>(null) }
     var lastDataError by remember { mutableStateOf<String?>(null) }
     var pendingScanTrack by remember { mutableStateOf<Pair<String,String>?>(null) }
+    var scannerTimeframes by remember { mutableStateOf(listOf("15M", "1H", "4H", "1D")) }
+    var scannerUniverse by remember { mutableStateOf(ScannerEngine.Universe.ALL) }
     var refreshTick by remember { mutableLongStateOf(0L) }
     val trackingCandleCache = remember { mutableStateMapOf<String, List<Candle>>() }
     // Canonical live quote per instrument. All timeframes in the same session use
@@ -524,12 +526,13 @@ fun MarketForecastApp(ctx: Context) {
                 Box(Modifier.fillMaxSize()) {
                 AnimatedContent(targetState = screen, label = "screen") { s ->
                     when (s) {
-                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, marketPicks, marketLoading, marketMode, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, { marketMode = it }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
+                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, marketPicks, marketLoading, marketMode, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, { screen = Screen.SCANNER }, { marketMode = it }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
+                        Screen.SCANNER -> ScannerScreen(repo, favorites, scannerUniverse, scannerTimeframes, ru, { scannerUniverse = it }, { scannerTimeframes = it }, { symbol -> load(symbol, scannerTimeframes.lastOrNull() ?: "1D") })
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
                         Screen.DIVIDENDS -> DividendScreen(ru, repo, refreshTick) { screen = Screen.HOME }
@@ -572,7 +575,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.SCANNER -> if (ru) "Сканер" else "Scanner"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
 }
 
 @Composable
@@ -612,7 +615,7 @@ private fun BrandHero(ru: Boolean) {
 }
 
 @Composable
-private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, picks: List<MarketPick>, marketLoading: Boolean, marketMode: String, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, setMarketMode: (String) -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
+private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, picks: List<MarketPick>, marketLoading: Boolean, marketMode: String, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, openScanner: () -> Unit, setMarketMode: (String) -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
         item { BrandHero(ru) }
         item { SearchLauncher(ru, search) }
@@ -644,6 +647,7 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
                 QuickAction(Icons.Default.CalendarMonth, if (ru) "Дивиденды" else "Dividends", openDiv, Modifier.weight(1f))
                 QuickAction(Icons.Default.Calculate, if (ru) "Прибыль" else "Profit", openFinance, Modifier.weight(1f))
                 QuickAction(Icons.Default.BarChart, if (ru) "Статистика" else "Stats", openStats, Modifier.weight(1f))
+                QuickAction(Icons.Default.Search, if (ru) "Сканер" else "Scanner", openScanner, Modifier.weight(1f))
             }
         }
         item { SectionHeader(if (ru) "Рынок" else "Market", if (ru) "Индексы и дополнительные рыночные данные" else "Indices and additional market data") }
@@ -652,6 +656,115 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf(NewsCategory.ALL,NewsCategory.STOCKS,NewsCategory.FX).forEach { c -> FilterChip(selected=newsCategory==c,onClick={setNewsCategory(c)},label={Text(if(ru) when(c){NewsCategory.ALL->"Все";NewsCategory.STOCKS->"Акции";NewsCategory.FX->"Валюты"} else c.name,fontSize=8.sp)}) } } }
         if (news.isEmpty()) { item { EmptyCard(if (ru) "Новости временно недоступны. Повторите обновление через несколько секунд." else "News are temporarily unavailable. Refresh in a few seconds.") } }
         items(news.take(20), key = { it.url.ifBlank { it.title } }) { NewsCard(it, ru, openArticle = openArticle) }
+    }
+}
+
+
+private fun scannerRegimeRu(value: String): String = when (value.uppercase(Locale.US)) {
+    "TREND" -> "Тренд"
+    "RANGE" -> "Диапазон"
+    "IMPULSE" -> "Импульс"
+    "REVERSAL" -> "Разворот"
+    else -> value.replace("_", " ").lowercase(Locale("ru")).replaceFirstChar { it.titlecase(Locale("ru")) }
+}
+
+@Composable
+private fun ScannerScreen(
+    repo: MarketRepository,
+    favorites: Set<String>,
+    universe: ScannerEngine.Universe,
+    timeframes: List<String>,
+    ru: Boolean,
+    setUniverse: (ScannerEngine.Universe) -> Unit,
+    setTimeframes: (List<String>) -> Unit,
+    openInstrument: (String) -> Unit
+) {
+    var running by remember { mutableStateOf(false) }
+    var discovered by remember { mutableIntStateOf(0) }
+    var completed by remember { mutableIntStateOf(0) }
+    var signals by remember { mutableIntStateOf(0) }
+    var results by remember { mutableStateOf<List<ScannerEngine.Result>>(emptyList()) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var runId by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
+    val cancelled = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+
+    DisposableEffect(Unit) { onDispose { cancelled.set(true) } }
+    LaunchedEffect(runId) {
+        if (runId == 0) return@LaunchedEffect
+        cancelled.set(false)
+        running = true; error = null; results = emptyList(); discovered = 0; completed = 0; signals = 0
+        val engine = ScannerEngine(repo)
+        runCatching {
+            withContext(Dispatchers.IO) {
+                engine.scan(
+                    ScannerEngine.Config(universe = universe, timeframes = timeframes, workers = if (universe == ScannerEngine.Universe.ALL) 4 else 3),
+                    favorites = favorites,
+                    cancelled = cancelled,
+                    onProgress = { p -> scope.launch { discovered = p.discovered; completed = p.completed; signals = p.signals; running = p.active } },
+                    onResult = { r -> scope.launch { results = (results + r).distinctBy { it.instrument.symbol + "@" + it.instrument.classCode }.sortedByDescending { it.confidence.toDouble() + abs(it.score) * 0.35 }.take(200); signals = results.size } }
+                )
+            }
+        }.onFailure { if (it !is CancellationException) error = it.message ?: if (ru) "Ошибка сканирования" else "Scanner error" }
+        running = false
+    }
+
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
+        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "Единая модель прогноза • БКС • потоковая выдача" else "One forecast model • BCS • streaming results") }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = universe == ScannerEngine.Universe.ALL, onClick = { if (!running) setUniverse(ScannerEngine.Universe.ALL) }, label = { Text(if (ru) "Весь рынок" else "Whole market", fontSize = 10.sp) })
+                FilterChip(selected = universe == ScannerEngine.Universe.FAVORITES, onClick = { if (!running) setUniverse(ScannerEngine.Universe.FAVORITES) }, label = { Text(if (ru) "Избранные" else "Favorites", fontSize = 10.sp) })
+            }
+        }
+        item {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("15M", "1H", "4H", "1D").forEach { tf ->
+                    FilterChip(selected = tf in timeframes, onClick = {
+                        if (!running) {
+                            val next = if (tf in timeframes) timeframes - tf else timeframes + tf
+                            setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D").indexOf(it) })
+                        }
+                    }, label = { Text(tf, fontSize = 10.sp) })
+                }
+            }
+        }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { if (running) cancelled.set(true) else runId++ }, modifier = Modifier.weight(1f)) {
+                    Icon(if (running) Icons.Default.Stop else Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text(if (running) if (ru) "Остановить" else "Stop" else if (ru) "Начать сканирование" else "Start scan", fontWeight = FontWeight.Black)
+                }
+                OutlinedButton(onClick = { results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) { Text(if (ru) "Очистить" else "Clear") }
+            }
+        }
+        item {
+            GradientCard(Modifier.fillMaxWidth()) {
+                Text(if (ru) "Обработано: $completed / $discovered" else "Processed: $completed / $discovered", fontWeight = FontWeight.Black)
+                Text(if (ru) "Сигналов: $signals" else "Signals: $signals", color = Accent, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
+                if (running && discovered > 0) LinearProgressIndicator(progress = { (completed.toFloat() / discovered.toFloat()).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+                Text(if (ru) "Каждый инструмент проходит выбранные таймфреймы последовательно; итог считается тем же движком прогноза, что и обычный прогноз." else "Each instrument passes the selected timeframes in order; the same forecast engine as the normal forecast produces the result.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 7.dp))
+            }
+        }
+        error?.let { msg -> item { EmptyCard(msg) } }
+        if (results.isEmpty() && !running && error == null) item { EmptyCard(if (ru) "Запустите сканирование. Показываются только сигналы, прошедшие quality gates." else "Start scanning. Only signals that pass the quality gates are shown.") }
+        items(results, key = { it.instrument.symbol + "@" + it.instrument.classCode }) { r ->
+            GradientCard(Modifier.fillMaxWidth().clickable { openInstrument(r.instrument.symbol) }) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(r.instrument.name, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                        Text("${r.instrument.symbol}${if (r.instrument.classCode.isNotBlank()) " • ${r.instrument.classCode}" else ""}", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(r.signal, color = if (r.signal == "LONG") Positive else Negative, fontWeight = FontWeight.Black)
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(if (ru) "Оценка ${"%.1f".format(Locale.US, r.score)}" else "Score ${"%.1f".format(Locale.US, r.score)}", fontSize = 9.sp)
+                    Text("${r.confidence}%", fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    Text(if (ru) "Р/Р ${"%.2f".format(Locale.US, r.rr)}" else "R/R ${"%.2f".format(Locale.US, r.rr)}", fontSize = 9.sp)
+                    Text(if (ru) scannerRegimeRu(r.regime) else r.regime, fontSize = 9.sp, color = Accent)
+                }
+                Text(r.timeframeScores.entries.joinToString("  •  ") { "${it.key}: ${"%.0f".format(Locale.US, it.value)}" }, fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 5.dp))
+            }
+        }
     }
 }
 
