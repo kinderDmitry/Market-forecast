@@ -60,8 +60,45 @@ class MarketRepository(
         // effectively instant without turning this into a downloaded instrument catalogue.
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         private const val SEARCH_CACHE_MS = 10 * 60_000L
+        private const val SEARCH_INDEX_PREFS = "mfp_search_index_v2"
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.44"
+    private val searchEngine = InstrumentSearchEngine(popularSeeds()).also { engine ->
+        loadSearchIndex().forEach { engine.addAll(listOf(it)) }
+    }
+
+    /** Immediate local suggestions. These never claim to be authoritative quotes. */
+    fun searchLocal(query: String, filter: String = "ALL"): List<SearchResult> =
+        searchEngine.search(query, filter, 30)
+
+    private fun loadSearchIndex(): List<SearchResult> {
+        val raw = prefs?.getString(SEARCH_INDEX_PREFS, "").orEmpty()
+        if (raw.isBlank()) return emptyList()
+        return runCatching {
+            val a = JSONArray(raw)
+            buildList {
+                for (i in 0 until a.length()) {
+                    val o = a.optJSONObject(i) ?: continue
+                    val symbol = o.optString("symbol").trim()
+                    if (symbol.isBlank()) continue
+                    add(SearchResult(symbol, o.optString("name", symbol), o.optString("exchange", "БКС"), o.optString("type", "STOCK"), "БКС", o.optString("classCode")))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun rememberSearchResults(values: Collection<SearchResult>) {
+        if (values.isEmpty()) return
+        searchEngine.addAll(values)
+        val merged = searchEngine.all().takeLast(350)
+        val a = JSONArray()
+        merged.forEach { r ->
+            a.put(JSONObject().apply {
+                put("symbol", r.symbol); put("name", r.name); put("exchange", r.exchange); put("type", r.type); put("classCode", r.classCode)
+            })
+        }
+        prefs?.edit()?.putString(SEARCH_INDEX_PREFS, a.toString())?.apply()
+    }
 
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -243,7 +280,10 @@ class MarketRepository(
             .map { it.second }
             .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
             .take(50)
-        if (result.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to result
+        if (result.isNotEmpty()) {
+            searchCache[cacheKey] = System.currentTimeMillis() to result
+            rememberSearchResults(result)
+        }
         return result
     }
 

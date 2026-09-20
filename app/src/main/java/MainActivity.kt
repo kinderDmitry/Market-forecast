@@ -300,14 +300,23 @@ fun MarketForecastApp(ctx: Context) {
     LaunchedEffect(query, searchFilter) {
         val q = query.trim()
         if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
-        delay(300)
         val requested = q
         val requestedFilter = searchFilter
+
+        // Modern-search behaviour: render local suggestions immediately, then let
+        // the authoritative BCS resolver refresh them in the same coroutine.
+        // LaunchedEffect cancellation prevents an older query from overwriting a newer one.
+        val local = withContext(Dispatchers.Default) { repo.searchLocal(requested, requestedFilter) }
+        if (query.trim().equals(requested, true) && searchFilter == requestedFilter && local.isNotEmpty()) {
+            results = local
+        }
+
+        delay(260)
         searching = true
         val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested, requestedFilter) }.getOrDefault(emptyList()) }
         if (query.trim().equals(requested, true) && searchFilter == requestedFilter) {
-            results = found
-            message = if (ru) "Поиск БКС завершён: найдено ${results.size}" else "BCS search completed: ${results.size} found"
+            if (found.isNotEmpty()) results = found
+            message = if (ru) "Поиск БКС обновлён: найдено ${if (found.isNotEmpty()) found.size else results.size}" else "BCS search updated: ${if (found.isNotEmpty()) found.size else results.size} found"
         }
         searching = false
     }
