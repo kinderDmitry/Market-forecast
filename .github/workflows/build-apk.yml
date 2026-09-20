@@ -1,4 +1,4 @@
-name: Build MarketForecast PROX 4.8.108 APK
+name: Build MarketForecast PROX 4.8.109 APK
 
 on:
   workflow_dispatch:
@@ -86,8 +86,8 @@ jobs:
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
           test -f app/src/main/java/AnalyticsEngine.kt
-          grep -q 'versionCode = 147' app/build.gradle.kts
-          grep -q 'versionName = "4.8.108"' app/build.gradle.kts
+          grep -q 'versionCode = 148' app/build.gradle.kts
+          grep -q 'versionName = "4.8.109"' app/build.gradle.kts
           grep -q 'TRADING_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
           echo 'Project verification: OK'
 
@@ -100,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.108.apk
+          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.109.apk
 
       - name: Publish APK as GitHub Release asset
         env:
@@ -108,8 +108,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.108 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.108.apk \
+          TITLE="MarketForecast PROX 4.8.109 build ${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" release/MarketForecast_PROX_4.8.109.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.108. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.109. Commit: ${GITHUB_SHA}"
