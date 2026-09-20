@@ -108,7 +108,7 @@ private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
 private val DarkMuted = Color(0xFF8FA7B8)
 
-private enum class Screen { HOME, SEARCH, FAVORITES, HISTORY, SCANNER, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
+private enum class Screen { HOME, SEARCH, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -142,7 +142,7 @@ fun MarketForecastApp(ctx: Context) {
     val launchTarget = launchIntent?.getStringExtra("mfp_target")?.takeIf { fromNotification }
     var selected by remember { mutableStateOf(launchSymbol ?: prefs.getString("selected", "SBER") ?: "SBER") }
     var tf by remember { mutableStateOf(launchIntent?.getStringExtra("mfp_timeframe") ?: "1D") }
-    var screen by remember { mutableStateOf(when(launchTarget){"SCANNER"->Screen.SCANNER;"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;else->Screen.HOME}) }
+    var screen by remember { mutableStateOf(when(launchTarget){"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;else->Screen.HOME}) }
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
@@ -178,7 +178,6 @@ fun MarketForecastApp(ctx: Context) {
     }
     fun saveTracked(v: List<TrackedForecast>) { tracked = v; prefs.edit().putString("tracked", encodeTracked(v)).apply() }
     fun schedule() {
-        if (prefs.getBoolean("scanner_priority_active", false)) return
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
         WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
             "market_monitor", ExistingPeriodicWorkPolicy.UPDATE,
@@ -186,10 +185,6 @@ fun MarketForecastApp(ctx: Context) {
         )
     }
     fun runMonitorNow() {
-        if (prefs.getBoolean("scanner_priority_active", false)) {
-            message = if (ru) "Сканер имеет приоритет: фоновые процессы временно приостановлены." else "Scanner has priority: background processes are temporarily paused."
-            return
-        }
         message = if (ru) "Проверка уведомлений запущена…" else "Notification check started…"
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
         WorkManager.getInstance(ctx).enqueueUniqueWork("market_monitor_now", ExistingWorkPolicy.REPLACE, OneTimeWorkRequestBuilder<MarketMonitorWorker>().setConstraints(constraints).build())
@@ -486,7 +481,7 @@ fun MarketForecastApp(ctx: Context) {
         AlertDialog(
             onDismissRequest = { showPopupPermissionPrompt = false; prefs.edit().putBoolean("popup_prompt_done", true).apply() },
             title = { Text(if (ru) "Всплывающие уведомления" else "Pop-up notifications") },
-            text = { Text(if (ru) "Для TP/SL, новостей, сканера и отслеживания нужен канал с высокой важностью. Android не имеет отдельного системного разрешения на всплывающие уведомления: они настраиваются внутри канала уведомлений." else "TP/SL, news, scanner and tracking alerts use a high-importance channel. Android has no separate runtime pop-up permission; it is controlled in the notification channel settings.") },
+            text = { Text(if (ru) "Для TP/SL, новостей и отслеживания нужен канал с высокой важностью. Android не имеет отдельного системного разрешения на всплывающие уведомления: они настраиваются внутри канала уведомлений." else "TP/SL, news and tracking alerts use a high-importance channel. Android has no separate runtime pop-up permission; it is controlled in the notification channel settings.") },
             confirmButton = { TextButton(onClick = {
                 createNotificationChannel(ctx)
                 showPopupPermissionPrompt = false
@@ -513,7 +508,7 @@ fun MarketForecastApp(ctx: Context) {
                     )
                 }
             },
-            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.FAVORITES, Screen.HISTORY, Screen.SCANNER, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
+            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.FAVORITES, Screen.HISTORY, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
         ) { pad ->
             Box(Modifier.fillMaxSize().padding(pad)) {
                 CosmicBackground()
@@ -524,7 +519,6 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
-                        Screen.SCANNER -> ScannerScreen(selected, favorites, ru, repo, refreshTick, { row -> pendingScanTrack = row.result.symbol to row.timeframe; load(row.result.symbol, row.timeframe) })
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
@@ -569,7 +563,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SCANNER -> if (ru) "🔎 Сканер" else "🔎 Scanner"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
 }
 
 @Composable
@@ -1268,119 +1262,6 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     }
 }
 
-@Composable private fun ScannerScreen(selected: String, favs: Set<String>, ru: Boolean, repo: MarketRepository, refreshTick: Long = 0L, track: (ScanRow) -> Unit) {
-    val ctx=LocalContext.current; val prefs=remember{ctx.getSharedPreferences("mfprefs",Context.MODE_PRIVATE)}
-    var tf by remember { mutableStateOf(prefs.getString("scanner_tf","1D") ?: "1D") }
-    var type by remember { mutableStateOf(prefs.getString("scanner_type","ALL") ?: "ALL") }
-    var scope by remember { mutableStateOf(prefs.getString("scanner_scope","ALL") ?: "ALL") }
-    var busy by remember { mutableStateOf(false) }; var progress by remember { mutableFloatStateOf(0f) }; var results by remember { mutableStateOf(loadAutoScanResults(prefs)) }
-    var scannerStatus by remember { mutableStateOf(prefs.getString("scanner_status", "") ?: "") }
-    var countdownNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(refreshTick) {
-        results = loadAutoScanResults(prefs)
-        scannerStatus = prefs.getString("scanner_status", "") ?: ""
-    }
-    LaunchedEffect(Unit) {
-        while (true) {
-            countdownNow = System.currentTimeMillis()
-            busy = prefs.getBoolean("scanner_running", false)
-            progress = prefs.getFloat("scanner_progress", 0f)
-            scannerStatus = prefs.getString("scanner_status", "") ?: ""
-            results = loadAutoScanResults(prefs)
-            delay(1000L)
-        }
-    }
-    LazyColumn(
-        Modifier.fillMaxSize().padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        contentPadding = PaddingValues(top = 10.dp, bottom = 30.dp)
-    ) {
-        item {
-            Text(
-                text = if (ru) "Выберите область: только избранные или весь доступный рынок. При сканировании всего рынка фоновые задачи приостанавливаются, чтобы все ресурсы устройства были отданы сканеру." else "Choose scope: favorites only or the full available market. During a full scan, background tasks are paused so device resources are dedicated to the scanner.",
-                fontSize = 9.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        item {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("SELECTED","ALL").forEach { k ->
-                    FilterChip(selected=scope==k,onClick={scope=k;prefs.edit().putString("scanner_scope",k).apply()},label={Text(if(ru) if(k=="SELECTED") "Только избранные" else "Весь рынок" else if(k=="SELECTED") "Selected only" else "Entire market",fontSize=8.sp)})
-                }
-            }
-        }
-        item {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("ALL","STOCKS","FX").forEach { k ->
-                    FilterChip(selected=type==k,onClick={type=k;prefs.edit().putString("scanner_type",k).apply()},label={Text(if(ru) when(k){"ALL"->"Все";"STOCKS"->"Акции";else->"Валюты"} else k,fontSize=8.sp)})
-                }
-            }
-        }
-        item {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("15M","1H","4H","1D","1W","ANY").forEach { k ->
-                    FilterChip(selected=tf==k,onClick={tf=k;prefs.edit().putString("scanner_tf",k).apply()},label={Text(if(ru&&k=="ANY")"Любой" else k,fontSize=8.sp)})
-                }
-            }
-        }
-        item {
-            Button({
-                if (prefs.getBoolean("scanner_running", false)) {
-                    ctx.startService(Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_STOP))
-                } else {
-                    prefs.edit().putBoolean("scanner_priority_active", scope == "ALL").apply()
-                    if (scope == "ALL") {
-                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor")
-                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_now")
-                        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor_history_catchup")
-                    }
-                    val intent = Intent(ctx, ScannerForegroundService::class.java).setAction(ScannerForegroundService.ACTION_START)
-                        .putExtra(ScannerForegroundService.EXTRA_SCOPE, scope)
-                        .putExtra(ScannerForegroundService.EXTRA_TYPE, type)
-                        .putExtra(ScannerForegroundService.EXTRA_TF, tf)
-                    if (Build.VERSION.SDK_INT >= 26) androidx.core.content.ContextCompat.startForegroundService(ctx, intent) else ctx.startService(intent)
-                }
-            }, Modifier.fillMaxWidth(), enabled=true, colors=ButtonDefaults.buttonColors(containerColor=if (busy) Negative else Accent)) {
-                Text(if (busy) (if (ru) "⛔ ОСТАНОВИТЬ СКАНЕР" else "⛔ STOP SCANNER") else (if (ru) "ЗАПУСТИТЬ СКАНЕР" else "START SCANNER"), fontWeight=FontWeight.Black)
-            }
-        }
-        if (busy) {
-            item {
-                GradientCard(Modifier.fillMaxWidth()) {
-                    Row(verticalAlignment=Alignment.CenterVertically) {
-                        CircularProgressIndicator(Modifier.size(24.dp),color=Accent)
-                        Column(Modifier.padding(start=10.dp).weight(1f)) {
-                            Text(if(ru)"Идёт сканирование рыночных данных…" else "Scanning live market…",fontWeight=FontWeight.Bold,fontSize=10.sp)
-                            LinearProgressIndicator(progress={progress},Modifier.fillMaxWidth().padding(top=6.dp),color=Accent)
-                        }
-                    }
-                }
-            }
-        }
-        if(scannerStatus.isNotBlank()&&!busy) item { Text(scannerStatus,fontSize=9.sp,color=Positive,modifier=Modifier.padding(top=2.dp)) }
-        if (results.isNotEmpty()) {
-            item { Text(if (ru) "Сигналы действуют только до указанного времени. После окончания горизонта они автоматически исчезают и ждут нового подтверждения." else "Signals are valid only until the shown expiry. After the horizon they disappear automatically and wait for a new confirmation.", fontSize=8.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, modifier=Modifier.padding(top=2.dp)) }
-            item { Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.End) { TextButton(onClick={ results=emptyList(); prefs.edit().remove("auto_scan_results").apply() }) { Text(if(ru) "🗑️ Удалить все" else "🗑️ Delete all") } } }
-            items(results,key={"${it.result.symbol}|${it.timeframe}"}) { row ->
-                GradientCard(Modifier.fillMaxWidth().clickable{track(row)}) {
-                    Row(verticalAlignment=Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(row.result.symbol, fontWeight=FontWeight.Black, fontSize=11.sp)
-                            Text(row.result.name, fontWeight=FontWeight.SemiBold, fontSize=9.sp, color=MaterialTheme.colorScheme.onSurfaceVariant, maxLines=1, overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                        }
-                        Box(Modifier.clip(RoundedCornerShape(7.dp)).background(signalColor(row.signal).copy(alpha=.14f)).border(1.dp, signalColor(row.signal).copy(alpha=.65f), RoundedCornerShape(7.dp)).padding(horizontal=7.dp, vertical=4.dp)) { Text(row.timeframe, color=signalColor(row.signal), fontWeight=FontWeight.Black, fontSize=8.sp) }
-                        Spacer(Modifier.width(6.dp)); Text(row.signal,color=signalColor(row.signal),fontWeight=FontWeight.Black,fontSize=8.sp); Spacer(Modifier.width(7.dp)); Text("${row.confidence}%",color=Accent,fontWeight=FontWeight.Black)
-                        val left=(row.expiresAt-countdownNow).coerceAtLeast(0L)
-                        Text(if(left>0) "• ${formatElapsed(left)}" else "• ${if(ru) "истёк" else "expired"}", color=if(left>0) Warning else MaterialTheme.colorScheme.onSurfaceVariant, fontSize=8.sp)
-                        Spacer(Modifier.width(3.dp)); TextButton(onClick={track(row)}, contentPadding=PaddingValues(horizontal=6.dp, vertical=0.dp)) { Text(if(ru) "Отследить" else "Track", color=Positive, fontSize=8.sp, fontWeight=FontWeight.Black) }
-                        IconButton({results=results.filterNot{it.result.symbol==row.result.symbol&&it.timeframe==row.timeframe};prefs.edit().putStringSet("auto_scan_results",results.map{listOf(it.result.symbol,it.timeframe,it.signal,it.confidence,it.score,it.rr,it.horizonSeconds,it.createdAt,it.expiresAt,it.tp1Probability,it.tp2Probability,it.tp3Probability,it.expectedValueR).joinToString("|")}.toSet()).apply()}){Icon(Icons.Default.Delete,null,tint=Negative)}
-                    }
-                }
-            }
-        }
-    }
-}
-
 @Composable private fun NewsScreen(news: List<NewsItem>, ru: Boolean, refreshTick: Long = 0L, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
         item { SectionHeader(if (ru) "📰 Новости" else "📰 News", if (ru) "Открой новость внутри приложения: фото, текст и оригинальная страница без выхода из приложения" else "Open the full article inside the app with images and text") }
@@ -1487,7 +1368,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     var token by remember { mutableStateOf(prefs.getString("bcs_refresh_token","").orEmpty()) }
     var saved by remember { mutableStateOf(token.isNotBlank()) }
     SettingGroup(if(ru)"БКС" else "BCS"){
-        Text(if(ru)"Поиск и сканер получают список инструментов напрямую из API БКС. Каталог в приложении не загружается и не кэшируется." else "Search and scanner obtain instruments directly from the BCS API. No instrument catalogue is downloaded or cached in the app.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(if(ru)"Поиск акций и валют работает напрямую через API БКС. Каталог инструментов в приложении не загружается и не кэшируется." else "Stock and currency search uses the BCS API directly. No instrument catalogue is downloaded or cached in the app.",fontSize=9.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedTextField(value=token,onValueChange={token=it;saved=false},modifier=Modifier.fillMaxWidth().padding(top=8.dp),singleLine=true,label={Text(if(ru)"Refresh-токен БКС" else "BCS refresh token")},visualTransformation=PasswordVisualTransformation())
         Button(onClick={prefs.edit().putString("bcs_refresh_token",token.trim()).apply();saved=token.isNotBlank()},enabled=token.isNotBlank(),modifier=Modifier.fillMaxWidth().padding(top=7.dp),shape=RoundedCornerShape(13.dp)){Text(if(ru)if(saved)"БКС подключён" else "Сохранить токен" else if(saved)"BCS connected" else "Save token",fontWeight=FontWeight.Black)}
         Text(if(token.isNotBlank()&&saved)if(ru)"Источник инструментов и рыночных данных: БКС API" else "Instrument and market-data source: BCS API" else if(ru)"Введите refresh-токен БКС с правами только для чтения." else "Enter a BCS read-only refresh token.",fontSize=8.sp,color=if(token.isNotBlank()&&saved)Positive else Warning,modifier=Modifier.padding(top=5.dp))
@@ -1516,7 +1397,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=10.sp);Switch(checked = value, onCheckedChange = on)}}
 
-@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SCANNER to Icons.Default.Radar,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";Screen.SCANNER->"Сканер";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";Screen.SCANNER->"Scanner";else->"Settings"},fontSize=7.sp)})}}}
+@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=7.sp)})}}}
 @Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=11.sp)}}
 @Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){GradientCard(modifier.clickable(onClick=on)){Column(Modifier.padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(icon,null,tint=Accent,modifier=Modifier.size(22.dp));Text(title,fontWeight=FontWeight.Bold,fontSize=8.sp,modifier=Modifier.padding(top=5.dp))}}}
 @Composable private fun SectionHeader(t:String,s:String){
@@ -1545,28 +1426,6 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun ErrorCard(s:String,ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Данные временно недоступны" else "Data temporarily unavailable",color=Negative,fontWeight=FontWeight.Bold);Text(s,fontSize=9.sp,modifier=Modifier.padding(top=5.dp))}}
 
 @Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier, shape = RoundedCornerShape(12.dp), color = Color.Black, contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
-private fun loadAutoScanResults(p: android.content.SharedPreferences): List<ScanRow> = p.getStringSet("auto_scan_results", emptySet()).orEmpty().mapNotNull { a ->
-    val x = a.split("|", limit = 17)
-    if (x.size < 6) null else {
-        val created = x.getOrNull(7)?.toLongOrNull() ?: 0L
-        val expires = x.getOrNull(8)?.toLongOrNull() ?: 0L
-        ScanRow(
-            SearchResult(
-                x[0],
-                x.getOrNull(13).orEmpty().ifBlank { x[0] },
-                x.getOrNull(14).orEmpty().ifBlank { "БКС" },
-                x.getOrNull(15).orEmpty(),
-                "БКС",
-                x.getOrNull(16).orEmpty()
-            ),
-            x[1], x[2], x[3].toIntOrNull() ?: 0, x[4].toDoubleOrNull() ?: 0.0,
-            x[5].toDoubleOrNull() ?: 0.0, x.getOrNull(6)?.toLongOrNull() ?: 0L,
-            created, expires, x.getOrNull(9)?.toDoubleOrNull() ?: 0.0,
-            x.getOrNull(10)?.toDoubleOrNull() ?: 0.0, x.getOrNull(11)?.toDoubleOrNull() ?: 0.0,
-            x.getOrNull(12)?.toDoubleOrNull() ?: 0.0
-        )
-    }
-}.filter { it.expiresAt <= 0L || it.expiresAt > System.currentTimeMillis() }.sortedByDescending { it.confidence }
 private fun loadFavoriteOrder(p: android.content.SharedPreferences, favs: Set<String>): List<String> = (p.getString("favorite_order", "").orEmpty().split("\n").filter { it.isNotBlank() }.filter { it in favs } + favs.filter { it !in p.getString("favorite_order", "").orEmpty().split("\n") }).distinct()
 private fun loadSearchHistory(p: android.content.SharedPreferences): List<String> = p.getString("search_history", "").orEmpty().split("\n").filter { it.isNotBlank() }.take(20)
 private fun saveSearchHistory(p: android.content.SharedPreferences, q: String): List<String> { val out = (listOf(q) + loadSearchHistory(p).filterNot { it.equals(q, true) }).take(20); p.edit().putString("search_history", out.joinToString("\n")).apply(); return out }

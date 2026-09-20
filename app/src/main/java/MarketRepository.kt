@@ -49,7 +49,7 @@ class MarketRepository(
         )
         // BCS documents 10 RPS for reference and market-data HTTP APIs. Keep a
         // single process-wide limiter because catalog, candles, quotes and order-book
-        // requests can run concurrently from scanner/UI/workers.
+        // requests can run concurrently from UI/workers.
         private val bcsHttpGate = Any()
         private var bcsLastRequestAt = 0L
         private const val BCS_MIN_REQUEST_GAP_MS = 115L
@@ -152,7 +152,8 @@ class MarketRepository(
         // people make most often (and still verifies the instrument against BCS).
         val seedTicker = aliases[q.lowercase(Locale.ROOT)] ?: popularSeeds()
             .firstOrNull { normalizeSearchText(it.name) == normalizeSearchText(q) }?.symbol
-        val directTicker = seedTicker ?: q.uppercase(Locale.US)
+        val normalizedFx = normalizeFx(q)?.symbol
+        val directTicker = seedTicker ?: normalizedFx ?: q.uppercase(Locale.US)
             .replace("/", "").replace("-", "")
             .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
         if (!directTicker.isNullOrBlank()) {
@@ -174,36 +175,70 @@ class MarketRepository(
             }
         }
 
-        // Name search is also API-only: walk only the selected BCS instrument types,
-        // page by page, and match the returned BCS display/short names.
+        // Name search has no BCS name endpoint, so the authoritative directory is the
+        // fallback. Pages are fetched concurrently; the process-wide 10 RPS gate still
+        // protects BCS. This avoids the old type-by-type serial wait.
         val needle = normalizeSearchText(q)
         val compact = compactSearch(needle)
         val transliterated = transliterateRuToLat(needle)
         val out = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, SearchResult>>())
-        // BCS has no name-search endpoint. Search the authoritative directory, but
-        // query the selected instrument types concurrently. The global BCS request
-        // gate still enforces the provider rate limit.
-        val jobs = wanted.map { type ->
-            analysisPool.submit {
-                val items = runCatching { loadCatalogType(type, 4) }.getOrElse { emptyList() }
-                for (item in items) {
-                    if (!matchesType(item)) continue
-                    val symbol = normalizeSearchText(item.symbol)
-                    val name = normalizeSearchText(item.name)
-                    val nameCompact = compactSearch(name)
-                    val rank = when {
-                        symbol == needle || name == needle -> 0
-                        symbol.startsWith(needle) || name.startsWith(needle) -> 1
-                        compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
-                        transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
-                        symbol.contains(needle) || name.contains(needle) -> 3
-                        else -> continue
-                    }
-                    out += rank to item
-                }
+
+        // First resolve bundled aliases/popular instruments through BCS. These are only
+        // candidates; every returned result is still verified against the live BCS API.
+        val seeds = popularSeeds().filter { item ->
+            matchesType(item) && run {
+                val s = normalizeSearchText(item.symbol)
+                val n = normalizeSearchText(item.name)
+                val nc = compactSearch(n)
+                s.startsWith(needle) || n.startsWith(needle) ||
+                    compact.isNotBlank() && (s.startsWith(compact) || nc.startsWith(compact)) ||
+                    transliterated.isNotBlank() && (s.startsWith(transliterated) || transliterateRuToLat(n).startsWith(transliterated))
+            }
+        }.take(12)
+        seeds.forEach { candidate ->
+            runCatching { bcsInstrumentInfo(candidate.symbol) }.getOrNull()?.let { o ->
+                val ticker = o.optString("ticker").ifBlank { candidate.symbol }
+                val board = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                val item = SearchResult(
+                    ticker,
+                    o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { candidate.name },
+                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
+                    o.optString("instrumentType").ifBlank { candidate.type },
+                    "БКС", board?.optString("classCode").orEmpty()
+                )
+                if (matchesType(item)) out += 0 to item
             }
         }
-        jobs.forEach { runCatching { it.get(18, TimeUnit.SECONDS) } }
+
+        // Search enough directory pages to cover the normal BCS universe, but do it in
+        // parallel instead of serially. If an exact/seed match already exists, this is
+        // deliberately skipped: returning a verified result is much faster than proving
+        // that the same instrument is also present on a later directory page.
+        if (out.isEmpty()) {
+            val pageCount = if (needle.length <= 2) 6 else 12
+            val jobs = wanted.flatMap { type ->
+                (0 until pageCount).map { page ->
+                    analysisPool.submit {
+                        runCatching { loadCatalogPage(type, page) }.getOrElse { emptyList() }.forEach { item ->
+                            if (!matchesType(item)) return@forEach
+                            val symbol = normalizeSearchText(item.symbol)
+                            val name = normalizeSearchText(item.name)
+                            val nameCompact = compactSearch(name)
+                            val rank = when {
+                                symbol == needle || name == needle -> 0
+                                symbol.startsWith(needle) || name.startsWith(needle) -> 1
+                                compact.isNotBlank() && (symbol.startsWith(compact) || nameCompact.startsWith(compact)) -> 2
+                                transliterated.isNotBlank() && (symbol.startsWith(transliterated) || transliterateRuToLat(name).startsWith(transliterated)) -> 2
+                                symbol.contains(needle) || name.contains(needle) -> 3
+                                else -> return@forEach
+                            }
+                            out += rank to item
+                        }
+                    }
+                }
+            }
+            jobs.forEach { runCatching { it.get(10, TimeUnit.SECONDS) } }
+        }
         val result = out.sortedWith(compareBy<Pair<Int, SearchResult>> { it.first }.thenBy { it.second.name.lowercase(Locale.ROOT) })
             .map { it.second }
             .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
@@ -212,21 +247,15 @@ class MarketRepository(
         return result
     }
 
-    /** Scanner universe comes directly from BCS, page-by-page, with no catalogue cache. */
-    fun scannerCatalog(type: String): List<SearchResult> {
+    /** BCS instrument universe for non-scanner market widgets. */
+    fun instrumentCatalog(type: String): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()
-        streamScannerInstruments(type) { item -> out.putIfAbsent(catalogIdentity(item), item) }
+        instrumentCatalogStream(type) { item -> out.putIfAbsent(catalogIdentity(item), item) }
         return out.values.toList()
     }
 
-    /**
-     * Streaming scanner source. The previous implementation downloaded the entire
-     * BCS directory before the first instrument could be analysed. That made the
-     * scanner look frozen for several minutes. Now each BCS page is delivered to the
-     * scanner immediately and the next page is requested only after the current page
-     * has been processed. No local catalogue is created.
-     */
-    fun streamScannerInstruments(type: String, onInstrument: (SearchResult) -> Unit) {
+    /** Stream BCS directory pages for market widgets without persisting a catalogue. */
+    private fun instrumentCatalogStream(type: String, onInstrument: (SearchResult) -> Unit) {
         val types = when (type.uppercase(Locale.US)) {
             "FX" -> listOf("CURRENCY")
             "STOCKS" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
@@ -259,6 +288,37 @@ class MarketRepository(
             else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
         }
         return item.takeIf { ok }
+    }
+
+    private fun loadCatalogPage(type: String, page: Int): List<SearchResult> {
+        var last: Throwable? = null
+        for (attempt in 0..4) {
+            try {
+                val root = JSONObject(getTextAuth(
+                    "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
+                    9000, bcsHeaders()
+                ))
+                val arr = root.optJSONArray("instruments") ?: JSONArray()
+                val out = ArrayList<SearchResult>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val ticker = o.optString("ticker").trim()
+                    if (ticker.isBlank()) continue
+                    out += SearchResult(
+                        ticker,
+                        o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
+                        o.optString("exchange").ifBlank { "БКС" },
+                        o.optString("instrumentType").ifBlank { type },
+                        "БКС", o.optString("classCode")
+                    )
+                }
+                return out
+            } catch (t: Throwable) {
+                last = t
+                Thread.sleep((180L * (attempt + 1)).coerceAtMost(900L))
+            }
+        }
+        throw last ?: IllegalStateException("БКС: не удалось получить страницу инструментов")
     }
 
     private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null, onItem: ((SearchResult) -> Unit)? = null): List<SearchResult> {
@@ -327,7 +387,7 @@ class MarketRepository(
 
     /** BCS-only FX catalogue. No local catalogue/cache is used. */
     fun fxCatalog(): List<SearchResult> = if (!isBcsConfigured()) emptyList() else
-        scannerCatalog("FX")
+        instrumentCatalog("FX")
 
     private fun normalizeSearchText(value: String): String =
         value.trim().lowercase(Locale.ROOT)
@@ -413,7 +473,7 @@ class MarketRepository(
     fun marketToday(mode: String, limit: Int = 20): List<MarketPick> {
         // Market Today is latency-sensitive. Each instrument is isolated so one
         // provider failure cannot abort the whole scan.
-        val catalog = runCatching { scannerCatalog("ALL") }.getOrDefault(emptyList())
+        val catalog = runCatching { instrumentCatalog("ALL") }.getOrDefault(emptyList())
         val normalizedCatalog = catalog
             .map { it.copy(symbol = canonicalSymbol(it.symbol)) }
             .distinctBy { it.symbol.uppercase(Locale.US) }

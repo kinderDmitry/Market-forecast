@@ -15,10 +15,6 @@ import kotlin.math.abs
 class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val p = applicationContext.getSharedPreferences("mfprefs", Context.MODE_PRIVATE)
-        // Full-market scanner has exclusive priority. Do not let a background monitor
-        // consume CPU/network while the scanner is active; the scanner restores the
-        // normal periodic schedule when it finishes.
-        if (p.getBoolean("scanner_priority_active", false)) return@withContext Result.success()
         val ru = p.getBoolean("ru", true)
         val repo = MarketRepository(
             bcsRefreshToken = p.getString("bcs_refresh_token", "")?.ifBlank { null },
@@ -149,7 +145,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
             }
         }
 
-        // Automatic market-wide scanner removed. Background worker is reserved for favorites/tracking.
+        // Background worker is reserved for favorites/tracking.
 
         val favorites = p.getStringSet("favorites", emptySet()).orEmpty().toList()
         val previous = readSignalMap(p).toMutableMap()

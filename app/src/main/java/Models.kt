@@ -2,21 +2,6 @@ package com.marketforecast.prox
 
 data class Candle(val time: Long, val open: Double, val high: Double, val low: Double, val close: Double, val volume: Double)
 data class SearchResult(val symbol: String, val name: String, val exchange: String, val type: String, val source: String = "", val classCode: String = "")
-data class ScanRow(
-    val result: SearchResult,
-    val timeframe: String,
-    val signal: String,
-    val confidence: Int,
-    val score: Double,
-    val rr: Double,
-    val horizonSeconds: Long = 0L,
-    val createdAt: Long = 0L,
-    val expiresAt: Long = 0L,
-    val tp1Probability: Double = 0.0,
-    val tp2Probability: Double = 0.0,
-    val tp3Probability: Double = 0.0,
-    val expectedValueR: Double = 0.0
-)
 data class DividendEvent(val symbol: String, val date: Long, val amount: Double, val source: String = "БКС Экспресс")
 enum class NewsCategory { ALL, STOCKS, FX }
 data class NewsItem(val title: String, val publisher: String, val url: String, val publishedAt: Long, val originalTitle: String = title, val category: NewsCategory = NewsCategory.ALL, val body: String = "", val instrument: String = "")

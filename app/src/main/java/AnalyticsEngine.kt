@@ -146,7 +146,7 @@ object AnalyticsEngine {
     private data class PatternResult(val score: Double, val names: List<String>)
 
     /**
-     * Price-action pattern engine. It works only from OHLCV, so the scanner can
+     * Price-action pattern engine. It works only from OHLCV, so downstream forecast logic can
      * recognize formations instead of relying on one oscillator. Patterns are
      * confirmations, not guarantees; conflicting formations reduce the score.
      */
@@ -683,15 +683,6 @@ object AnalyticsEngine {
         synchronized(cacheLock) { analysisCache[key] = result }
         return result
     }
-
-    /**
-     * Scanner and Forecast must never use different admission rules.  The scanner
-     * is an execution surface of the same forecast engine, not a second model.
-     * Keeping one decision path prevents the classic contradiction where the
-     * scanner says LONG while the instrument forecast says NO TRADE / weak trend.
-     */
-    fun analyzeForScanner(c: List<Candle>, entryOverride: Double? = null): Forecast =
-        analyze(c, entryOverride)
 
     private fun analyzeInternal(c: List<Candle>, entryOverride: Double? = null, calibrate: Boolean): Forecast {
         require(c.size >= 30) { "Недостаточно исторических данных" }
