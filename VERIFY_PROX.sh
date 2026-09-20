@@ -10,11 +10,14 @@ test -f app/src/main/java/MainActivity.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 146' app/build.gradle.kts
-grep -q 'versionName = "4.8.107"' app/build.gradle.kts
+grep -q 'versionCode = 147' app/build.gradle.kts
+grep -q 'versionName = "4.8.108"' app/build.gradle.kts
 
-echo "[3/6] Search-only architecture"
-! grep -RInE "ScannerForegroundService|analyzeForScanner|ScanRow|streamScannerInstruments|scannerCatalog" app/src/main 2>/dev/null
+echo "[3/6] Search + streaming scanner architecture"
+test -f app/src/main/java/ScannerEngine.kt
+grep -q "class ScannerEngine" app/src/main/java/ScannerEngine.kt
+grep -q "Universe.ALL" app/src/main/java/ScannerEngine.kt
+! grep -RInE "ScannerForegroundService|analyzeForScanner|ScanRow|scannerCatalog" app/src/main 2>/dev/null
 ! grep -q "scanner_priority_active" app/src/main/java/MarketMonitorWorker.kt
 
 echo "[4/6] No duplicate FavoriteQuote"
@@ -38,7 +41,7 @@ echo "[8/9] No stale live-price fallback"
 
 echo "[9/9] BCS API-only architecture"
 test ! -e app/src/main/java/CatalogRefreshService.kt
-! grep -RInE "CatalogRefreshService|refreshFullCatalog|catalog_refresh_|ScannerForegroundService|analyzeForScanner|ScanRow|streamScannerInstruments|scannerCatalog" app/src/main 2>/dev/null
+! grep -RInE "CatalogRefreshService|refreshFullCatalog|catalog_refresh_|ScannerForegroundService|analyzeForScanner|ScanRow|scannerCatalog" app/src/main 2>/dev/null
 grep -q "TRADING_INSTRUMENT_TYPES" app/src/main/java/MarketRepository.kt
 
 echo "VERIFY_PROX: OK"
