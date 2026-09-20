@@ -5,7 +5,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/** Shared real-time candle merge used by the screen and the scanner. */
+/** Shared real-time candle merge used by the market screen. */
 internal fun mergeRealtimeCandle(raw: List<Candle>, live: Double, timeframe: String, now: Long, symbol: String = ""): List<Candle> {
     if (raw.isEmpty() || !live.isFinite() || live <= 0.0) return raw
     val sorted = raw.sortedBy { it.time }

@@ -36,12 +36,12 @@ class MarketRepository(
     companion object {
         const val BCS_DIVIDEND_CALENDAR_URL = "https://bcs-express.ru/dividednyj-kalendar"
         // Historical candles change slowly compared with live quotes. A short process-wide
-        // cache prevents repeated timeframe switches/scans from hammering the same provider.
+        // cache prevents repeated timeframe switches from hammering the same provider.
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
         private const val QUOTE_CACHE_MS = 5_000L
-        // Only instruments the app can actually search/scan: shares (including
+        // Only instruments the app can actually search: shares (including
         // foreign shares/DRs) and currencies. Do not download ETFs, indices,
         // bonds, futures, options or other BCS directory types.
         private val TRADING_INSTRUMENT_TYPES = listOf(
@@ -247,7 +247,7 @@ class MarketRepository(
         return result
     }
 
-    /** BCS instrument universe for non-scanner market widgets. */
+    /** BCS instrument universe for market widgets. */
     fun instrumentCatalog(type: String): List<SearchResult> {
         val out = LinkedHashMap<String, SearchResult>()
         instrumentCatalogStream(type) { item -> out.putIfAbsent(catalogIdentity(item), item) }
@@ -472,7 +472,7 @@ class MarketRepository(
 
     fun marketToday(mode: String, limit: Int = 20): List<MarketPick> {
         // Market Today is latency-sensitive. Each instrument is isolated so one
-        // provider failure cannot abort the whole scan.
+        // provider failure cannot abort the whole market list.
         val catalog = runCatching { instrumentCatalog("ALL") }.getOrDefault(emptyList())
         val normalizedCatalog = catalog
             .map { it.copy(symbol = canonicalSymbol(it.symbol)) }
