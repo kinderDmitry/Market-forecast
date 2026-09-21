@@ -1,4 +1,4 @@
-name: Build MarketForecast PROX 4.8.111 APK
+name: Build MarketForecast PROX 4.8.114 APK
 
 on:
   workflow_dispatch:
@@ -72,24 +72,21 @@ jobs:
           gradle-version: '8.11.1'
           cache-read-only: false
 
-      - name: Verify clean search-only architecture
+      - name: Verify scanner service architecture
         shell: bash
         run: |
           set -euo pipefail
-          test ! -e app/src/main/java/ScannerForegroundService.kt
-          test ! -e app/src/main/java/CatalogRefreshService.kt
-          if grep -RInE "CatalogRefreshService|refreshFullCatalog|catalog_refresh_|ScannerForegroundService|scanIdentity" app/src/main 2>/dev/null; then
-            echo "ERROR: stale scanner/catalog-refresh code is still present"
-            exit 1
-          fi
-          test -f settings.gradle.kts
-          test -f app/build.gradle.kts
+          test -f app/src/main/java/ScannerForegroundService.kt
+          test -f app/src/main/java/ScannerEngine.kt
           test -f app/src/main/AndroidManifest.xml
-          test -f app/src/main/java/AnalyticsEngine.kt
-          grep -q 'versionCode = 150' app/build.gradle.kts
-          grep -q 'versionName = "4.8.111"' app/build.gradle.kts
+          grep -q 'ScannerForegroundService' app/src/main/AndroidManifest.xml
+          grep -q 'foregroundServiceType="dataSync"' app/src/main/AndroidManifest.xml
+          grep -q 'versionCode = 153' app/build.gradle.kts
+          grep -q 'versionName = "4.8.114"' app/build.gradle.kts
           grep -q 'TRADING_INSTRUMENT_TYPES' app/src/main/java/MarketRepository.kt
-          echo 'Project verification: OK'
+          grep -q 'START_STICKY' app/src/main/java/ScannerForegroundService.kt
+          grep -q 'onTaskRemoved' app/src/main/java/ScannerForegroundService.kt
+          echo 'Persistent scanner architecture verification: OK'
 
       - name: Build debug APK
         env:
@@ -100,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.111.apk
+          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.114.apk
 
       - name: Publish APK as GitHub Release asset
         env:
@@ -108,8 +105,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.111 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.111.apk \
+          TITLE="MarketForecast PROX 4.8.114 build ${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" release/MarketForecast_PROX_4.8.114.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.111. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.114. Commit: ${GITHUB_SHA}"
