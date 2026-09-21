@@ -21,8 +21,10 @@ class ScannerEngine(private val repo: MarketRepository) {
         val universe: Universe = Universe.ALL,
         val timeframes: List<String> = listOf("15M", "1H", "4H", "1D"),
         val workers: Int = 4,
-        val minimumConfidence: Int = 70,
-        val minimumScoreAbs: Double = 55.0
+        val minimumConfidence: Int = 68,
+        // AnalyticsEngine score is normalized to -10..+10, not -100..+100.
+        // The old 55 threshold made every scanner result impossible.
+        val minimumScoreAbs: Double = 4.0
     )
 
     enum class Universe { ALL, FAVORITES }
@@ -124,11 +126,15 @@ class ScannerEngine(private val repo: MarketRepository) {
         val canonical = if (instrument.classCode.isBlank()) instrument.symbol else "${instrument.symbol}@${instrument.classCode}"
         val data = ArrayList<TfData>(timeframes.size)
         for (tf in timeframes) {
+            // Scanner history is deliberately bounded to one BCS request per
+            // timeframe in normal conditions. These windows are still much longer
+            // than the model's structural/calibration lookbacks and avoid turning a
+            // whole-market scan into thousands of paginated history calls.
             val pair = when (tf) {
-                "15M" -> "15d" to "15m"
-                "1H" -> "90d" to "1h"
-                "4H" -> "365d" to "4h"
-                else -> "5y" to "1d"
+                "15M" -> "10d" to "15m"
+                "1H" -> "45d" to "1h"
+                "4H" -> "180d" to "4h"
+                else -> "3y" to "1d"
             }
             val candles = repo.load(canonical, pair.first, pair.second)
             if (candles.size < 60) return null
@@ -155,21 +161,29 @@ class ScannerEngine(private val repo: MarketRepository) {
         if (confidence < config.minimumConfidence || abs(score) < config.minimumScoreAbs) return null
         if (higherTimeframeConflict(data, direction)) return null
 
-        val latest = data.maxByOrNull { timeframeWeight(it.timeframe) }?.forecast ?: data.last().forecast
-        if (!latest.highConviction && confidence < 76) return null
+        // Execution levels come from the selected lower working timeframe (15M
+        // when present). Higher timeframes decide context/consensus, not the exact
+        // entry price. This prevents a daily forecast from supplying stale execution
+        // levels to a 15M scanner signal.
+        val execution = data.firstOrNull { it.timeframe == "15M" }?.forecast
+            ?: data.firstOrNull { it.timeframe == "1H" }?.forecast
+            ?: data.minByOrNull { timeframeWeight(it.timeframe) }?.forecast
+            ?: data.last().forecast
+        if (!execution.highConviction && confidence < 74) return null
+        if (execution.rr < 1.45 || execution.tp2Probability < 0.38 || execution.expectedValueR < 0.05) return null
 
         return Result(
             instrument = instrument,
             signal = direction,
             confidence = confidence,
             score = score,
-            entry = latest.entry,
-            stop = latest.stop,
-            tp1 = latest.tp1,
-            tp2 = latest.tp2,
-            tp3 = latest.tp3,
-            rr = latest.rr,
-            regime = latest.regime,
+            entry = execution.entry,
+            stop = execution.stop,
+            tp1 = execution.tp1,
+            tp2 = execution.tp2,
+            tp3 = execution.tp3,
+            rr = execution.rr,
+            regime = execution.regime,
             timeframeScores = data.associate { it.timeframe to it.forecast.score },
             timeframeConfidence = data.associate { it.timeframe to it.forecast.confidence },
             updatedAt = System.currentTimeMillis()

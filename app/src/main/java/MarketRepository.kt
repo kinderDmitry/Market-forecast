@@ -158,60 +158,78 @@ class MarketRepository(
      * confirmation when it is cheap/necessary. No BCS directory walk is performed
      * for autocomplete and no full instrument catalogue is downloaded.
      */
+    /**
+     * Authoritative BCS search. Search metadata comes only from the official BCS
+     * information API; no MOEX/Internet autocomplete participates in the result set.
+     * A small persisted cache is only an acceleration layer for data previously
+     * received from BCS, never a second market-data source.
+     */
     fun search(query: String, filter: String = "ALL"): List<SearchResult> {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
-        val cacheKey = "${filter.uppercase(Locale.US)}|${normalizeSearchText(q)}"
+        val normalized = normalizeSearchText(q)
+        val cacheKey = "BCS|${filter.uppercase(Locale.US)}|$normalized"
         searchCache[cacheKey]?.let { cached ->
             if (System.currentTimeMillis() - cached.first <= SEARCH_CACHE_MS && cached.second.isNotEmpty()) return cached.second
             searchCache.remove(cacheKey)
         }
 
-        // Internet autocomplete and direct BCS resolution run concurrently. Neither
-        // path performs a full directory walk, so typing stays responsive.
-        val internetFuture = prefetchPool.submit<List<SearchResult>> {
-            runCatching { InternetInstrumentSearch.search(q, filter) }.getOrDefault(emptyList())
-        }
-
-        // In parallel with internet autocomplete, resolve a direct ticker/known alias
-        // through BCS. This gives exact BCS identity without ever scanning the directory.
-        val directFuture = analysisPool.submit<List<SearchResult>> {
-            if (!isBcsConfigured()) return@submit emptyList()
-            val normalized = normalizeSearchText(q)
-            val aliases = mapOf(
-                "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
-                "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
-                "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
-                "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
-                "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
-                "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
-                "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
-            )
-            val candidate = aliases[normalized] ?: normalizeFx(q)?.symbol ?: q.uppercase(Locale.US)
-                .replace("/", "").replace("-", "")
+        val aliases = mapOf(
+            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
+            "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
+            "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
+            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
+            "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
+            "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
+            "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
+        )
+        val tickerCandidate = aliases[normalized]
+            ?: normalizeFx(q)?.symbol
+            ?: q.uppercase(Locale.US).replace("/", "").replace("-", "")
                 .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
-                ?: return@submit emptyList()
-            val info = runCatching { bcsInstrumentInfo(candidate) }.getOrNull() ?: return@submit emptyList()
-            val board = info.optJSONArray("boards")?.let { chooseBoard(it) }
-            val item = SearchResult(
-                info.optString("ticker").ifBlank { candidate },
-                info.optString("displayName").ifBlank { info.optString("shortName") }.ifBlank { candidate },
-                board?.optString("exchange").orEmpty().ifBlank { "БКС" },
-                info.optString("instrumentType").ifBlank { if (candidate.endsWith("=X")) "CURRENCY" else "STOCK" },
-                "БКС", board?.optString("classCode").orEmpty()
-            )
-            if (matchesSearchFilter(item, filter)) listOf(item) else emptyList()
+
+        val direct = tickerCandidate?.let { candidate ->
+            runCatching { bcsInstrumentInfo(candidate) }.getOrNull()?.let { info ->
+                val board = info.optJSONArray("boards")?.let { chooseBoard(it) }
+                SearchResult(
+                    info.optString("ticker").ifBlank { candidate },
+                    info.optString("displayName").ifBlank { info.optString("shortName") }.ifBlank { candidate },
+                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
+                    info.optString("instrumentType").ifBlank { if (candidate.contains("RUB", true) || candidate.endsWith("UTSTOM")) "CURRENCY" else "STOCK" },
+                    "БКС", board?.optString("classCode").orEmpty()
+                )
+            }
+        }?.takeIf { matchesSearchFilter(it, filter) }
+
+        // Search the locally persisted BCS directory cache. The cache is populated
+        // exclusively from /instruments/by-type below and therefore remains an
+        // official-BCS identity cache rather than an external search source.
+        val cachedBcs = searchEngine.search(q, filter, 30)
+            .filter { it.source == "БКС" }
+            .filter { matchesSearchFilter(it, filter) }
+
+        val merged = buildList {
+            direct?.let { add(it) }
+            addAll(cachedBcs)
+        }.distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }.take(50)
+
+        // If the BCS cache has never been warmed, fetch the official BCS directory
+        // once in this call. This is the only potentially expensive first search;
+        // subsequent searches are local against the BCS-derived cache.
+        if (merged.isEmpty() && isBcsConfigured()) {
+            runCatching {
+                instrumentCatalogStream(filter) { item -> rememberSearchResults(listOf(item)) }
+            }
+            val warmed = searchEngine.search(q, filter, 30)
+                .filter { it.source == "БКС" && matchesSearchFilter(it, filter) }
+            val final = buildList { direct?.let { add(it) }; addAll(warmed) }
+                .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
+                .take(50)
+            if (final.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to final
+            return final
         }
 
-        val internet = runCatching { internetFuture.get(3000, TimeUnit.MILLISECONDS) }.getOrDefault(emptyList())
-        val direct = runCatching { directFuture.get(2200, TimeUnit.MILLISECONDS) }.getOrDefault(emptyList())
-        val merged = (direct + internet)
-            .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
-            .take(50)
-        if (merged.isNotEmpty()) {
-            searchCache[cacheKey] = System.currentTimeMillis() to merged
-            rememberSearchResults(merged.filter { it.source == "БКС" })
-        }
+        if (merged.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to merged
         return merged
     }
 

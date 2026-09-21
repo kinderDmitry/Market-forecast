@@ -32,6 +32,7 @@ class ScannerForegroundService : Service() {
         const val KEY_DISCOVERED = "discovered"
         const val KEY_COMPLETED = "completed"
         const val KEY_SIGNALS = "signals"
+        const val KEY_ERROR = "error"
         const val KEY_RESULTS = "results"
         const val CHANNEL = "mfp_scanner"
         const val NOTIFICATION_ID = 4711
@@ -54,6 +55,9 @@ class ScannerForegroundService : Service() {
             return Triple(p.getInt(KEY_DISCOVERED, 0), p.getInt(KEY_COMPLETED, 0), p.getInt(KEY_SIGNALS, 0))
         }
 
+        fun readError(context: android.content.Context): String? =
+            context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).getString(KEY_ERROR, null)
+
         fun readResults(context: android.content.Context): List<ScannerEngine.Result> {
             val p = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
             val a = runCatching { JSONArray(p.getString(KEY_RESULTS, "[]")) }.getOrElse { JSONArray() }
@@ -73,7 +77,9 @@ class ScannerForegroundService : Service() {
         }
 
         fun clearResults(context: android.content.Context) {
-            context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit().remove(KEY_RESULTS).putInt(KEY_DISCOVERED, 0).putInt(KEY_COMPLETED, 0).putInt(KEY_SIGNALS, 0).apply()
+            context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit()
+                .remove(KEY_RESULTS).remove(KEY_ERROR)
+                .putInt(KEY_DISCOVERED, 0).putInt(KEY_COMPLETED, 0).putInt(KEY_SIGNALS, 0).apply()
         }
 
         fun stop(context: android.content.Context) {
@@ -104,7 +110,8 @@ class ScannerForegroundService : Service() {
                 val u = intent.getStringExtra(EXTRA_UNIVERSE).orEmpty().ifBlank { "ALL" }
                 val tfs = intent.getStringExtra(EXTRA_TIMEFRAMES).orEmpty().ifBlank { "15M,1H,4H,1D" }
                 val p = getSharedPreferences(PREFS, MODE_PRIVATE)
-                p.edit().putString(KEY_UNIVERSE, u).putString(KEY_TIMEFRAMES, tfs).putBoolean(KEY_RUNNING, true).apply()
+                p.edit().putString(KEY_UNIVERSE, u).putString(KEY_TIMEFRAMES, tfs)
+                    .putBoolean(KEY_RUNNING, true).remove(KEY_ERROR).apply()
                 startRunIfNeeded(u, tfs)
             }
             null -> {
@@ -140,8 +147,10 @@ class ScannerForegroundService : Service() {
                         persistResult(result)
                     }
                 )
-            } catch (_: Throwable) {
-                // ScannerEngine exposes the actionable error to the UI through the persisted state.
+            } catch (t: Throwable) {
+                val message = t.message?.takeIf { it.isNotBlank() } ?: "Неизвестная ошибка сканера"
+                prefs.edit().putString(KEY_ERROR, message).putBoolean(KEY_RUNNING, false).apply()
+                updateNotification("Ошибка сканера: $message")
             } finally {
                 prefs.edit().putBoolean(KEY_RUNNING, false).apply()
                 updateNotification("Сканирование завершено")

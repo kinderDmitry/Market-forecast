@@ -689,13 +689,14 @@ private fun ScannerScreen(
     var completed by remember { mutableIntStateOf(0) }
     var signals by remember { mutableIntStateOf(0) }
     var results by remember { mutableStateOf(ScannerForegroundService.readResults(ctx)) }
-    var error by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>(ScannerForegroundService.readError(ctx)) }
 
     LaunchedEffect(Unit) {
         while (true) {
             val p = ScannerForegroundService.readProgress(ctx)
             discovered = p.first; completed = p.second; signals = p.third
             running = ScannerForegroundService.isRunning(ctx)
+            error = ScannerForegroundService.readError(ctx)
             results = ScannerForegroundService.readResults(ctx)
                 .sortedByDescending { it.confidence.toDouble() + abs(it.score) * 0.35 }
                 .take(200)
