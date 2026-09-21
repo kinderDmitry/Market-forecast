@@ -421,16 +421,16 @@ fun MarketForecastApp(ctx: Context) {
                             "STOP" -> "🛑 Stop Loss достигнут"
                             else -> event
                         }
-                        NotificationHelper.notifyTracking(ctx, "${newItem.id}|$event", ru, label, "${newItem.symbol} • ${newItem.timeframe} • ${formatPrice(ev.price)}", newItem.symbol)
+                        NotificationHelper.notifyTracking(ctx, "${newItem.id}|$event", ru, label, "${newItem.symbol} • ${newItem.timeframe} • ${fmt(ev.price)}", newItem.symbol)
                     }
                     ev.finalResult?.let { result ->
                         if (prefs.getBoolean("alert_result", true)) {
                             val ok = result.startsWith("SUCCESS") || result == "DIRECTION_OK" || result == "FLAT"
                             val label = if (ok) "✅ Прогноз завершён" else "❌ Прогноз завершён"
                             val body = if (ru) {
-                                "${newItem.symbol} • ${newItem.timeframe}\nРезультат: ${if (ok) "подтверждён" else "не подтверждён"}\nВход: ${formatPrice(newItem.entry)} • Закрытие: ${formatPrice(ev.price)}"
+                                "${newItem.symbol} • ${newItem.timeframe}\nРезультат: ${if (ok) "подтверждён" else "не подтверждён"}\nВход: ${fmt(newItem.entry)} • Закрытие: ${fmt(ev.price)}"
                             } else {
-                                "${newItem.symbol} • ${newItem.timeframe}\nResult: ${if (ok) "confirmed" else "failed"}\nOpen: ${formatPrice(newItem.entry)} • Close: ${formatPrice(ev.price)}"
+                                "${newItem.symbol} • ${newItem.timeframe}\nResult: ${if (ok) "confirmed" else "failed"}\nOpen: ${fmt(newItem.entry)} • Close: ${fmt(ev.price)}"
                             }
                             NotificationHelper.notifyTracking(ctx, "${newItem.id}|RESULT|$result", ru, label, body, newItem.symbol)
                         }
@@ -769,6 +769,8 @@ private fun ScannerScreen(
         }
     }
 }
+
+data class FavoriteTfResult(val forecast: Forecast?, val candles: List<Candle>)
 
 @Composable
 private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepository, onOpen: (String) -> Unit) {

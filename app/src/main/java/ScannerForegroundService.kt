@@ -174,7 +174,7 @@ class ScannerForegroundService : Service() {
     }
 
     private fun resultJson(r: ScannerEngine.Result, key: String) = JSONObject().apply {
-        put("key", key); put("symbol", r.instrument.symbol); put("name", r.instrument.name); put("exchange", r.instrument.exchange); put("type", r.instrument.type); put("provider", r.instrument.provider); put("classCode", r.instrument.classCode)
+        put("key", key); put("symbol", r.instrument.symbol); put("name", r.instrument.name); put("exchange", r.instrument.exchange); put("type", r.instrument.type); put("provider", r.instrument.source); put("classCode", r.instrument.classCode)
         put("signal", r.signal); put("confidence", r.confidence); put("score", r.score); put("entry", r.entry); put("stop", r.stop); put("tp1", r.tp1); put("tp2", r.tp2); put("tp3", r.tp3); put("rr", r.rr); put("regime", r.regime); put("updatedAt", r.updatedAt)
         put("timeframeScores", JSONObject(r.timeframeScores as Map<*, *>)); put("timeframeConfidence", JSONObject(r.timeframeConfidence as Map<*, *>))
     }
