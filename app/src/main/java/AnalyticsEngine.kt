@@ -675,6 +675,108 @@ object AnalyticsEngine {
         return (sum / windows.size * 3.0).coerceIn(-3.0, 3.0)
     }
 
+    /**
+     * Human-style decision layer.
+     *
+     * A discretionary analyst does not add every indicator with equal weight. They
+     * first establish context (regime + structure), then ask whether momentum and
+     * volume confirm that context, then evaluate entry location, exhaustion and risk.
+     * This layer deliberately groups correlated indicators so EMA/RSI/MACD cannot
+     * outvote structure by themselves. It also produces separate LONG/SHORT evidence
+     * and applies regime-dependent weights before the final executable signal gate.
+     */
+    private data class HumanDecision(
+        val score: Double,
+        val longEvidence: Double,
+        val shortEvidence: Double,
+        val conflict: Double,
+        val narrative: List<String>
+    )
+
+    private fun humanDecision(
+        price: Double,
+        atrValue: Double,
+        regime: String,
+        trend: Double,
+        momentum: Double,
+        structure: Double,
+        volume: Double,
+        priceAction: Double,
+        patterns: Double,
+        vwap: Double,
+        hierarchy: Double,
+        liquidity: Double,
+        rsiValue: Double,
+        adxValue: Double,
+        bollinger: Double,
+        timing: Double,
+        support: Double,
+        resistance: Double
+    ): HumanDecision {
+        fun n(v: Double, scale: Double): Double = (v / scale).coerceIn(-1.0, 1.0)
+
+        // Structure/context gets priority. In a trend, momentum confirms the trend;
+        // in a range, mean-reversion evidence gets more influence.
+        val weights = when {
+            regime.startsWith("IMPULSE") -> doubleArrayOf(.34, .18, .22, .10, .08, .08)
+            regime.startsWith("TREND") -> doubleArrayOf(.32, .21, .22, .11, .07, .07)
+            regime == "RANGE" -> doubleArrayOf(.15, .24, .27, .12, .12, .10)
+            regime == "HIGH_VOLATILITY" -> doubleArrayOf(.24, .17, .25, .15, .10, .09)
+            else -> doubleArrayOf(.24, .21, .25, .12, .10, .08)
+        }
+
+        val eTrend = n(trend, 8.0)
+        val eMomentum = n(momentum, 7.0)
+        val eStructure = (n(structure, 4.0) * .55 + n(hierarchy, 4.0) * .45).coerceIn(-1.0, 1.0)
+        val eVolume = (n(volume, 4.0) * .60 + n(liquidity, 4.0) * .40).coerceIn(-1.0, 1.0)
+        val eAction = (n(priceAction, 5.0) * .65 + n(patterns, 4.0) * .35).coerceIn(-1.0, 1.0)
+        val eLocation = n(vwap, 4.0)
+
+        var directional = eTrend * weights[0] + eMomentum * weights[1] + eStructure * weights[2] +
+            eVolume * weights[3] + eAction * weights[4] + eLocation * weights[5]
+
+        // ADX tells the analyst whether a directional reading deserves trend-following
+        // treatment. RSI extremes are interpreted in context, not as automatic reversals.
+        val trendMode = adxValue >= 22.0
+        if (trendMode) {
+            directional += (eTrend.sign * eMomentum.coerceIn(-1.0, 1.0)) * .10
+        } else {
+            directional += (-n(bollinger, 2.0)) * .10
+            directional += ((50.0 - rsiValue) / 25.0).coerceIn(-1.0, 1.0) * .08
+        }
+
+        // Chasing/exhaustion: a good direction can still be a bad entry.
+        val distanceToS = abs(price - if (directional >= 0) resistance else support)
+        val nearLevel = if (atrValue > 0.0) (1.0 - distanceToS / (atrValue * 0.80)).coerceIn(0.0, 1.0) else 0.0
+        val exhaustion = when {
+            directional > 0 && rsiValue >= 78.0 -> .16
+            directional < 0 && rsiValue <= 22.0 -> .16
+            else -> 0.0
+        }
+        directional -= directional.sign * exhaustion
+        directional += n(timing, 3.0) * .10
+        directional -= directional.sign * nearLevel * .10
+
+        // Independent evidence count: a human normally wants several different kinds
+        // of evidence, not six versions of the same EMA signal.
+        val components = doubleArrayOf(eTrend, eMomentum, eStructure, eVolume, eAction, eLocation)
+        val longVotes = components.count { it >= .18 }
+        val shortVotes = components.count { it <= -.18 }
+        val conflict = min(longVotes, shortVotes).toDouble() / components.size
+
+        val longEvidence = (max(0.0, directional) + longVotes / 12.0).coerceIn(0.0, 1.0)
+        val shortEvidence = (max(0.0, -directional) + shortVotes / 12.0).coerceIn(0.0, 1.0)
+        val score = (directional * 10.0 * (1.0 - conflict * .35)).coerceIn(-10.0, 10.0)
+
+        val narrative = listOf(
+            "Контекст: $regime; ADX %.1f — %s.".format(Locale.US, adxValue, if (trendMode) "рынок способен поддерживать направленное движение" else "трендовый режим не подтверждён"),
+            "Независимые блоки: LONG %d/6, SHORT %d/6; конфликт %.0f%%.".format(Locale.US, longVotes, shortVotes, conflict * 100.0),
+            "Согласование контекста: тренд %.2f, структура %.2f, моментум %.2f, объём %.2f, price action %.2f.".format(Locale.US, eTrend, eStructure, eMomentum, eVolume, eAction),
+            "Решение учитывает расположение относительно VWAP/S-R, риск погони за ценой и RSI-истощение, а не один индикатор."
+        )
+        return HumanDecision(score, longEvidence, shortEvidence, conflict, narrative)
+    }
+
     fun analyze(c: List<Candle>, entryOverride: Double? = null): Forecast {
         require(c.size >= 30) { "Недостаточно исторических данных" }
         val key = cacheKey(c, entryOverride)
@@ -745,13 +847,17 @@ object AnalyticsEngine {
         val longExcursion = if (calibrate) historicalExcursionR(c, 1, 8) else (2.0 to 3.0)
         val shortExcursion = if (calibrate) historicalExcursionR(c, -1, 8) else (2.0 to 3.0)
 
-        val trendBase = when {
-            price > e20 && e20 > e50 && (e200 == null || e50 > e200) -> 10.0
-            price < e20 && e20 < e50 && (e200 == null || e50 < e200) -> -10.0
-            price > e20 && e20 > e50 -> 6.0
-            price < e20 && e20 < e50 -> -6.0
-            else -> 0.0
-        }
+        // Continuous trend model. The previous binary EMA test returned exactly 0
+        // whenever price/EMA20/EMA50 were not perfectly aligned, which made nearly
+        // every timeframe look like "no trend" around normal pullbacks. Trend is now
+        // measured from price-vs-EMA20, EMA20-vs-EMA50, EMA20 slope and (when available)
+        // EMA50-vs-EMA200. This preserves neutral/range detection but no longer confuses
+        // a pullback or transition with absence of directional information.
+        val emaDistance = ((price - e20) / price.coerceAtLeast(1e-9) * 100.0 * 5.0).coerceIn(-4.0, 4.0)
+        val emaSpread = ((e20 - e50) / price.coerceAtLeast(1e-9) * 100.0 * 7.0).coerceIn(-4.0, 4.0)
+        val emaSlopeComponent = (slope * 2.2).coerceIn(-3.0, 3.0)
+        val longTermComponent = if (e200 != null) ((e50 - e200) / price.coerceAtLeast(1e-9) * 100.0 * 3.0).coerceIn(-2.0, 2.0) else 0.0
+        val trendBase = (emaDistance * 0.30 + emaSpread * 0.38 + emaSlopeComponent * 0.22 + longTermComponent * 0.10).coerceIn(-10.0, 10.0)
         // Contextual momentum: oscillators confirm a strong trend instead of blindly
         // fading every overbought/oversold reading. In a range the behavior is reversed.
         val rsiContext = when {
@@ -785,8 +891,9 @@ object AnalyticsEngine {
         // sensitive to what this market has actually rewarded recently.
         val currentTrendContext = ((e20 - e50) / price.coerceAtLeast(1e-9) * 100.0).coerceIn(-8.0, 8.0)
         val preliminaryRegime = when {
-            adxV >= 28.0 && trendBase >= 6.0 -> "TREND_UP"
-            adxV >= 28.0 && trendBase <= -6.0 -> "TREND_DOWN"
+            adxV >= 35.0 && abs(trendBase) >= 6.0 && rangeExpansion >= 0.18 -> if (trendBase > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
+            adxV >= 22.0 && trendBase >= 3.2 -> "TREND_UP"
+            adxV >= 22.0 && trendBase <= -3.2 -> "TREND_DOWN"
             volatilityPct >= 4.0 -> "HIGH_VOLATILITY"
             adxV < 18.0 -> "RANGE"
             else -> "TRANSITION"
@@ -824,11 +931,39 @@ object AnalyticsEngine {
             else -> (trendQuality + agreement + volumePrice).coerceIn(-4.0, 4.0)
         }
         val raw = trendBase * adaptiveTrendW + (momentumBase + stochasticBase + momentumExtended) * adaptiveMomentumW/2.2 + levelBase * .14 + volumeBase * .11 + adxBase*.06 + structure*.05 + mtf*.05 + agreement*.05 + vwapBase*.06 + slopeBase*.06 + pressure*.04 + volatilityRegimeBase*.025 + compressionBias + breakout*.06 + efficiency*agreement*.12 + volumeImpulse*.04 + advancedTechnical*.10 + priceActionQuality*.10 + patterns.score * .16 + confirmationBoost + regimeAlignment*.10 + timingQuality*.10 + hierarchy*.055 + liquidity.score*.065
-        val score = raw.coerceIn(-10.0, 10.0)
+
+        val human = humanDecision(
+            price = price,
+            atrValue = a,
+            regime = preliminaryRegime,
+            trend = trendBase + trendQuality,
+            momentum = momentumBase + stochasticBase + momentumExtended + advancedTechnical * .35,
+            structure = structure + mtf + agreement,
+            volume = volumeBase + volumePrice,
+            priceAction = priceActionQuality,
+            patterns = patterns.score,
+            vwap = vwapBase,
+            hierarchy = hierarchy,
+            liquidity = liquidity.score,
+            rsiValue = r,
+            adxValue = adxV,
+            bollinger = bb,
+            timing = timingQuality,
+            support = support1,
+            resistance = resistance1
+        )
+
+        // The old ensemble remains a useful numerical baseline, but the final score
+        // is adjudicated by the human-style evidence layer. This prevents correlated
+        // indicators from manufacturing confidence and gives structure/context the
+        // same priority a discretionary analyst would use.
+        val score = (raw * .45 + human.score * .55).coerceIn(-10.0, 10.0)
         // Directional confirmation is deliberately conservative: a high raw score is
         // not enough when trend, momentum and higher-timeframe structure disagree.
-        val confirmation = (trendBase.sign + agreement.sign + mtf.sign + momentumBase.sign + structure.sign + trendQuality.sign + volumePrice.sign + patterns.score.sign).roundToInt()
-        val directionalConflict = abs(score) >= 2.2 && confirmation * score.sign < 2.0
+        val classicConfirmation = (trendBase.sign + agreement.sign + mtf.sign + momentumBase.sign + structure.sign + trendQuality.sign + volumePrice.sign + patterns.score.sign).roundToInt()
+        val humanConfirmation = if (score >= 0) (human.longEvidence * 6.0 - human.shortEvidence * 3.0).roundToInt() else (human.shortEvidence * 6.0 - human.longEvidence * 3.0).roundToInt()
+        val confirmation = (classicConfirmation * .55 + humanConfirmation * .45).roundToInt().coerceIn(-7, 7)
+        val directionalConflict = abs(score) >= 2.2 && (confirmation * score.sign < 2.0 || human.conflict >= .50)
         val confirmationStrength = (abs(confirmation) / 7.0).coerceIn(0.0, 1.0)
         val divergenceConflict = divergence * score.sign < -1.0
         val timingConflict = timingQuality < -1.8 && abs(score) < 7.0
@@ -952,8 +1087,9 @@ object AnalyticsEngine {
         val entryQuality = (1.0 - srPenalty/3.0 + hierarchy.sign*direction*0.12 + liquidity.score.sign*0.08).coerceIn(0.0,1.0)
         val projected = if (signal == "NO TRADE") price else if (direction > 0) safeTp2 else safeTp2
         val regime = when {
-            adxV >= 28 && trendBase >= 6 -> "TREND_UP"
-            adxV >= 28 && trendBase <= -6 -> "TREND_DOWN"
+            adxV >= 35 && abs(trendBase) >= 6 && rangeExpansion >= 0.18 -> if (trendBase > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
+            adxV >= 22 && trendBase >= 3.2 -> "TREND_UP"
+            adxV >= 22 && trendBase <= -3.2 -> "TREND_DOWN"
             volatilityPct >= 4.0 -> "HIGH_VOLATILITY"
             adxV < 18 -> "RANGE"
             else -> "TRANSITION"
@@ -1027,7 +1163,7 @@ object AnalyticsEngine {
         // For NO TRADE, confidence describes directional certainty only as a
         // probability estimate; it is never presented as permission to trade.
         val finalConfidence = confidence
-        val finalExplanation = explanation + listOf(
+        val finalExplanation = explanation + human.narrative + listOf(
             "Режим рынка: $regime; ширина Bollinger %.2f%%; regime calibration LONG %.0f%% / SHORT %.0f%%.".format(Locale.US, bbWidth * 100.0, longRegimeEdge*100.0, shortRegimeEdge*100.0),
             String.format(Locale.US, "Движок риска и целей: SL %.2f%%; TP1/TP2/TP3 = %.2fR / %.2fR / %.2fR; риск/прибыль %.2f; исторический максимум благоприятного движения %.2fR/%.2fR; качество момента входа %.2f.", expectedLossPct, tp1R, tp2R, tp3R, rr, excursion.first, excursion.second, timingQuality),
             String.format(Locale.US, "Движок вероятности целей: TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%%; SL %.0f%%; математическое ожидание %.2fR.", tp1Prob*100.0,tp2Prob*100.0,tp3Prob*100.0,stopProb*100.0,expectedValueR),

@@ -1,6 +1,6 @@
 package com.marketforecast.prox
 
-import kotlinx.coroutines.CancellationException
+import java.util.concurrent.CancellationException
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -142,14 +142,21 @@ class ScannerEngine(private val repo: MarketRepository) {
         val aligned = data.filter { it.forecast.signal == direction }
         if (aligned.size < requiredConsensus(data.size)) return null
 
-        val latest = data.last().forecast
+        // Do not force the last/highest timeframe to have the same executable signal.
+        // A higher timeframe can legitimately be NO TRADE while a confirmed lower
+        // timeframe setup exists. The scanner must not silently discard the whole
+        // instrument merely because one timeframe is neutral. Higher timeframes still
+        // dominate through the weights below and an opposite executable signal on a
+        // higher timeframe is treated as a hard conflict.
         val weightedScore = weighted(data) { it.forecast.score }
         val weightedConfidence = weighted(data) { it.forecast.confidence.toDouble() }.toInt().coerceIn(0, 100)
-        val confidence = ((weightedConfidence * 0.65) + (consensusStrength(data, direction) * 35.0)).toInt().coerceIn(0, 100)
-        val score = (weightedScore * (0.70 + consensusStrength(data, direction) * 0.30)).coerceIn(-100.0, 100.0)
+        val confidence = ((weightedConfidence * 0.68) + (consensusStrength(data, direction) * 32.0)).toInt().coerceIn(0, 100)
+        val score = (weightedScore * (0.72 + consensusStrength(data, direction) * 0.28)).coerceIn(-100.0, 100.0)
         if (confidence < config.minimumConfidence || abs(score) < config.minimumScoreAbs) return null
-        if (latest.signal != direction && data.size > 1) return null
-        if (!latest.highConviction && confidence < 78) return null
+        if (higherTimeframeConflict(data, direction)) return null
+
+        val latest = data.maxByOrNull { timeframeWeight(it.timeframe) }?.forecast ?: data.last().forecast
+        if (!latest.highConviction && confidence < 76) return null
 
         return Result(
             instrument = instrument,
@@ -172,9 +179,12 @@ class ScannerEngine(private val repo: MarketRepository) {
     private fun consensusDirection(data: List<TfData>): String {
         val long = data.count { it.forecast.signal == "LONG" }
         val short = data.count { it.forecast.signal == "SHORT" }
+        val weightedLong = data.filter { it.forecast.signal == "LONG" }.sumOf { timeframeWeight(it.timeframe) }
+        val weightedShort = data.filter { it.forecast.signal == "SHORT" }.sumOf { timeframeWeight(it.timeframe) }
+        val required = requiredConsensus(data.size)
         return when {
-            long > short && long >= requiredConsensus(data.size) -> "LONG"
-            short > long && short >= requiredConsensus(data.size) -> "SHORT"
+            long >= required && weightedLong > weightedShort -> "LONG"
+            short >= required && weightedShort > weightedLong -> "SHORT"
             else -> ""
         }
     }
@@ -183,18 +193,33 @@ class ScannerEngine(private val repo: MarketRepository) {
         1 -> 1
         2 -> 2
         3 -> 2
-        else -> 3
+        else -> 2
     }
 
     private fun consensusStrength(data: List<TfData>, direction: String): Double =
         data.count { it.forecast.signal == direction }.toDouble() / data.size.coerceAtLeast(1)
 
+    private fun timeframeWeight(tf: String): Double = when (tf) {
+        "15M" -> 1.0
+        "1H" -> 1.5
+        "4H" -> 2.2
+        "1D" -> 3.0
+        else -> 1.0
+    }
+
+    private fun higherTimeframeConflict(data: List<TfData>, direction: String): Boolean {
+        val higher = data.filter { it.timeframe == "4H" || it.timeframe == "1D" }
+        return higher.any {
+            (direction == "LONG" && it.forecast.signal == "SHORT" && it.forecast.confidence >= 70) ||
+            (direction == "SHORT" && it.forecast.signal == "LONG" && it.forecast.confidence >= 70)
+        }
+    }
+
     private fun weighted(data: List<TfData>, value: (TfData) -> Double): Double {
-        val weights = mapOf("15M" to 1.0, "1H" to 1.5, "4H" to 2.2, "1D" to 3.0)
         var sum = 0.0
         var weight = 0.0
         data.forEach { d ->
-            val w = weights[d.timeframe] ?: 1.0
+            val w = timeframeWeight(d.timeframe)
             sum += value(d) * w
             weight += w
         }

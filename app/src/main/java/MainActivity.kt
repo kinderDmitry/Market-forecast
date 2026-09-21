@@ -662,10 +662,13 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
 
 
 private fun scannerRegimeRu(value: String): String = when (value.uppercase(Locale.US)) {
-    "TREND" -> "Тренд"
+    "TREND_UP" -> "Восходящий тренд"
+    "TREND_DOWN" -> "Нисходящий тренд"
+    "IMPULSE_UP" -> "Восходящий импульс"
+    "IMPULSE_DOWN" -> "Нисходящий импульс"
     "RANGE" -> "Диапазон"
-    "IMPULSE" -> "Импульс"
-    "REVERSAL" -> "Разворот"
+    "TRANSITION" -> "Переходный режим"
+    "HIGH_VOLATILITY" -> "Высокая волатильность"
     else -> value.replace("_", " ").lowercase(Locale("ru")).replaceFirstChar { it.titlecase(Locale("ru")) }
 }
 
@@ -680,38 +683,28 @@ private fun ScannerScreen(
     setTimeframes: (List<String>) -> Unit,
     openInstrument: (String) -> Unit
 ) {
-    var running by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
+    var running by remember { mutableStateOf(ScannerForegroundService.isRunning(ctx)) }
     var discovered by remember { mutableIntStateOf(0) }
     var completed by remember { mutableIntStateOf(0) }
     var signals by remember { mutableIntStateOf(0) }
-    var results by remember { mutableStateOf<List<ScannerEngine.Result>>(emptyList()) }
+    var results by remember { mutableStateOf(ScannerForegroundService.readResults(ctx)) }
     var error by remember { mutableStateOf<String?>(null) }
-    var runId by remember { mutableIntStateOf(0) }
-    val scope = rememberCoroutineScope()
-    val cancelled = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
-    DisposableEffect(Unit) { onDispose { cancelled.set(true) } }
-    LaunchedEffect(runId) {
-        if (runId == 0) return@LaunchedEffect
-        cancelled.set(false)
-        running = true; error = null; results = emptyList(); discovered = 0; completed = 0; signals = 0
-        val engine = ScannerEngine(repo)
-        runCatching {
-            withContext(Dispatchers.IO) {
-                engine.scan(
-                    ScannerEngine.Config(universe = universe, timeframes = timeframes, workers = if (universe == ScannerEngine.Universe.ALL) 4 else 3),
-                    favorites = favorites,
-                    cancelled = cancelled,
-                    onProgress = { p -> scope.launch { discovered = p.discovered; completed = p.completed; signals = p.signals; running = p.active } },
-                    onResult = { r -> scope.launch { results = (results + r).distinctBy { it.instrument.symbol + "@" + it.instrument.classCode }.sortedByDescending { it.confidence.toDouble() + abs(it.score) * 0.35 }.take(200); signals = results.size } }
-                )
-            }
-        }.onFailure { if (it !is CancellationException) error = it.message ?: if (ru) "Ошибка сканирования" else "Scanner error" }
-        running = false
+    LaunchedEffect(Unit) {
+        while (true) {
+            val p = ScannerForegroundService.readProgress(ctx)
+            discovered = p.first; completed = p.second; signals = p.third
+            running = ScannerForegroundService.isRunning(ctx)
+            results = ScannerForegroundService.readResults(ctx)
+                .sortedByDescending { it.confidence.toDouble() + abs(it.score) * 0.35 }
+                .take(200)
+            delay(700)
+        }
     }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
-        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "Единая модель прогноза • БКС • потоковая выдача" else "One forecast model • BCS • streaming results") }
+        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "Работает независимо от экрана приложения • BCS • потоковая выдача" else "Runs independently of the app screen • BCS • streaming results") }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = universe == ScannerEngine.Universe.ALL, onClick = { if (!running) setUniverse(ScannerEngine.Universe.ALL) }, label = { Text(if (ru) "Весь рынок" else "Whole market", fontSize = 10.sp) })
@@ -734,10 +727,19 @@ private fun ScannerScreen(
         }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { if (running) cancelled.set(true) else runId++ }, modifier = Modifier.weight(1f)) {
-                    Icon(if (running) Icons.Default.Stop else Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text(if (running) if (ru) "Остановить" else "Stop" else if (ru) "Начать сканирование" else "Start scan", fontWeight = FontWeight.Black)
+                Button(onClick = {
+                    if (running) ScannerForegroundService.stop(ctx)
+                    else {
+                        error = null
+                        ScannerForegroundService.clearResults(ctx)
+                        ScannerForegroundService.start(ctx, universe, timeframes)
+                    }
+                }, modifier = Modifier.weight(1f)) {
+                    Icon(if (running) Icons.Default.Stop else Icons.Default.PlayArrow, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (running) if (ru) "Остановить" else "Stop" else if (ru) "Начать сканирование" else "Start scan", fontWeight = FontWeight.Black)
                 }
-                OutlinedButton(onClick = { results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) { Text(if (ru) "Очистить" else "Clear") }
+                OutlinedButton(onClick = { ScannerForegroundService.clearResults(ctx); results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) { Text(if (ru) "Очистить" else "Clear") }
             }
         }
         item {
@@ -745,7 +747,7 @@ private fun ScannerScreen(
                 Text(if (ru) "Обработано: $completed / $discovered" else "Processed: $completed / $discovered", fontWeight = FontWeight.Black)
                 Text(if (ru) "Сигналов: $signals" else "Signals: $signals", color = Accent, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
                 if (running && discovered > 0) LinearProgressIndicator(progress = { (completed.toFloat() / discovered.toFloat()).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
-                Text(if (ru) "Каждый инструмент проходит выбранные таймфреймы последовательно; итог считается тем же движком прогноза, что и обычный прогноз." else "Each instrument passes the selected timeframes in order; the same forecast engine as the normal forecast produces the result.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 7.dp))
+                Text(if (ru) "Сканирование продолжается даже после выхода из приложения. Результаты сохраняются." else "Scanning continues after leaving the app. Results are persisted.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 7.dp))
             }
         }
         error?.let { msg -> item { EmptyCard(msg) } }
@@ -755,32 +757,18 @@ private fun ScannerScreen(
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(r.instrument.name, fontWeight = FontWeight.Black, fontSize = 14.sp)
-                        Text("${r.instrument.symbol}${if (r.instrument.classCode.isNotBlank()) " • ${r.instrument.classCode}" else ""}", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("${r.instrument.symbol} • ${r.signal} • ${r.confidence}%", fontWeight = FontWeight.Bold, color = if (r.signal == "LONG") Positive else Negative)
+                        Text(scannerRegimeRu(r.regime), fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(r.signal, color = if (r.signal == "LONG") Positive else Negative, fontWeight = FontWeight.Black)
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text("${fmt(r.entry)} → ${fmt(r.tp1)}", fontWeight = FontWeight.Bold)
+                        Text("SL ${fmt(r.stop)}", fontSize = 9.sp, color = Negative)
+                    }
                 }
-                Row(Modifier.fillMaxWidth().padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(if (ru) "Оценка ${"%.1f".format(Locale.US, r.score)}" else "Score ${"%.1f".format(Locale.US, r.score)}", fontSize = 9.sp)
-                    Text("${r.confidence}%", fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                    Text(if (ru) "Р/Р ${"%.2f".format(Locale.US, r.rr)}" else "R/R ${"%.2f".format(Locale.US, r.rr)}", fontSize = 9.sp)
-                    Text(if (ru) scannerRegimeRu(r.regime) else r.regime, fontSize = 9.sp, color = Accent)
-                }
-                Text(r.timeframeScores.entries.joinToString("  •  ") { "${it.key}: ${"%.0f".format(Locale.US, it.value)}" }, fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 5.dp))
             }
         }
     }
 }
-
-private fun formatPrice(price: Double): String = fmt(price)
-
-private fun formatHorizon(seconds: Long, ru: Boolean): String = when {
-    seconds < 60L -> if (ru) "$seconds сек" else "$seconds sec"
-    seconds < 3600L -> { val m = seconds / 60L; if (ru) "$m мин" else "$m min" }
-    seconds < 86400L -> { val h = seconds / 3600L; if (ru) "$h ч" else "$h h" }
-    else -> { val d = seconds / 86400L; if (ru) "$d дн" else "$d d" }
-}
-
-private data class FavoriteTfResult(val forecast: Forecast?, val candles: List<Candle>)
 
 @Composable
 private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepository, onOpen: (String) -> Unit) {
@@ -1068,10 +1056,12 @@ private fun niceStep(raw: Double): Double {
 private fun regimeRu(regime: String): String = when (regime) {
     "TREND_UP" -> "восходящий тренд"
     "TREND_DOWN" -> "нисходящий тренд"
+    "IMPULSE_UP" -> "восходящий импульс"
+    "IMPULSE_DOWN" -> "нисходящий импульс"
     "RANGE" -> "боковой диапазон"
     "TRANSITION" -> "переходный режим"
     "HIGH_VOLATILITY" -> "высокая волатильность"
-    else -> "не определён"
+    else -> "режим не определён"
 }
 
 @Composable private fun Explanation(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Почему такой прогноз" else "Why this forecast", if (ru) "EMA • RSI • MACD • ATR • ADX • Стохастик • Объём • Структура • Таймфреймы" else "EMA • RSI • MACD • ATR • ADX • Stochastic • Volume • Structure • MTF"); f.explanation.forEach { Text("• $it", fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp)) } } }
