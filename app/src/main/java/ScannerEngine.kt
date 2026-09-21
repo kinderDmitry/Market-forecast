@@ -103,6 +103,9 @@ class ScannerEngine(private val repo: MarketRepository) {
                 // directory page arrives. The full universe never has to be held
                 // in memory before analysis begins.
                 repo.streamScannerUniverse(::submit)
+                if (discovered.get() == 0 && !cancelled.get()) {
+                    throw IllegalStateException("БКС не вернул ни одного инструмента для сканирования. Проверьте refresh-токен и доступ к справочнику BCS.")
+                }
             }
             futures.toList().forEach { future ->
                 if (!cancelled.get()) runCatching { future.get() }

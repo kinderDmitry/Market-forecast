@@ -252,10 +252,16 @@ class MarketRepository(
 
     /** Stream BCS directory pages for market widgets without persisting a catalogue. */
     private fun instrumentCatalogStream(type: String, onInstrument: (SearchResult) -> Unit) {
+        // BCS currently documents STOCK and CURRENCY as the supported
+        // by-type directory values. Foreign shares/DRs, when exposed by BCS,
+        // are returned inside the stock universe and are filtered by their
+        // instrumentType below. Never request undocumented pseudo-types: a
+        // single invalid type used to terminate the whole scanner before the
+        // FX universe was reached.
         val types = when (type.uppercase(Locale.US)) {
             "FX" -> listOf("CURRENCY")
-            "STOCKS" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
-            else -> TRADING_INSTRUMENT_TYPES
+            "STOCKS" -> listOf("STOCK")
+            else -> listOf("STOCK", "CURRENCY")
         }
         for (instrumentType in types) {
             loadCatalogType(instrumentType, Int.MAX_VALUE, onItem = onInstrument)
@@ -294,7 +300,7 @@ class MarketRepository(
                     "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
                     9000, bcsHeaders()
                 ))
-                val arr = root.optJSONArray("instruments") ?: JSONArray()
+                val arr = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
                 val out = ArrayList<SearchResult>(arr.length())
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
@@ -330,7 +336,7 @@ class MarketRepository(
                             "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
                             20000, bcsHeaders()
                         ))
-                        return@runCatching root.optJSONArray("instruments") ?: JSONArray()
+                        return@runCatching root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
                     } catch (t: Throwable) {
                         last = t
                         val message = t.message.orEmpty()
@@ -355,7 +361,40 @@ class MarketRepository(
                 continue
             }
             consecutiveFailures = 0
-            if (arr.length() == 0) { onPage?.invoke(page, 0, true); break }
+            if (arr.length() == 0 && page == 0) {
+                // Some BCS deployments/examples have used one-based pagination.
+                // Probe page 1 once instead of treating an empty page 0 as an
+                // empty market. This keeps the scanner working across deployments
+                // without downloading a local catalogue.
+                val pageOne = runCatching {
+                    val root = JSONObject(getTextAuth(
+                        "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=1&size=100",
+                        20000, bcsHeaders()
+                    ))
+                    root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
+                }.getOrDefault(JSONArray())
+                if (pageOne.length() > 0) {
+                    for (i in 0 until pageOne.length()) {
+                        val o = pageOne.optJSONObject(i) ?: continue
+                        val ticker = o.optString("ticker").trim()
+                        if (ticker.isBlank()) continue
+                        val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                        val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
+                        val name = o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { o.optString("issuerName") }.ifBlank { ticker }
+                        val typeName = o.optString("instrumentType").ifBlank { type }
+                        val classCode = boardObj?.optString("classCode").orEmpty()
+                        val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
+                        out.putIfAbsent(catalogIdentity(item), item)
+                        onItem?.invoke(item)
+                    }
+                    onPage?.invoke(1, pageOne.length(), pageOne.length() < 100)
+                    if (pageOne.length() < 100) break
+                    page = 1
+                    continue
+                }
+                onPage?.invoke(page, 0, true)
+                break
+            }
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val ticker = o.optString("ticker").trim()
