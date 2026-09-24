@@ -520,7 +520,7 @@ fun MarketForecastApp(ctx: Context) {
                     )
                 }
             },
-            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.FAVORITES, Screen.HISTORY, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
+            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.SCANNER, Screen.FAVORITES, Screen.HISTORY, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
         ) { pad ->
             Box(Modifier.fillMaxSize().padding(pad)) {
                 CosmicBackground()
@@ -648,7 +648,6 @@ private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<Strin
                 QuickAction(Icons.Default.CalendarMonth, if (ru) "Дивиденды" else "Dividends", openDiv, Modifier.weight(1f))
                 QuickAction(Icons.Default.Calculate, if (ru) "Прибыль" else "Profit", openFinance, Modifier.weight(1f))
                 QuickAction(Icons.Default.BarChart, if (ru) "Статистика" else "Stats", openStats, Modifier.weight(1f))
-                QuickAction(Icons.Default.Search, if (ru) "Сканер" else "Scanner", openScanner, Modifier.weight(1f))
             }
         }
         item { SectionHeader(if (ru) "Рынок" else "Market", if (ru) "Индексы и дополнительные рыночные данные" else "Indices and additional market data") }
@@ -666,6 +665,12 @@ private fun scannerRegimeRu(value: String): String = when (value.uppercase(Local
     "TREND_DOWN" -> "Нисходящий тренд"
     "IMPULSE_UP" -> "Восходящий импульс"
     "IMPULSE_DOWN" -> "Нисходящий импульс"
+    "BREAKOUT_UP" -> "Пробой вверх"
+    "BREAKOUT_DOWN" -> "Пробой вниз"
+    "PULLBACK_UP" -> "Откат вверх"
+    "PULLBACK_DOWN" -> "Откат вниз"
+    "MEAN_REVERSION_UP" -> "Возврат к среднему вверх"
+    "MEAN_REVERSION_DOWN" -> "Возврат к среднему вниз"
     "RANGE" -> "Диапазон"
     "TRANSITION" -> "Переходный режим"
     "HIGH_VOLATILITY" -> "Высокая волатильность"
@@ -692,6 +697,12 @@ private fun ScannerScreen(
     var error by remember { mutableStateOf<String?>(ScannerForegroundService.readError(ctx)) }
 
     LaunchedEffect(Unit) {
+        // Scanner tab is an active workspace: opening it immediately starts a fresh
+        // scan when no scan is already running. No separate "Start" step is required.
+        if (!ScannerForegroundService.isRunning(ctx)) {
+            ScannerForegroundService.clearResults(ctx)
+            ScannerForegroundService.start(ctx, universe, listOf("15M", "1H", "4H", "1D", "1W"))
+        }
         while (true) {
             val p = ScannerForegroundService.readProgress(ctx)
             discovered = p.first; completed = p.second; signals = p.third
@@ -705,7 +716,7 @@ private fun ScannerScreen(
     }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
-        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "Работает независимо от экрана приложения • BCS • потоковая выдача" else "Runs independently of the app screen • BCS • streaming results") }
+        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "BCS • последовательный обход API • полный MTF 15M / 1H / 4H / 1D / 1W" else "BCS • sequential API traversal • full MTF 15M / 1H / 4H / 1D / 1W") }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = universe == ScannerEngine.Universe.ALL, onClick = { if (!running) setUniverse(ScannerEngine.Universe.ALL) }, label = { Text(if (ru) "Весь рынок" else "Whole market", fontSize = 10.sp) })
@@ -716,31 +727,21 @@ private fun ScannerScreen(
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("15M", "1H", "4H", "1D", "1W").forEach { tf ->
                     item(key = "scanner_tf_$tf") {
-                        FilterChip(selected = tf in timeframes, onClick = {
-                            if (!running) {
-                                val next = if (tf in timeframes) timeframes - tf else timeframes + tf
-                                setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D", "1W").indexOf(it) })
-                            }
-                        }, label = { Text(tf, fontSize = 10.sp) })
+                        FilterChip(selected = true, onClick = { }, label = { Text(tf, fontSize = 10.sp) })
                     }
                 }
             }
         }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    if (running) ScannerForegroundService.stop(ctx)
-                    else {
-                        error = null
-                        ScannerForegroundService.clearResults(ctx)
-                        ScannerForegroundService.start(ctx, universe, timeframes)
-                    }
-                }, modifier = Modifier.weight(1f)) {
-                    Icon(if (running) Icons.Default.Stop else Icons.Default.PlayArrow, null)
+                Button(onClick = { ScannerForegroundService.stop(ctx) }, enabled = running, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Stop, null)
                     Spacer(Modifier.width(6.dp))
-                    Text(if (running) if (ru) "Остановить" else "Stop" else if (ru) "Начать сканирование" else "Start scan", fontWeight = FontWeight.Black)
+                    Text(if (ru) "Остановить" else "Stop", fontWeight = FontWeight.Black)
                 }
-                OutlinedButton(onClick = { ScannerForegroundService.clearResults(ctx); results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) { Text(if (ru) "Очистить" else "Clear") }
+                OutlinedButton(onClick = { ScannerForegroundService.clearResults(ctx); results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) {
+                    Text(if (ru) "Очистить" else "Clear")
+                }
             }
         }
         item {
@@ -752,7 +753,7 @@ private fun ScannerScreen(
             }
         }
         error?.let { msg -> item { EmptyCard(msg) } }
-        if (results.isEmpty() && !running && error == null) item { EmptyCard(if (ru) "Запустите сканирование. Показываются только сигналы, прошедшие quality gates." else "Start scanning. Only signals that pass the quality gates are shown.") }
+        if (results.isEmpty() && !running && error == null) item { EmptyCard(if (ru) "Сканирование запускается автоматически. Показываются только сигналы, прошедшие quality gates." else "Scanning starts automatically. Only signals that pass the quality gates are shown.") }
         items(results, key = { it.instrument.symbol + "@" + it.instrument.classCode }) { r ->
             GradientCard(Modifier.fillMaxWidth().clickable { openInstrument(r.instrument.symbol) }) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1061,6 +1062,12 @@ private fun regimeRu(regime: String): String = when (regime) {
     "TREND_DOWN" -> "нисходящий тренд"
     "IMPULSE_UP" -> "восходящий импульс"
     "IMPULSE_DOWN" -> "нисходящий импульс"
+    "BREAKOUT_UP" -> "пробой вверх"
+    "BREAKOUT_DOWN" -> "пробой вниз"
+    "PULLBACK_UP" -> "откат вверх"
+    "PULLBACK_DOWN" -> "откат вниз"
+    "MEAN_REVERSION_UP" -> "возврат к среднему вверх"
+    "MEAN_REVERSION_DOWN" -> "возврат к среднему вниз"
     "RANGE" -> "боковой диапазон"
     "TRANSITION" -> "переходный режим"
     "HIGH_VOLATILITY" -> "высокая волатильность"
@@ -1515,7 +1522,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=10.sp);Switch(checked = value, onCheckedChange = on)}}
 
-@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=7.sp)})}}}
+@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.SCANNER to Icons.Default.AutoGraph,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.SCANNER->"Сканер";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.SCANNER->"Scanner";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=7.sp)})}}}
 @Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=11.sp)}}
 @Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){GradientCard(modifier.clickable(onClick=on)){Column(Modifier.padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(icon,null,tint=Accent,modifier=Modifier.size(22.dp));Text(title,fontWeight=FontWeight.Bold,fontSize=8.sp,modifier=Modifier.padding(top=5.dp))}}}
 @Composable private fun SectionHeader(t:String,s:String){

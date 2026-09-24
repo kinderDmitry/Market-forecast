@@ -104,10 +104,15 @@ class ScannerEngine(private val repo: MarketRepository) {
                 // Page-by-page BCS streaming: workers start as soon as the first
                 // directory page arrives. The full universe never has to be held
                 // in memory before analysis begins.
-                repo.streamScannerUniverse(::submit)
+                val apiErrors = java.util.Collections.synchronizedList(mutableListOf<String>())
+                repo.streamScannerUniverse(::submit) { apiErrors += it }
                 if (discovered.get() == 0 && !cancelled.get()) {
-                    throw IllegalStateException("БКС не вернул ни одного инструмента для сканирования. Проверьте refresh-токен и доступ к справочнику BCS.")
+                    val detail = apiErrors.joinToString("; ").ifBlank { "пустой ответ каталога" }
+                    throw IllegalStateException("БКС: не удалось получить инструменты для сканирования. $detail")
                 }
+                // Non-fatal directory errors are intentionally not promoted to a global
+                // scanner failure when another BCS API stream already supplied instruments.
+                if (apiErrors.isNotEmpty()) onProgress(Progress(discovered.get(), completed.get(), signals.get(), true))
             }
             futures.toList().forEach { future ->
                 if (!cancelled.get()) runCatching { future.get() }
@@ -124,9 +129,10 @@ class ScannerEngine(private val repo: MarketRepository) {
 
     private fun analyzeInstrument(instrument: SearchResult, timeframes: List<String>, config: Config): Result? {
         val canonical = if (instrument.classCode.isBlank()) instrument.symbol else "${instrument.symbol}@${instrument.classCode}"
-        val ordered = timeframes.distinct()
-        val lower = ordered.filter { it == "15M" || it == "1H" || it == "4H" }
-        val higher = ordered.filter { it == "1D" || it == "1W" }
+        // Coverage is never silently reduced. The scanner always evaluates every selected
+        // timeframe in the configured order; higher timeframes are not dropped just because
+        // a lower timeframe looks weak. This is critical for true MTF consensus.
+        val ordered = timeframes.distinct().filter { it in setOf("15M", "1H", "4H", "1D", "1W") }
         val data = ArrayList<TfData>(ordered.size)
 
         fun history(tf: String): Pair<String, String> = when (tf) {
@@ -138,35 +144,19 @@ class ScannerEngine(private val repo: MarketRepository) {
             else -> "4y" to "1d"
         }
 
-        fun loadTf(tf: String): TfData? {
+        ordered.forEach { tf ->
             val pair = history(tf)
-            return runCatching {
+            runCatching {
                 val candles = repo.load(canonical, pair.first, pair.second)
-                if (candles.size < 60) null else TfData(tf, candles, AnalyticsEngine.analyze(candles))
-            }.getOrNull()
-        }
-
-        // Two-stage scanner: cheap lower-timeframe qualification first. Daily/weekly
-        // history is fetched only for instruments that already show a coherent setup.
-        // This preserves the exact same AnalyticsEngine while cutting most market-wide
-        // network and CPU work on instruments that are obviously non-actionable.
-        val firstStage = if (lower.isNotEmpty()) lower else higher
-        firstStage.forEach { loadTf(it)?.let(data::add) }
-        if (data.isEmpty()) return null
-        if (lower.isNotEmpty() && higher.isNotEmpty()) {
-            val preliminaryDirection = consensusDirection(data)
-            val preliminaryStrength = preliminaryDirection.takeIf { it.isNotBlank() }?.let { d ->
-                consensusStrength(data, d)
-            } ?: 0.0
-            if (preliminaryDirection.isBlank() || preliminaryStrength < 0.67) return null
-            higher.forEach { loadTf(it)?.let(data::add) }
+                if (candles.size >= 60) data += TfData(tf, candles, AnalyticsEngine.analyze(candles))
+            }
         }
         if (data.isEmpty()) return null
 
         val direction = consensusDirection(data)
-        if (direction == "") return null
-        val aligned = data.filter { it.forecast.signal == direction }
-        if (aligned.size < requiredConsensus(data.size)) return null
+        if (direction.isBlank()) return null
+        val aligned = data.count { it.forecast.signal == direction }
+        if (aligned < requiredConsensus(data.size)) return null
 
         val weightedScore = weighted(data) { it.forecast.score }
         val weightedConfidence = weighted(data) { it.forecast.confidence.toDouble() }.toInt().coerceIn(0, 100)
@@ -175,12 +165,16 @@ class ScannerEngine(private val repo: MarketRepository) {
         if (confidence < config.minimumConfidence || abs(score) < config.minimumScoreAbs) return null
         if (higherTimeframeConflict(data, direction)) return null
 
+        // Execution is selected from the fastest available timeframe, while direction is
+        // validated against the complete MTF set. This preserves responsive entries without
+        // sacrificing daily/weekly context.
         val execution = data.firstOrNull { it.timeframe == "15M" }?.forecast
             ?: data.firstOrNull { it.timeframe == "1H" }?.forecast
+            ?: data.firstOrNull { it.timeframe == "4H" }?.forecast
             ?: data.minByOrNull { timeframeWeight(it.timeframe) }?.forecast
             ?: data.last().forecast
-        if (!execution.highConviction && confidence < 74) return null
-        if (execution.rr < 1.45 || execution.tp2Probability < 0.38 || execution.expectedValueR < 0.05) return null
+        if (!execution.highConviction && confidence < 72) return null
+        if (execution.rr < 1.35 || execution.tp2Probability < 0.35 || execution.expectedValueR < 0.03) return null
 
         return Result(
             instrument = instrument,

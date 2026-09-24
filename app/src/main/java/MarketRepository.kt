@@ -254,23 +254,60 @@ class MarketRepository(
         return out.values.toList()
     }
 
-    /** Stream only scanner-eligible BCS instruments. The callback fires as each page arrives, so the scanner can start work before the full universe is downloaded. */
-    fun streamScannerUniverse(onInstrument: (SearchResult) -> Unit) {
+    /**
+     * Stream the complete BCS trading universe in deterministic API order.
+     * A failure in STOCK must never prevent the scanner from moving on to CURRENCY,
+     * and a transient page failure must never be mistaken for an empty market.
+     * Previously one exception here terminated the whole run before the first instrument.
+     */
+    fun streamScannerUniverse(onInstrument: (SearchResult) -> Unit, onApiError: (String) -> Unit = {}): Int {
         val seen = HashSet<String>()
-        instrumentCatalogStream("STOCKS") { item ->
-            val t = item.type.uppercase(Locale.US)
-            if (t == "STOCK" || t == "FOREIGN_STOCK") {
-                val key = catalogIdentity(item)
-                if (seen.add(key)) onInstrument(item)
+        var emitted = 0
+        fun emit(item: SearchResult) {
+            val key = catalogIdentity(item)
+            if (seen.add(key)) {
+                emitted++
+                onInstrument(item)
             }
         }
-        instrumentCatalogStream("FX") { item ->
-            val t = item.type.uppercase(Locale.US)
-            if (t.contains("CURRENCY") || t.contains("FOREX")) {
-                val key = catalogIdentity(item)
-                if (seen.add(key)) onInstrument(item)
+
+        // A previously downloaded BCS directory is an identity cache, not a market-price
+        // source. Use it immediately so scanning can begin even while the live directory
+        // API is reconnecting; fresh candle data is still fetched from BCS for every forecast.
+        searchEngine.all().asSequence()
+            .filter { it.source == "БКС" }
+            .filter { allowedScannerType(it.type) }
+            .forEach(::emit)
+
+        runCatching {
+            instrumentCatalogStream("STOCKS") { item ->
+                if (allowedScannerType(item.type, stocksOnly = true)) {
+                    emit(item)
+                    // Persist only metadata received from BCS. This makes the next run warm-startable.
+                    rememberSearchResults(listOf(item), persist = false)
+                }
             }
-        }
+        }.onFailure { onApiError("STOCK: ${it.message ?: "ошибка каталога BCS"}") }
+
+        runCatching {
+            instrumentCatalogStream("FX") { item ->
+                if (allowedScannerType(item.type, fxOnly = true)) {
+                    emit(item)
+                    rememberSearchResults(listOf(item), persist = false)
+                }
+            }
+        }.onFailure { onApiError("CURRENCY: ${it.message ?: "ошибка каталога BCS"}") }
+
+        // Persist the complete BCS-derived metadata index once, after the sequential API pass.
+        runCatching { rememberSearchResults(searchEngine.all().filter { it.source == "БКС" }, persist = true) }
+        return emitted
+    }
+
+    private fun allowedScannerType(type: String, stocksOnly: Boolean = false, fxOnly: Boolean = false): Boolean {
+        val t = type.uppercase(Locale.US)
+        if (fxOnly) return t.contains("CURRENCY") || t.contains("FOREX")
+        if (stocksOnly) return t == "STOCK" || t == "FOREIGN_STOCK" || t == "DEPOSITARY_RECEIPTS"
+        return t == "STOCK" || t == "FOREIGN_STOCK" || t == "DEPOSITARY_RECEIPTS" || t.contains("CURRENCY") || t.contains("FOREX")
     }
 
     /** Stream BCS directory pages for market widgets without persisting a catalogue. */
@@ -379,7 +416,7 @@ class MarketRepository(
                 // silently skip a whole page and produce a fake partial universe.
                 consecutiveFailures++
                 if (consecutiveFailures >= 3) {
-                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type")
+                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type: ${last?.message ?: "неизвестная ошибка"}")
                 }
                 continue
             }
@@ -883,6 +920,12 @@ class MarketRepository(
 
     private fun bcsHeaders(): Map<String,String> = mapOf("Authorization" to "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось получить access token")}", "Accept" to "application/json")
 
+    private fun invalidateBcsAccessToken() {
+        bcsAccessToken = null
+        bcsAccessExpiresAt = 0L
+        bcsAccessRefreshFingerprint = 0
+    }
+
     private fun loadBcs(symbol: String, range: String, interval: String): List<Candle> {
         val (ticker, classCode) = bcsInstrument(symbol)
         val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
@@ -1070,34 +1113,64 @@ class MarketRepository(
     }
     private fun postJson(url: String, body: String, timeout: Int, headers: Map<String,String>): String {
         var last: Throwable? = null
-        repeat(4) { attempt ->
+        var authRefreshUsed = false
+        repeat(5) { attempt ->
             try {
                 bcsPace()
                 val c = URL(url).openConnection() as HttpURLConnection
                 c.requestMethod = "POST"; c.connectTimeout = timeout; c.readTimeout = timeout; c.doOutput = true
-                c.setRequestProperty("Content-Type", "application/json"); headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                c.setRequestProperty("Content-Type", "application/json")
+                headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                if (authRefreshUsed && headers.containsKey("Authorization")) {
+                    c.setRequestProperty("Authorization", "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось обновить access token")}")
+                }
                 c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
                 return readResponse(c)
             } catch (t: Throwable) {
                 last = t
-                if (!t.message.orEmpty().contains("HTTP 429")) throw t
-                Thread.sleep((400L shl attempt).coerceAtMost(5000L))
+                val message = t.message.orEmpty()
+                when {
+                    message.contains("HTTP 401") || message.contains("HTTP 403") -> {
+                        if (authRefreshUsed) throw t
+                        invalidateBcsAccessToken()
+                        authRefreshUsed = true
+                    }
+                    message.contains("HTTP 429") || message.contains("HTTP 408") || message.contains("HTTP 5") || message.contains("timeout", true) || message.contains("timed out", true) -> {
+                        Thread.sleep((350L shl attempt.coerceAtMost(3)).coerceAtMost(5000L))
+                    }
+                    else -> throw t
+                }
             }
         }
         throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")
     }
     private fun getTextAuth(url: String, timeout: Int, headers: Map<String,String>): String {
         var last: Throwable? = null
-        repeat(4) { attempt ->
+        var authRefreshUsed = false
+        repeat(5) { attempt ->
             try {
                 bcsPace()
                 val c = URL(url).openConnection() as HttpURLConnection
-                c.requestMethod = "GET"; c.connectTimeout = timeout; c.readTimeout = timeout; headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                c.requestMethod = "GET"; c.connectTimeout = timeout; c.readTimeout = timeout
+                headers.forEach { (k,v) -> c.setRequestProperty(k,v) }
+                if (authRefreshUsed && headers.containsKey("Authorization")) {
+                    c.setRequestProperty("Authorization", "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось обновить access token")}")
+                }
                 return readResponse(c)
             } catch (t: Throwable) {
                 last = t
-                if (!t.message.orEmpty().contains("HTTP 429")) throw t
-                Thread.sleep((400L shl attempt).coerceAtMost(5000L))
+                val message = t.message.orEmpty()
+                when {
+                    message.contains("HTTP 401") || message.contains("HTTP 403") -> {
+                        if (authRefreshUsed) throw t
+                        invalidateBcsAccessToken()
+                        authRefreshUsed = true
+                    }
+                    message.contains("HTTP 429") || message.contains("HTTP 408") || message.contains("HTTP 5") || message.contains("timeout", true) || message.contains("timed out", true) -> {
+                        Thread.sleep((350L shl attempt.coerceAtMost(3)).coerceAtMost(5000L))
+                    }
+                    else -> throw t
+                }
             }
         }
         throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")

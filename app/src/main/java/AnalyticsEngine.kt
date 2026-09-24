@@ -731,6 +731,10 @@ object AnalyticsEngine {
         // in a range, mean-reversion evidence gets more influence.
         val weights = when {
             regime.startsWith("IMPULSE") -> doubleArrayOf(.34, .18, .22, .10, .08, .08)
+            regime.startsWith("BREAKOUT") -> doubleArrayOf(.25, .23, .24, .14, .08, .06)
+            regime.startsWith("PULLBACK") -> doubleArrayOf(.22, .25, .27, .10, .10, .06)
+            regime.startsWith("MEAN_REVERSION") -> doubleArrayOf(.13, .27, .30, .11, .12, .07)
+            regime.startsWith("REVERSAL") -> doubleArrayOf(.16, .28, .31, .10, .09, .06)
             regime.startsWith("TREND") -> doubleArrayOf(.32, .21, .22, .11, .07, .07)
             regime == "RANGE" -> doubleArrayOf(.15, .24, .27, .12, .12, .10)
             regime == "HIGH_VOLATILITY" -> doubleArrayOf(.24, .17, .25, .15, .10, .09)
@@ -933,16 +937,34 @@ object AnalyticsEngine {
             val directionalEfficiency = efficiency
             ((1.0 - (adxV / 28.0).coerceIn(0.0, 1.0)) * 0.55 + (1.0 - (directionalEfficiency / 0.30).coerceIn(0.0, 1.0)) * 0.45)
         }
+        // Regime hierarchy is intentionally specific-first. TREND is a last-resort label,
+        // not the default answer. A directional market can still be classified more precisely
+        // as BREAKOUT, PULLBACK or IMPULSE; a sideways market as RANGE/MEAN_REVERSION; and a
+        // structural turn as REVERSAL. This prevents five timeframes from collapsing into TREND.
+        val breakoutUp = price >= recentHigh * 0.998 && rangeExpansion >= 0.06 && volumeAnomaly >= 0.10 && structuralDirection >= 0.80
+        val breakoutDown = price <= recentLow * 1.002 && rangeExpansion >= 0.06 && volumeAnomaly >= 0.10 && structuralDirection <= -0.80
+        val pullbackUp = trendBase >= 3.0 && structuralDirection >= 1.2 && price < e20 && adxV >= 20.0 && efficiency >= 0.10
+        val pullbackDown = trendBase <= -3.0 && structuralDirection <= -1.2 && price > e20 && adxV >= 20.0 && efficiency >= 0.10
+        val meanReversionUp = adxV < 22.0 && rangeQuality >= 0.58 && (r < 34.0 || stoch < 22.0) && bb <= -0.55
+        val meanReversionDown = adxV < 22.0 && rangeQuality >= 0.58 && (r > 66.0 || stoch > 78.0) && bb >= 0.55
         val preliminaryRegime = when {
             reversalPressure >= 0.90 && adxV >= 18.0 && abs(structuralDirection) >= 0.65 &&
                 abs(trendBase + structure * 0.35 + mtf * 0.35) < 6.5 ->
                 if (structuralDirection >= 0.0) "REVERSAL_UP" else "REVERSAL_DOWN"
+            breakoutUp -> "BREAKOUT_UP"
+            breakoutDown -> "BREAKOUT_DOWN"
             adxV >= 28.0 && abs(structuralDirection) >= 2.2 && rangeExpansion >= 0.12 && efficiency >= 0.32 ->
                 if (structuralDirection > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
+            meanReversionUp -> "MEAN_REVERSION_UP"
+            meanReversionDown -> "MEAN_REVERSION_DOWN"
             adxV < 20.0 && efficiency < 0.35 && rangeQuality >= 0.55 -> "RANGE"
-            adxV >= 24.0 && structuralDirection >= 1.8 && trendBase >= 2.8 && efficiency >= 0.14 -> "TREND_UP"
-            adxV >= 24.0 && structuralDirection <= -1.8 && trendBase <= -2.8 && efficiency >= 0.14 -> "TREND_DOWN"
+            pullbackUp -> "PULLBACK_UP"
+            pullbackDown -> "PULLBACK_DOWN"
             volatilityPct >= 4.0 && rangeExpansion >= 0.10 -> "HIGH_VOLATILITY"
+            // TREND is deliberately strict and is reached only after all more specific
+            // structures have been rejected.
+            adxV >= 26.0 && structuralDirection >= 2.5 && trendBase >= 3.5 && efficiency >= 0.22 -> "TREND_UP"
+            adxV >= 26.0 && structuralDirection <= -2.5 && trendBase <= -3.5 && efficiency >= 0.22 -> "TREND_DOWN"
             else -> "TRANSITION"
         }
         val longRegimeEdge = if(calibrate) regimeHistoricalEdge(c,1,preliminaryRegime,8) else 0.5
