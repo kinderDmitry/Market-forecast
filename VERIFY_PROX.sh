@@ -10,15 +10,15 @@ test -f app/src/main/java/MainActivity.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 152' app/build.gradle.kts
-grep -q 'versionName = "4.8.113"' app/build.gradle.kts
+grep -q 'versionCode = 157' app/build.gradle.kts
+grep -q 'versionName = "4.8.118"' app/build.gradle.kts
 
 echo "[3/6] Search + streaming scanner architecture"
 test -f app/src/main/java/ScannerEngine.kt
 grep -q "class ScannerEngine" app/src/main/java/ScannerEngine.kt
 grep -q "Universe.ALL" app/src/main/java/ScannerEngine.kt
 grep -q "class ScannerForegroundService" app/src/main/java/ScannerForegroundService.kt
-grep -q "foregroundServiceType="dataSync"" app/src/main/AndroidManifest.xml
+grep -q 'foregroundServiceType="dataSync"' app/src/main/AndroidManifest.xml
 ! grep -q "scanner_priority_active" app/src/main/java/MarketMonitorWorker.kt
 
 echo "[4/6] No duplicate FavoriteQuote"
