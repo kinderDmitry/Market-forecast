@@ -716,7 +716,7 @@ private fun ScannerScreen(
         item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "BCS • полный каталог • выберите рынок и таймфреймы" else "BCS • full catalogue • choose market and timeframes") }
         item {
             Text(if (ru) "Рынок" else "Market", fontWeight = FontWeight.Black, fontSize = 12.sp)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.padding(top = 6.dp)) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 FilterChip(selected = universe == ScannerEngine.Universe.RUSSIAN_STOCKS, onClick = { if (!running) setUniverse(ScannerEngine.Universe.RUSSIAN_STOCKS) }, label = { Text(if (ru) "Акции РФ" else "Russian stocks", fontSize = 10.sp) })
                 FilterChip(selected = universe == ScannerEngine.Universe.CURRENCIES, onClick = { if (!running) setUniverse(ScannerEngine.Universe.CURRENCIES) }, label = { Text(if (ru) "Валюты" else "Currencies", fontSize = 10.sp) })
                 FilterChip(selected = universe == ScannerEngine.Universe.FAVORITES, onClick = { if (!running) setUniverse(ScannerEngine.Universe.FAVORITES) }, label = { Text(if (ru) "Избранные" else "Favorites", fontSize = 10.sp) })
