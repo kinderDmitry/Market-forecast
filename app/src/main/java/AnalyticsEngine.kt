@@ -5,15 +5,27 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 object AnalyticsEngine {
-    private const val CACHE_MAX = 128
+    private const val CACHE_MAX = 512
     private val analysisCache = object : LinkedHashMap<String, Forecast>(CACHE_MAX, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Forecast>?): Boolean = size > CACHE_MAX
     }
     private val cacheLock = Any()
 
     private fun cacheKey(c: List<Candle>, entryOverride: Double?): String {
-        val last = c.lastOrNull()
-        return "${c.size}:${last?.time ?: 0L}:${last?.close ?: 0.0}:${entryOverride ?: Double.NaN}"
+        // A size+last-candle key can collide between two different instruments that
+        // happen to share the same latest close. Use a cheap sampled fingerprint so
+        // the cache stays fast without ever returning another instrument's forecast.
+        val sample = intArrayOf(0, c.size / 4, c.size / 2, (c.size * 3) / 4, c.lastIndex)
+            .distinct().filter { it in c.indices }
+        var hash = 17L
+        sample.forEach { i ->
+            val x = c[i]
+            hash = hash * 31L + x.time
+            hash = hash * 31L + java.lang.Double.doubleToLongBits(x.close)
+            hash = hash * 31L + java.lang.Double.doubleToLongBits(x.high)
+            hash = hash * 31L + java.lang.Double.doubleToLongBits(x.low)
+        }
+        return "${c.size}:$hash:${entryOverride ?: Double.NaN}"
     }
 
     private fun ema(x: List<Double>, n: Int): Double? {
@@ -890,12 +902,47 @@ object AnalyticsEngine {
         // selected direction is used after signal formation. This makes confidence
         // sensitive to what this market has actually rewarded recently.
         val currentTrendContext = ((e20 - e50) / price.coerceAtLeast(1e-9) * 100.0).coerceIn(-8.0, 8.0)
+        val structuralDirection = run {
+            val w = c.takeLast(min(40, c.size))
+            if (w.size < 12) 0.0 else {
+                val mid = w.size / 2
+                val left = w.take(mid)
+                val right = w.drop(mid)
+                val leftHigh = left.maxOf { it.high }; val rightHigh = right.maxOf { it.high }
+                val leftLow = left.minOf { it.low }; val rightLow = right.minOf { it.low }
+                val atrNorm = a.coerceAtLeast(price * 0.001)
+                ((rightHigh - leftHigh) / atrNorm * 0.5 + (rightLow - leftLow) / atrNorm * 0.5).coerceIn(-6.0, 6.0)
+            }
+        }
+        val reversalPressure = run {
+            val recent = c.takeLast(min(10, c.size))
+            val prior = c.dropLast(min(10, c.size)).takeLast(min(24, c.size))
+            if (recent.size < 6 || prior.size < 10) 0.0 else {
+                val recentMove = recent.last().close - recent.first().close
+                val priorMove = prior.last().close - prior.first().close
+                val norm = a.coerceAtLeast(price * 0.001)
+                val signFlip = if (recentMove.sign != 0.0 && priorMove.sign != 0.0 && recentMove.sign != priorMove.sign) 1.0 else 0.0
+                val magnitude = min(1.8, abs(recentMove - priorMove) / norm)
+                (signFlip * magnitude).coerceIn(0.0, 2.0)
+            }
+        }
+        val efficiencyWindow = c.takeLast(min(20, c.size)).map { it.close }
+        val pathNoise = efficiencyWindow.zipWithNext().sumOf { abs(it.second - it.first) }.coerceAtLeast(1e-9)
+        val efficiency = if (efficiencyWindow.size > 1) abs(efficiencyWindow.last() - efficiencyWindow.first()) / pathNoise else 0.0
+        val rangeQuality = run {
+            val directionalEfficiency = efficiency
+            ((1.0 - (adxV / 28.0).coerceIn(0.0, 1.0)) * 0.55 + (1.0 - (directionalEfficiency / 0.30).coerceIn(0.0, 1.0)) * 0.45)
+        }
         val preliminaryRegime = when {
-            adxV >= 35.0 && abs(trendBase) >= 6.0 && rangeExpansion >= 0.18 -> if (trendBase > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
-            adxV >= 22.0 && trendBase >= 3.2 -> "TREND_UP"
-            adxV >= 22.0 && trendBase <= -3.2 -> "TREND_DOWN"
-            volatilityPct >= 4.0 -> "HIGH_VOLATILITY"
-            adxV < 18.0 -> "RANGE"
+            reversalPressure >= 0.90 && adxV >= 18.0 && abs(structuralDirection) >= 0.65 &&
+                abs(trendBase + structure * 0.35 + mtf * 0.35) < 6.5 ->
+                if (structuralDirection >= 0.0) "REVERSAL_UP" else "REVERSAL_DOWN"
+            adxV >= 28.0 && abs(structuralDirection) >= 2.2 && rangeExpansion >= 0.12 && efficiency >= 0.32 ->
+                if (structuralDirection > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
+            adxV < 20.0 && efficiency < 0.35 && rangeQuality >= 0.55 -> "RANGE"
+            adxV >= 24.0 && structuralDirection >= 1.8 && trendBase >= 2.8 && efficiency >= 0.14 -> "TREND_UP"
+            adxV >= 24.0 && structuralDirection <= -1.8 && trendBase <= -2.8 && efficiency >= 0.14 -> "TREND_DOWN"
+            volatilityPct >= 4.0 && rangeExpansion >= 0.10 -> "HIGH_VOLATILITY"
             else -> "TRANSITION"
         }
         val longRegimeEdge = if(calibrate) regimeHistoricalEdge(c,1,preliminaryRegime,8) else 0.5
@@ -910,9 +957,6 @@ object AnalyticsEngine {
         val longHorizon = if (calibrate) horizonEdgeStats(c, 1) else HorizonEdgeStats(.5, .5, 0, 0)
         val shortHorizon = if (calibrate) horizonEdgeStats(c, -1) else HorizonEdgeStats(.5, .5, 0, 0)
         val edgeGap = abs(longEdge - shortEdge)
-        val efficiencyWindow = c.takeLast(min(20, c.size)).map { it.close }
-        val pathNoise = efficiencyWindow.zipWithNext().sumOf { abs(it.second - it.first) }.coerceAtLeast(1e-9)
-        val efficiency = if (efficiencyWindow.size > 1) abs(efficiencyWindow.last() - efficiencyWindow.first()) / pathNoise else 0.0
         val breakout = when { price > recentHigh * 0.998 -> 2.5; price < recentLow * 1.002 -> -2.5; else -> 0.0 }
         val volumeImpulse = ((volRatio - 1.0) * if (c.last().close >= c.last().open) 2.0 else -2.0).coerceIn(-3.0, 3.0)
         val adaptiveTrendW = if (volatilityPct > 5.0) .30 else .38
@@ -1086,14 +1130,11 @@ object AnalyticsEngine {
         val entryZoneHigh = maxOf(price, dynamicEntry)
         val entryQuality = (1.0 - srPenalty/3.0 + hierarchy.sign*direction*0.12 + liquidity.score.sign*0.08).coerceIn(0.0,1.0)
         val projected = if (signal == "NO TRADE") price else if (direction > 0) safeTp2 else safeTp2
-        val regime = when {
-            adxV >= 35 && abs(trendBase) >= 6 && rangeExpansion >= 0.18 -> if (trendBase > 0) "IMPULSE_UP" else "IMPULSE_DOWN"
-            adxV >= 22 && trendBase >= 3.2 -> "TREND_UP"
-            adxV >= 22 && trendBase <= -3.2 -> "TREND_DOWN"
-            volatilityPct >= 4.0 -> "HIGH_VOLATILITY"
-            adxV < 18 -> "RANGE"
-            else -> "TRANSITION"
-        }
+        // Keep the structural regime decided above. Recomputing it here with a
+        // simpler EMA/ADX rule used to collapse REVERSAL/IMPULSE/RANGE setups back
+        // into TREND. TREND is now only a fallback regime when no stronger structural
+        // state is present.
+        val regime = preliminaryRegime
         val rrPenalty = if (rr < 1.5) 10 else 0
         val agreementBonus = abs(agreement) * 1.5
         val qualityBase = (55 + min(25, c.size / 8) + (if (avgVol > 0) 5 else 0) + (if (a > 0) 5 else 0) + (if (e200 != null) 5 else 0)).coerceIn(55, 95)
@@ -1160,6 +1201,10 @@ object AnalyticsEngine {
         val expectancyGate = expectedValueR >= 0.15 && tp2Prob >= 0.42
         val srGate = srPenalty < 2.25
         val finalSignal = if (signal != "NO TRADE" && (!actualRrGate || !expectancyGate || !srGate)) "NO TRADE" else signal
+        // TREND is not a generic answer. It is reserved for a genuine directional
+        // structure when the engine cannot justify a more specific regime. This keeps
+        // the forecast descriptive instead of forcing every market into TREND.
+        // The executable signal itself remains LONG/SHORT/NO TRADE.
         // For NO TRADE, confidence describes directional certainty only as a
         // probability estimate; it is never presented as permission to trade.
         val finalConfidence = confidence

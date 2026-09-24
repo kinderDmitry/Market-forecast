@@ -108,7 +108,7 @@ class ScannerForegroundService : Service() {
             }
             ACTION_START -> {
                 val u = intent.getStringExtra(EXTRA_UNIVERSE).orEmpty().ifBlank { "ALL" }
-                val tfs = intent.getStringExtra(EXTRA_TIMEFRAMES).orEmpty().ifBlank { "15M,1H,4H,1D" }
+                val tfs = intent.getStringExtra(EXTRA_TIMEFRAMES).orEmpty().ifBlank { "15M,1H,4H,1D,1W" }
                 val p = getSharedPreferences(PREFS, MODE_PRIVATE)
                 p.edit().putString(KEY_UNIVERSE, u).putString(KEY_TIMEFRAMES, tfs)
                     .putBoolean(KEY_RUNNING, true).remove(KEY_ERROR).apply()
@@ -116,7 +116,7 @@ class ScannerForegroundService : Service() {
             }
             null -> {
                 val p = getSharedPreferences(PREFS, MODE_PRIVATE)
-                if (p.getBoolean(KEY_RUNNING, false)) startRunIfNeeded(p.getString(KEY_UNIVERSE, "ALL") ?: "ALL", p.getString(KEY_TIMEFRAMES, "15M,1H,4H,1D") ?: "15M,1H,4H,1D")
+                if (p.getBoolean(KEY_RUNNING, false)) startRunIfNeeded(p.getString(KEY_UNIVERSE, "ALL") ?: "ALL", p.getString(KEY_TIMEFRAMES, "15M,1H,4H,1D,1W") ?: "15M,1H,4H,1D,1W")
             }
         }
         return START_STICKY
@@ -130,7 +130,7 @@ class ScannerForegroundService : Service() {
         executor.execute {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val universe = runCatching { ScannerEngine.Universe.valueOf(universeName) }.getOrDefault(ScannerEngine.Universe.ALL)
-            val timeframes = tfString.split(',').map { it.trim() }.filter { it in setOf("15M", "1H", "4H", "1D") }.ifEmpty { listOf("15M", "1H", "4H", "1D") }
+            val timeframes = tfString.split(',').map { it.trim() }.filter { it in setOf("15M", "1H", "4H", "1D", "1W") }.ifEmpty { listOf("15M", "1H", "4H", "1D", "1W") }
             val token = getSharedPreferences("mfprefs", MODE_PRIVATE).getString("bcs_refresh_token", "").orEmpty()
             val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = getSharedPreferences("mfprefs", MODE_PRIVATE), context = this)
             val favorites = getSharedPreferences("mfprefs", MODE_PRIVATE).getStringSet("favorites", emptySet()).orEmpty()

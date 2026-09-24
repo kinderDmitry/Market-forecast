@@ -19,8 +19,8 @@ import kotlin.math.abs
 class ScannerEngine(private val repo: MarketRepository) {
     data class Config(
         val universe: Universe = Universe.ALL,
-        val timeframes: List<String> = listOf("15M", "1H", "4H", "1D"),
-        val workers: Int = 4,
+        val timeframes: List<String> = listOf("15M", "1H", "4H", "1D", "1W"),
+        val workers: Int = 6,
         val minimumConfidence: Int = 68,
         // AnalyticsEngine score is normalized to -10..+10, not -100..+100.
         // The old 55 threshold made every scanner result impossible.
@@ -63,7 +63,7 @@ class ScannerEngine(private val repo: MarketRepository) {
         onResult: (Result) -> Unit = {}
     ) {
         require(repo.isBcsConfigured()) { "БКС не подключен" }
-        val tfs = config.timeframes.distinct().filter { it in setOf("15M", "1H", "4H", "1D") }
+        val tfs = config.timeframes.distinct().filter { it in setOf("15M", "1H", "4H", "1D", "1W") }
         require(tfs.isNotEmpty()) { "Выберите хотя бы один таймфрейм" }
 
         val queue = Executors.newFixedThreadPool(config.workers.coerceIn(1, 6))
@@ -124,22 +124,42 @@ class ScannerEngine(private val repo: MarketRepository) {
 
     private fun analyzeInstrument(instrument: SearchResult, timeframes: List<String>, config: Config): Result? {
         val canonical = if (instrument.classCode.isBlank()) instrument.symbol else "${instrument.symbol}@${instrument.classCode}"
-        val data = ArrayList<TfData>(timeframes.size)
-        for (tf in timeframes) {
-            // Scanner history is deliberately bounded to one BCS request per
-            // timeframe in normal conditions. These windows are still much longer
-            // than the model's structural/calibration lookbacks and avoid turning a
-            // whole-market scan into thousands of paginated history calls.
-            val pair = when (tf) {
-                "15M" -> "10d" to "15m"
-                "1H" -> "45d" to "1h"
-                "4H" -> "180d" to "4h"
-                else -> "3y" to "1d"
-            }
-            val candles = repo.load(canonical, pair.first, pair.second)
-            if (candles.size < 60) return null
-            val forecast = AnalyticsEngine.analyze(candles)
-            data += TfData(tf, candles, forecast)
+        val ordered = timeframes.distinct()
+        val lower = ordered.filter { it == "15M" || it == "1H" || it == "4H" }
+        val higher = ordered.filter { it == "1D" || it == "1W" }
+        val data = ArrayList<TfData>(ordered.size)
+
+        fun history(tf: String): Pair<String, String> = when (tf) {
+            "15M" -> "7d" to "15m"
+            "1H" -> "30d" to "1h"
+            "4H" -> "120d" to "4h"
+            "1D" -> "4y" to "1d"
+            "1W" -> "8y" to "1wk"
+            else -> "4y" to "1d"
+        }
+
+        fun loadTf(tf: String): TfData? {
+            val pair = history(tf)
+            return runCatching {
+                val candles = repo.load(canonical, pair.first, pair.second)
+                if (candles.size < 60) null else TfData(tf, candles, AnalyticsEngine.analyze(candles))
+            }.getOrNull()
+        }
+
+        // Two-stage scanner: cheap lower-timeframe qualification first. Daily/weekly
+        // history is fetched only for instruments that already show a coherent setup.
+        // This preserves the exact same AnalyticsEngine while cutting most market-wide
+        // network and CPU work on instruments that are obviously non-actionable.
+        val firstStage = if (lower.isNotEmpty()) lower else higher
+        firstStage.forEach { loadTf(it)?.let(data::add) }
+        if (data.isEmpty()) return null
+        if (lower.isNotEmpty() && higher.isNotEmpty()) {
+            val preliminaryDirection = consensusDirection(data)
+            val preliminaryStrength = preliminaryDirection.takeIf { it.isNotBlank() }?.let { d ->
+                consensusStrength(data, d)
+            } ?: 0.0
+            if (preliminaryDirection.isBlank() || preliminaryStrength < 0.67) return null
+            higher.forEach { loadTf(it)?.let(data::add) }
         }
         if (data.isEmpty()) return null
 
@@ -148,12 +168,6 @@ class ScannerEngine(private val repo: MarketRepository) {
         val aligned = data.filter { it.forecast.signal == direction }
         if (aligned.size < requiredConsensus(data.size)) return null
 
-        // Do not force the last/highest timeframe to have the same executable signal.
-        // A higher timeframe can legitimately be NO TRADE while a confirmed lower
-        // timeframe setup exists. The scanner must not silently discard the whole
-        // instrument merely because one timeframe is neutral. Higher timeframes still
-        // dominate through the weights below and an opposite executable signal on a
-        // higher timeframe is treated as a hard conflict.
         val weightedScore = weighted(data) { it.forecast.score }
         val weightedConfidence = weighted(data) { it.forecast.confidence.toDouble() }.toInt().coerceIn(0, 100)
         val confidence = ((weightedConfidence * 0.68) + (consensusStrength(data, direction) * 32.0)).toInt().coerceIn(0, 100)
@@ -161,10 +175,6 @@ class ScannerEngine(private val repo: MarketRepository) {
         if (confidence < config.minimumConfidence || abs(score) < config.minimumScoreAbs) return null
         if (higherTimeframeConflict(data, direction)) return null
 
-        // Execution levels come from the selected lower working timeframe (15M
-        // when present). Higher timeframes decide context/consensus, not the exact
-        // entry price. This prevents a daily forecast from supplying stale execution
-        // levels to a 15M scanner signal.
         val execution = data.firstOrNull { it.timeframe == "15M" }?.forecast
             ?: data.firstOrNull { it.timeframe == "1H" }?.forecast
             ?: data.minByOrNull { timeframeWeight(it.timeframe) }?.forecast
@@ -218,11 +228,12 @@ class ScannerEngine(private val repo: MarketRepository) {
         "1H" -> 1.5
         "4H" -> 2.2
         "1D" -> 3.0
+        "1W" -> 4.2
         else -> 1.0
     }
 
     private fun higherTimeframeConflict(data: List<TfData>, direction: String): Boolean {
-        val higher = data.filter { it.timeframe == "4H" || it.timeframe == "1D" }
+        val higher = data.filter { it.timeframe == "4H" || it.timeframe == "1D" || it.timeframe == "1W" }
         return higher.any {
             (direction == "LONG" && it.forecast.signal == "SHORT" && it.forecast.confidence >= 70) ||
             (direction == "SHORT" && it.forecast.signal == "LONG" && it.forecast.confidence >= 70)
@@ -242,6 +253,6 @@ class ScannerEngine(private val repo: MarketRepository) {
 
     private fun allowed(item: SearchResult): Boolean {
         val t = item.type.uppercase(Locale.US)
-        return t == "STOCK" || t == "FOREIGN_STOCK" || t.contains("CURRENCY") || t.contains("FOREX")
+        return t == "STOCK" || t == "FOREIGN_STOCK" || t == "DEPOSITARY_RECEIPTS" || t.contains("CURRENCY") || t.contains("FOREX")
     }
 }

@@ -162,7 +162,7 @@ fun MarketForecastApp(ctx: Context) {
     var message by remember { mutableStateOf<String?>(null) }
     var lastDataError by remember { mutableStateOf<String?>(null) }
     var pendingScanTrack by remember { mutableStateOf<Pair<String,String>?>(null) }
-    var scannerTimeframes by remember { mutableStateOf(listOf("15M", "1H", "4H", "1D")) }
+    var scannerTimeframes by remember { mutableStateOf(listOf("15M", "1H", "4H", "1D", "1W")) }
     var scannerUniverse by remember { mutableStateOf(ScannerEngine.Universe.ALL) }
     var refreshTick by remember { mutableLongStateOf(0L) }
     val trackingCandleCache = remember { mutableStateMapOf<String, List<Candle>>() }
@@ -714,12 +714,12 @@ private fun ScannerScreen(
         }
         item {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("15M", "1H", "4H", "1D").forEach { tf ->
+                listOf("15M", "1H", "4H", "1D", "1W").forEach { tf ->
                     item(key = "scanner_tf_$tf") {
                         FilterChip(selected = tf in timeframes, onClick = {
                             if (!running) {
                                 val next = if (tf in timeframes) timeframes - tf else timeframes + tf
-                                setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D").indexOf(it) })
+                                setTimeframes(next.sortedBy { listOf("15M", "1H", "4H", "1D", "1W").indexOf(it) })
                             }
                         }, label = { Text(tf, fontSize = 10.sp) })
                     }

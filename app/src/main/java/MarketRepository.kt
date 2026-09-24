@@ -60,7 +60,8 @@ class MarketRepository(
         // effectively instant without turning this into a downloaded instrument catalogue.
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         private const val SEARCH_CACHE_MS = 10 * 60_000L
-        private const val SEARCH_INDEX_PREFS = "mfp_search_index_v2"
+        private const val SEARCH_INDEX_PREFS = "mfp_search_index_v3_full_bcs"
+        private const val SEARCH_INDEX_MAX = 50000
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.107"
     private val searchEngine = InstrumentSearchEngine(popularSeeds()).also { engine ->
@@ -87,10 +88,13 @@ class MarketRepository(
         }.getOrDefault(emptyList())
     }
 
-    private fun rememberSearchResults(values: Collection<SearchResult>) {
+    private fun rememberSearchResults(values: Collection<SearchResult>, persist: Boolean = false) {
         if (values.isEmpty()) return
+        // Never serialize the entire learned index once per instrument. The old path
+        // could rewrite a 50k-entry JSON blob thousands of times during first search.
         searchEngine.addAll(values)
-        val merged = searchEngine.all().takeLast(350)
+        if (!persist) return
+        val merged = searchEngine.all().takeLast(SEARCH_INDEX_MAX)
         val a = JSONArray()
         merged.forEach { r ->
             a.put(JSONObject().apply {
@@ -218,7 +222,8 @@ class MarketRepository(
         // subsequent searches are local against the BCS-derived cache.
         if (merged.isEmpty() && isBcsConfigured()) {
             runCatching {
-                instrumentCatalogStream(filter) { item -> rememberSearchResults(listOf(item)) }
+                instrumentCatalogStream(filter) { item -> rememberSearchResults(listOf(item), persist = false) }
+                rememberSearchResults(searchEngine.all(), persist = true)
             }
             val warmed = searchEngine.search(q, filter, 30)
                 .filter { it.source == "БКС" && matchesSearchFilter(it, filter) }
