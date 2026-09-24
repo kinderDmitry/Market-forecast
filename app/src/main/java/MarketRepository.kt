@@ -388,6 +388,7 @@ class MarketRepository(
         var page = 0
         var consecutiveFailures = 0
         while (maxPagesPerType == Int.MAX_VALUE || page < maxPagesPerType) {
+            var pageError: Throwable? = null
             val arr = runCatching {
                 var last: Throwable? = null
                 for (attempt in 0..7) {
@@ -399,6 +400,7 @@ class MarketRepository(
                         return@runCatching root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
                     } catch (t: Throwable) {
                         last = t
+                        pageError = t
                         val message = t.message.orEmpty()
                         val retryable = message.contains("429") || message.contains("408") ||
                             message.contains("500") || message.contains("502") ||
@@ -416,7 +418,7 @@ class MarketRepository(
                 // silently skip a whole page and produce a fake partial universe.
                 consecutiveFailures++
                 if (consecutiveFailures >= 3) {
-                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type: ${last?.message ?: "неизвестная ошибка"}")
+                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type: ${pageError?.message ?: "неизвестная ошибка"}")
                 }
                 continue
             }
