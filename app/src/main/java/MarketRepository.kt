@@ -260,8 +260,12 @@ class MarketRepository(
      * and a transient page failure must never be mistaken for an empty market.
      * Previously one exception here terminated the whole run before the first instrument.
      */
-    fun streamScannerUniverse(onInstrument: (SearchResult) -> Unit, onApiError: (String) -> Unit = {}): Int {
+    fun streamScannerUniverse(universe: ScannerEngine.Universe = ScannerEngine.Universe.ALL, onInstrument: (SearchResult) -> Unit, onApiError: (String) -> Unit = {}): Int {
         val seen = HashSet<String>()
+        val stocksOnly = universe == ScannerEngine.Universe.RUSSIAN_STOCKS
+        val fxOnly = universe == ScannerEngine.Universe.CURRENCIES
+        val includeStocks = universe == ScannerEngine.Universe.ALL || stocksOnly
+        val includeFx = universe == ScannerEngine.Universe.ALL || fxOnly
         var emitted = 0
         fun emit(item: SearchResult) {
             val key = catalogIdentity(item)
@@ -271,43 +275,79 @@ class MarketRepository(
             }
         }
 
-        // A previously downloaded BCS directory is an identity cache, not a market-price
-        // source. Use it immediately so scanning can begin even while the live directory
-        // API is reconnecting; fresh candle data is still fetched from BCS for every forecast.
-        searchEngine.all().asSequence()
-            .filter { it.source == "БКС" }
-            .filter { allowedScannerType(it.type) }
-            .forEach(::emit)
+        // The live BCS directory is authoritative. Do not pre-feed the scanner from the
+        // learned search cache: older releases could have a partial 25-item cache and that
+        // made the UI look like a fixed-size scanner. Cache is used only as an explicit
+        // fallback when the corresponding live directory stream fails.
+        var stockApiFailed = false
+        var fxApiFailed = false
 
-        runCatching {
-            instrumentCatalogStream("STOCKS") { item ->
-                if (allowedScannerType(item.type, stocksOnly = true)) {
-                    emit(item)
-                    // Persist only metadata received from BCS. This makes the next run warm-startable.
-                    rememberSearchResults(listOf(item), persist = false)
+        if (includeStocks) {
+            runCatching {
+                instrumentCatalogStream("STOCKS") { item ->
+                    if (isRussianStock(item)) {
+                        emit(item)
+                        rememberSearchResults(listOf(item), persist = false)
+                    }
                 }
+            }.onFailure {
+                stockApiFailed = true
+                onApiError("STOCK: ${it.message ?: "ошибка каталога BCS"}")
             }
-        }.onFailure { onApiError("STOCK: ${it.message ?: "ошибка каталога BCS"}") }
+        }
 
-        runCatching {
-            instrumentCatalogStream("FX") { item ->
-                if (allowedScannerType(item.type, fxOnly = true)) {
-                    emit(item)
-                    rememberSearchResults(listOf(item), persist = false)
+        if (includeFx) {
+            runCatching {
+                instrumentCatalogStream("FX") { item ->
+                    if (isCurrency(item)) {
+                        emit(item)
+                        rememberSearchResults(listOf(item), persist = false)
+                    }
                 }
+            }.onFailure {
+                fxApiFailed = true
+                onApiError("CURRENCY: ${it.message ?: "ошибка каталога BCS"}")
             }
-        }.onFailure { onApiError("CURRENCY: ${it.message ?: "ошибка каталога BCS"}") }
+        }
+
+        // Cache fallback is deliberately per-universe and only activates after the live
+        // BCS stream failed. It is never a second market-data source; candles still come
+        // from BCS for every forecast.
+        if ((stockApiFailed || fxApiFailed) && emitted == 0) {
+            searchEngine.all().asSequence()
+                .filter { it.source == "БКС" }
+                .filter {
+                    when {
+                        stocksOnly -> isRussianStock(it)
+                        fxOnly -> isCurrency(it)
+                        else -> isRussianStock(it) || isCurrency(it)
+                    }
+                }
+                .forEach(::emit)
+        }
 
         // Persist the complete BCS-derived metadata index once, after the sequential API pass.
         runCatching { rememberSearchResults(searchEngine.all().filter { it.source == "БКС" }, persist = true) }
         return emitted
     }
 
+    private fun isCurrency(item: SearchResult): Boolean {
+        val t = item.type.uppercase(Locale.US)
+        return t == "CURRENCY" || t.contains("FOREX") || item.symbol.endsWith("=X")
+    }
+
+    private fun isRussianStock(item: SearchResult): Boolean {
+        // BCS API documentation defines type=STOCK as "Акции РФ". Keep the
+        // check exact so stale metadata from older app versions cannot leak
+        // foreign shares or depositary receipts into the РФ scanner.
+        return item.type.uppercase(Locale.US) == "STOCK"
+    }
+
     private fun allowedScannerType(type: String, stocksOnly: Boolean = false, fxOnly: Boolean = false): Boolean {
         val t = type.uppercase(Locale.US)
-        if (fxOnly) return t.contains("CURRENCY") || t.contains("FOREX")
-        if (stocksOnly) return t == "STOCK" || t == "FOREIGN_STOCK" || t == "DEPOSITARY_RECEIPTS"
-        return t == "STOCK" || t == "FOREIGN_STOCK" || t == "DEPOSITARY_RECEIPTS" || t.contains("CURRENCY") || t.contains("FOREX")
+        if (fxOnly) return t == "CURRENCY" || t.contains("FOREX")
+        if (stocksOnly) return t == "STOCK"
+        return t == "STOCK" || t == "CURRENCY" || t.contains("FOREX")
     }
 
     /** Stream BCS directory pages for market widgets without persisting a catalogue. */
@@ -449,9 +489,11 @@ class MarketRepository(
                         out.putIfAbsent(catalogIdentity(item), item)
                         onItem?.invoke(item)
                     }
-                    onPage?.invoke(1, pageOne.length(), pageOne.length() < 100)
-                    if (pageOne.length() < 100) break
-                    page = 1
+                    onPage?.invoke(1, pageOne.length(), false)
+                    // page=0 was rejected as empty, so this deployment is using
+                    // one-based pagination. Continue with page 2 rather than
+                    // requesting page 1 twice.
+                    page = 2
                     continue
                 }
                 onPage?.invoke(page, 0, true)
@@ -473,10 +515,13 @@ class MarketRepository(
                 out.putIfAbsent(catalogIdentity(item), item)
                 onItem?.invoke(item)
             }
-            onPage?.invoke(page, arr.length(), arr.length() < 100)
-            // BCS documents that a full page requires requesting page + 1.
-            if (arr.length() < 100) break
+            // Do not infer the end of the universe from page length. BCS deployments
+            // may cap the effective page size below the requested 100 (for example 25).
+            // A short non-empty page is therefore still a valid page, not EOF.
+            onPage?.invoke(page, arr.length(), arr.length() == 0)
+            if (arr.length() == 0) break
             page++
+            if (page >= 2000) throw IllegalStateException("БКС: превышен безопасный предел страниц каталога")
             Thread.sleep(40L)
         }
         return out.values.toList()

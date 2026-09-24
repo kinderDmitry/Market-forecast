@@ -115,11 +115,12 @@ class ScannerForegroundService : Service() {
                 startRunIfNeeded(u, tfs)
             }
             null -> {
-                val p = getSharedPreferences(PREFS, MODE_PRIVATE)
-                if (p.getBoolean(KEY_RUNNING, false)) startRunIfNeeded(p.getString(KEY_UNIVERSE, "ALL") ?: "ALL", p.getString(KEY_TIMEFRAMES, "15M,1H,4H,1D,1W") ?: "15M,1H,4H,1D,1W")
+                // A service recreation must never silently start a new scan.
+                // Scanning starts only after an explicit ACTION_START from the UI.
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, false).apply()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startRunIfNeeded(universeName: String, tfString: String) {

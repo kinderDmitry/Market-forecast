@@ -163,7 +163,7 @@ fun MarketForecastApp(ctx: Context) {
     var lastDataError by remember { mutableStateOf<String?>(null) }
     var pendingScanTrack by remember { mutableStateOf<Pair<String,String>?>(null) }
     var scannerTimeframes by remember { mutableStateOf(listOf("15M", "1H", "4H", "1D", "1W")) }
-    var scannerUniverse by remember { mutableStateOf(ScannerEngine.Universe.ALL) }
+    var scannerUniverse by remember { mutableStateOf(run { val n = prefs.getString("scanner_universe", "RUSSIAN_STOCKS") ?: "RUSSIAN_STOCKS"; runCatching { ScannerEngine.Universe.valueOf(n) }.getOrDefault(ScannerEngine.Universe.RUSSIAN_STOCKS) }) }
     var refreshTick by remember { mutableLongStateOf(0L) }
     val trackingCandleCache = remember { mutableStateMapOf<String, List<Candle>>() }
     // Canonical live quote per instrument. All timeframes in the same session use
@@ -533,7 +533,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
-                        Screen.SCANNER -> ScannerScreen(repo, favorites, scannerUniverse, scannerTimeframes, ru, { scannerUniverse = it }, { scannerTimeframes = it }, { symbol -> load(symbol, scannerTimeframes.lastOrNull() ?: "1D") })
+                        Screen.SCANNER -> ScannerScreen(repo, favorites, scannerUniverse, scannerTimeframes, ru, { scannerUniverse = it; prefs.edit().putString("scanner_universe", it.name).apply() }, { scannerTimeframes = it }, { symbol -> load(symbol, scannerTimeframes.lastOrNull() ?: "1D") })
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
                         Screen.DIVIDENDS -> DividendScreen(ru, repo, refreshTick) { screen = Screen.HOME }
@@ -697,12 +697,6 @@ private fun ScannerScreen(
     var error by remember { mutableStateOf<String?>(ScannerForegroundService.readError(ctx)) }
 
     LaunchedEffect(Unit) {
-        // Scanner tab is an active workspace: opening it immediately starts a fresh
-        // scan when no scan is already running. No separate "Start" step is required.
-        if (!ScannerForegroundService.isRunning(ctx)) {
-            ScannerForegroundService.clearResults(ctx)
-            ScannerForegroundService.start(ctx, universe, listOf("15M", "1H", "4H", "1D", "1W"))
-        }
         while (true) {
             val p = ScannerForegroundService.readProgress(ctx)
             discovered = p.first; completed = p.second; signals = p.third
@@ -716,10 +710,12 @@ private fun ScannerScreen(
     }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
-        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "BCS • последовательный обход API • полный MTF 15M / 1H / 4H / 1D / 1W" else "BCS • sequential API traversal • full MTF 15M / 1H / 4H / 1D / 1W") }
+        item { SectionHeader(if (ru) "СКАНЕР РЫНКА" else "MARKET SCANNER", if (ru) "BCS • полный каталог • 15M / 1H / 4H / 1D / 1W" else "BCS • full catalogue • 15M / 1H / 4H / 1D / 1W") }
         item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = universe == ScannerEngine.Universe.ALL, onClick = { if (!running) setUniverse(ScannerEngine.Universe.ALL) }, label = { Text(if (ru) "Весь рынок" else "Whole market", fontSize = 10.sp) })
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                FilterChip(selected = universe == ScannerEngine.Universe.RUSSIAN_STOCKS, onClick = { if (!running) setUniverse(ScannerEngine.Universe.RUSSIAN_STOCKS) }, label = { Text(if (ru) "Акции РФ" else "Russian stocks", fontSize = 10.sp) })
+                FilterChip(selected = universe == ScannerEngine.Universe.CURRENCIES, onClick = { if (!running) setUniverse(ScannerEngine.Universe.CURRENCIES) }, label = { Text(if (ru) "Валюты" else "Currencies", fontSize = 10.sp) })
+                FilterChip(selected = universe == ScannerEngine.Universe.ALL, onClick = { if (!running) setUniverse(ScannerEngine.Universe.ALL) }, label = { Text(if (ru) "Акции РФ + валюты" else "Russian stocks + FX", fontSize = 10.sp) })
                 FilterChip(selected = universe == ScannerEngine.Universe.FAVORITES, onClick = { if (!running) setUniverse(ScannerEngine.Universe.FAVORITES) }, label = { Text(if (ru) "Избранные" else "Favorites", fontSize = 10.sp) })
             }
         }
@@ -734,12 +730,24 @@ private fun ScannerScreen(
         }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { ScannerForegroundService.stop(ctx) }, enabled = running, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Stop, null)
-                    Spacer(Modifier.width(6.dp))
-                    Text(if (ru) "Остановить" else "Stop", fontWeight = FontWeight.Black)
+                if (!running) {
+                    Button(onClick = {
+                        ScannerForegroundService.clearResults(ctx)
+                        results = emptyList(); completed = 0; discovered = 0; signals = 0; error = null
+                        ScannerForegroundService.start(ctx, universe, listOf("15M", "1H", "4H", "1D", "1W"))
+                    }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.PlayArrow, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (ru) "Запустить сканирование" else "Start scanning", fontWeight = FontWeight.Black)
+                    }
+                } else {
+                    Button(onClick = { ScannerForegroundService.stop(ctx) }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.Stop, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (ru) "Остановить" else "Stop", fontWeight = FontWeight.Black)
+                    }
                 }
-                OutlinedButton(onClick = { ScannerForegroundService.clearResults(ctx); results = emptyList(); completed = 0; discovered = 0; signals = 0 }, enabled = !running) {
+                OutlinedButton(onClick = { ScannerForegroundService.clearResults(ctx); results = emptyList(); completed = 0; discovered = 0; signals = 0; error = null }, enabled = !running) {
                     Text(if (ru) "Очистить" else "Clear")
                 }
             }
@@ -753,7 +761,7 @@ private fun ScannerScreen(
             }
         }
         error?.let { msg -> item { EmptyCard(msg) } }
-        if (results.isEmpty() && !running && error == null) item { EmptyCard(if (ru) "Сканирование запускается автоматически. Показываются только сигналы, прошедшие quality gates." else "Scanning starts automatically. Only signals that pass the quality gates are shown.") }
+        if (results.isEmpty() && !running && error == null) item { EmptyCard(if (ru) "Выберите фильтр и нажмите «Запустить сканирование». Обход идёт по всему доступному BCS-каталогу, а не по фиксированным 25 инструментам." else "Choose a filter and press Start scanning. The scanner walks the complete available BCS catalogue, not a fixed 25 instruments.") }
         items(results, key = { it.instrument.symbol + "@" + it.instrument.classCode }) { r ->
             GradientCard(Modifier.fillMaxWidth().clickable { openInstrument(r.instrument.symbol) }) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

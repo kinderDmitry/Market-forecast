@@ -3,7 +3,8 @@ package com.marketforecast.prox
 import java.util.concurrent.CancellationException
 import java.util.Locale
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
+import java.util.concurrent.Semaphore
+import java.util.concurrent.Phaser
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
@@ -27,7 +28,7 @@ class ScannerEngine(private val repo: MarketRepository) {
         val minimumScoreAbs: Double = 4.0
     )
 
-    enum class Universe { ALL, FAVORITES }
+    enum class Universe { ALL, RUSSIAN_STOCKS, CURRENCIES, FAVORITES }
 
     data class Result(
         val instrument: SearchResult,
@@ -67,7 +68,9 @@ class ScannerEngine(private val repo: MarketRepository) {
         require(tfs.isNotEmpty()) { "Выберите хотя бы один таймфрейм" }
 
         val queue = Executors.newFixedThreadPool(config.workers.coerceIn(1, 6))
-        val futures = java.util.Collections.synchronizedList(mutableListOf<Future<*>>())
+        val completion = Phaser(1)
+        val maxInFlight = config.workers.coerceIn(1, 6) * 2
+        val permits = Semaphore(maxInFlight)
         val discovered = AtomicInteger(0)
         val completed = AtomicInteger(0)
         val signals = AtomicInteger(0)
@@ -77,9 +80,18 @@ class ScannerEngine(private val repo: MarketRepository) {
             if (cancelled.get() || !allowed(instrument)) return
             val key = "${instrument.symbol.uppercase(Locale.US)}@${instrument.classCode.uppercase(Locale.US)}"
             if (!submitted.add(key)) return
+            // Backpressure: never enqueue the entire BCS universe into an unbounded
+            // executor queue. At most workers*2 analyses are in flight/queued; the
+            // catalogue API naturally pauses until capacity is available.
+            permits.acquireUninterruptibly()
+            if (cancelled.get()) {
+                permits.release()
+                return
+            }
             discovered.incrementAndGet()
             onProgress(Progress(discovered.get(), completed.get(), signals.get(), true))
-            futures += queue.submit {
+            completion.register()
+            queue.submit {
                 try {
                     if (!cancelled.get()) {
                         runCatching { analyzeInstrument(instrument, tfs, config) }.getOrNull()?.let { result ->
@@ -90,7 +102,9 @@ class ScannerEngine(private val repo: MarketRepository) {
                         }
                     }
                 } finally {
+                    permits.release()
                     completed.incrementAndGet()
+                    completion.arriveAndDeregister()
                     onProgress(Progress(discovered.get(), completed.get(), signals.get(), !cancelled.get()))
                 }
             }
@@ -105,7 +119,7 @@ class ScannerEngine(private val repo: MarketRepository) {
                 // directory page arrives. The full universe never has to be held
                 // in memory before analysis begins.
                 val apiErrors = java.util.Collections.synchronizedList(mutableListOf<String>())
-                repo.streamScannerUniverse(::submit) { apiErrors += it }
+                repo.streamScannerUniverse(config.universe, ::submit) { apiErrors += it }
                 if (discovered.get() == 0 && !cancelled.get()) {
                     val detail = apiErrors.joinToString("; ").ifBlank { "пустой ответ каталога" }
                     throw IllegalStateException("БКС: не удалось получить инструменты для сканирования. $detail")
@@ -114,14 +128,13 @@ class ScannerEngine(private val repo: MarketRepository) {
                 // scanner failure when another BCS API stream already supplied instruments.
                 if (apiErrors.isNotEmpty()) onProgress(Progress(discovered.get(), completed.get(), signals.get(), true))
             }
-            futures.toList().forEach { future ->
-                if (!cancelled.get()) runCatching { future.get() }
-            }
+            // Wait without retaining one Future object per instrument. The Phaser keeps
+            // completion tracking bounded even for a full multi-thousand-instrument scan.
+            completion.arriveAndAwaitAdvance()
         } catch (ce: CancellationException) {
             cancelled.set(true)
             throw ce
         } finally {
-            if (cancelled.get()) futures.toList().forEach { it.cancel(true) }
             queue.shutdownNow()
             onProgress(Progress(discovered.get(), completed.get(), signals.get(), false))
         }
