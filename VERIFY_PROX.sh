@@ -10,8 +10,8 @@ test -f app/src/main/java/MainActivity.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 161' app/build.gradle.kts
-grep -q 'versionName = "4.8.122"' app/build.gradle.kts
+grep -q 'versionCode = 162' app/build.gradle.kts
+grep -q 'versionName = "4.8.123"' app/build.gradle.kts
 
 echo "[3/6] Search + streaming scanner architecture"
 test -f app/src/main/java/ScannerEngine.kt
@@ -32,7 +32,7 @@ kotlinc app/src/main/java/Models.kt app/src/main/java/AnalyticsEngine.kt -d "$TM
 
 echo "[7/9] BCS API identity/rate-limit hardening"
 grep -q 'classCode: String = ""' app/src/main/java/Models.kt
-grep -q 'BCS_MIN_REQUEST_GAP_MS = 115L' app/src/main/java/MarketRepository.kt
+grep -q 'BCS_MIN_REQUEST_GAP_MS = 105L' app/src/main/java/MarketRepository.kt
 grep -q 'contains("HTTP 429")' app/src/main/java/MarketRepository.kt
 grep -q '"циан" to "CNRU"' app/src/main/java/MarketRepository.kt
 
