@@ -131,13 +131,15 @@ class ScannerForegroundService : Service() {
         executor.execute {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val universe = runCatching { ScannerEngine.Universe.valueOf(universeName) }.getOrDefault(ScannerEngine.Universe.ALL)
-            val timeframes = listOf("15M", "1H", "4H", "1D", "1W")
+            val timeframes = tfString.split(',').map { it.trim().uppercase() }
+                .filter { it in setOf("15M", "1H", "4H", "1D", "1W") }.distinct()
+                .ifEmpty { listOf("15M", "1H", "4H", "1D", "1W") }
             val token = getSharedPreferences("mfprefs", MODE_PRIVATE).getString("bcs_refresh_token", "").orEmpty()
             val repo = MarketRepository(bcsRefreshToken = token.ifBlank { null }, prefs = getSharedPreferences("mfprefs", MODE_PRIVATE), context = this)
             val favorites = getSharedPreferences("mfprefs", MODE_PRIVATE).getStringSet("favorites", emptySet()).orEmpty()
             try {
                 ScannerEngine(repo).scan(
-                    ScannerEngine.Config(universe = universe, timeframes = timeframes, workers = if (universe == ScannerEngine.Universe.ALL) 6 else 4),
+                    ScannerEngine.Config(universe = universe, timeframes = timeframes, workers = 8),
                     favorites = favorites,
                     cancelled = cancelled,
                     onProgress = { pr ->

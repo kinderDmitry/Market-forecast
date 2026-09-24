@@ -52,7 +52,7 @@ class MarketRepository(
         // requests can run concurrently from UI/workers.
         private val bcsHttpGate = Any()
         private var bcsLastRequestAt = 0L
-        private const val BCS_MIN_REQUEST_GAP_MS = 115L
+        private const val BCS_MIN_REQUEST_GAP_MS = 105L
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
@@ -61,11 +61,13 @@ class MarketRepository(
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         private const val SEARCH_CACHE_MS = 10 * 60_000L
         private const val SEARCH_INDEX_PREFS = "mfp_search_index_v3_full_bcs"
-        private const val SEARCH_INDEX_MAX = 50000
+        private const val SEARCH_INDEX_MAX = 100000
+        private const val BCS_CATALOG_FILE = "bcs_catalog_v2.json"
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.107"
     private val searchEngine = InstrumentSearchEngine(popularSeeds()).also { engine ->
         loadSearchIndex().forEach { engine.addAll(listOf(it)) }
+        loadCatalogDisk().forEach { engine.addAll(listOf(it)) }
     }
 
     /** Immediate local suggestions. These never claim to be authoritative quotes. */
@@ -86,6 +88,42 @@ class MarketRepository(
                 }
             }
         }.getOrDefault(emptyList())
+    }
+
+    private fun loadCatalogDisk(): List<SearchResult> {
+        val file = context?.getFileStreamPath(BCS_CATALOG_FILE) ?: return emptyList()
+        if (!file.exists() || file.length() == 0L) return emptyList()
+        return runCatching {
+            val a = JSONArray(file.readText(Charsets.UTF_8))
+            buildList {
+                for (i in 0 until a.length()) {
+                    val o = a.optJSONObject(i) ?: continue
+                    val symbol = o.optString("symbol").trim()
+                    if (symbol.isBlank()) continue
+                    add(SearchResult(symbol, o.optString("name", symbol), o.optString("exchange", "БКС"), o.optString("type", "STOCK"), "БКС", o.optString("classCode")))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun persistCatalogDisk(values: Collection<SearchResult>) {
+        val file = context?.getFileStreamPath(BCS_CATALOG_FILE) ?: return
+        val tmp = context.getFileStreamPath("$BCS_CATALOG_FILE.tmp")
+        val unique = LinkedHashMap<String, SearchResult>()
+        values.asSequence()
+            .filter { it.source == "БКС" && allowedScannerType(it.type) }
+            .forEach { unique.putIfAbsent(catalogIdentity(it), it) }
+        val a = JSONArray()
+        unique.values.forEach { r ->
+            a.put(JSONObject().apply {
+                put("symbol", r.symbol); put("name", r.name); put("exchange", r.exchange); put("type", r.type); put("classCode", r.classCode)
+            })
+        }
+        runCatching {
+            tmp.writeText(a.toString(), Charsets.UTF_8)
+            if (file.exists()) file.delete()
+            tmp.renameTo(file)
+        }
     }
 
     private fun rememberSearchResults(values: Collection<SearchResult>, persist: Boolean = false) {
@@ -327,7 +365,9 @@ class MarketRepository(
         }
 
         // Persist the complete BCS-derived metadata index once, after the sequential API pass.
-        runCatching { rememberSearchResults(searchEngine.all().filter { it.source == "БКС" }, persist = true) }
+        val bcsTradingCatalog = searchEngine.all().filter { it.source == "БКС" && allowedScannerType(it.type) }
+        runCatching { rememberSearchResults(bcsTradingCatalog, persist = true) }
+        runCatching { persistCatalogDisk(bcsTradingCatalog) }
         return emitted
     }
 
@@ -522,7 +562,6 @@ class MarketRepository(
             if (arr.length() == 0) break
             page++
             if (page >= 2000) throw IllegalStateException("БКС: превышен безопасный предел страниц каталога")
-            Thread.sleep(40L)
         }
         return out.values.toList()
     }

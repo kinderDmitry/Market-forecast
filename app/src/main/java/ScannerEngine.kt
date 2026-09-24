@@ -21,7 +21,7 @@ class ScannerEngine(private val repo: MarketRepository) {
     data class Config(
         val universe: Universe = Universe.ALL,
         val timeframes: List<String> = listOf("15M", "1H", "4H", "1D", "1W"),
-        val workers: Int = 6,
+        val workers: Int = 8,
         val minimumConfidence: Int = 68,
         // AnalyticsEngine score is normalized to -10..+10, not -100..+100.
         // The old 55 threshold made every scanner result impossible.
@@ -67,9 +67,10 @@ class ScannerEngine(private val repo: MarketRepository) {
         val tfs = config.timeframes.distinct().filter { it in setOf("15M", "1H", "4H", "1D", "1W") }
         require(tfs.isNotEmpty()) { "Выберите хотя бы один таймфрейм" }
 
-        val queue = Executors.newFixedThreadPool(config.workers.coerceIn(1, 6))
+        val workerCount = config.workers.coerceIn(1, 8)
+        val queue = Executors.newFixedThreadPool(workerCount)
         val completion = Phaser(1)
-        val maxInFlight = config.workers.coerceIn(1, 6) * 2
+        val maxInFlight = workerCount * 2
         val permits = Semaphore(maxInFlight)
         val discovered = AtomicInteger(0)
         val completed = AtomicInteger(0)
