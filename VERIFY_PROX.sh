@@ -10,8 +10,8 @@ test -f app/src/main/java/MainActivity.kt
 test -f app/src/main/java/AnalyticsEngine.kt
 
 echo "[2/6] Version"
-grep -q 'versionCode = 158' app/build.gradle.kts
-grep -q 'versionName = "4.8.119"' app/build.gradle.kts
+grep -q 'versionCode = 159' app/build.gradle.kts
+grep -q 'versionName = "4.8.120"' app/build.gradle.kts
 
 echo "[3/6] Search + streaming scanner architecture"
 test -f app/src/main/java/ScannerEngine.kt
