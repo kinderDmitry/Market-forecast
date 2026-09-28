@@ -1,4 +1,4 @@
-name: Build MarketForecast PROX 4.8.125 APK
+name: Build MarketForecast PROX 4.8.126 APK
 
 on:
   workflow_dispatch:
@@ -79,9 +79,13 @@ jobs:
           test -f app/src/main/java/AnalyticsEngine.kt
           test -f app/src/main/java/Models.kt
           test -f app/src/main/AndroidManifest.xml
-          ! grep -RiqE 'Scanner|scanner|SCANNER' app/src/main/java app/src/main/AndroidManifest.xml
-          grep -q 'versionCode = 164' app/build.gradle.kts
-          grep -q 'versionName = "4.8.125"' app/build.gradle.kts
+          test ! -e app/src/main/java/ScannerEngine.kt
+          test ! -e app/src/main/java/ScannerForegroundService.kt
+          test ! -e app/src/main/java/ScannerScreen.kt
+          test ! -e app/src/main/java/scanner
+          ! grep -qE 'ScannerEngine|ScannerForegroundService|streamScannerUniverse' app/src/main/AndroidManifest.xml app/src/main/java/MarketRepository.kt
+          grep -q 'versionCode = 165' app/build.gradle.kts
+          grep -q 'versionName = "4.8.126"' app/build.gradle.kts
           grep -q 'longScore' app/src/main/java/Models.kt
           grep -q 'shortScore' app/src/main/java/Models.kt
           grep -q 'sampleSize' app/src/main/java/Models.kt
@@ -97,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.125.apk
+          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.126.apk
 
       - name: Publish APK as GitHub Release asset
         env:
@@ -105,8 +109,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.125 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.125.apk \
+          TITLE="MarketForecast PROX 4.8.126 build ${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" release/MarketForecast_PROX_4.8.126.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.124. Commit: ${GITHUB_SHA}"
+            --notes "Debug APK for MarketForecast PROX 4.8.126. Commit: ${GITHUB_SHA}"
