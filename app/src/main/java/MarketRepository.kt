@@ -499,7 +499,12 @@ class MarketRepository(
         "YDEX" to "Яндекс", "OZON" to "Ozon", "CNRU" to "ЦИАН", "AFLT" to "Аэрофлот",
         "VTBR" to "ВТБ", "MTSS" to "МТС", "GMKN" to "Норникель", "PLZL" to "Полюс",
         "PHOR" to "ФосАгро", "RTKM" to "Ростелеком", "ALRS" to "АЛРОСА", "FLOT" to "Совкомфлот",
-        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "USD000UTSTOM" to "Доллар / Рубль",
+        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "TCSG" to "Т-Банк", "HEAD" to "HeadHunter",
+        "VKCO" to "VK", "RUAL" to "РУСАЛ", "SNGS" to "Сургутнефтегаз", "SNGSP" to "Сургутнефтегаз-п",
+        "CHMF" to "Северсталь", "NLMK" to "НЛМК", "MAGN" to "ММК", "PIKK" to "ПИК",
+        "ASTR" to "Астра", "SOFL" to "Софтлайн", "BELU" to "Белуга", "MVID" to "М.Видео",
+        "AFKS" to "АФК Система", "HYDR" to "РусГидро", "FEES" to "Россети",
+        "USD000UTSTOM" to "Доллар / Рубль",
         "EUR_RUB__TOM" to "Евро / Рубль", "CNYRUB_TOM" to "Юань / Рубль"
     ).map { (symbol, name) ->
         SearchResult(symbol, name, "БКС", if (symbol in setOf("USD000UTSTOM", "EUR_RUB__TOM", "CNYRUB_TOM")) "CURRENCY" else "STOCK", "БКС")

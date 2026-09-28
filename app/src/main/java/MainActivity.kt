@@ -310,12 +310,20 @@ fun MarketForecastApp(ctx: Context) {
             results = local
         }
 
-        delay(260)
+        // Start authoritative BCS lookup immediately after the first character.
+        // Local index is already rendered above; cancellation guarantees that fast typing
+        // cannot let an older network response overwrite the current query.
         searching = true
         val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested, requestedFilter) }.getOrDefault(emptyList()) }
         if (query.trim().equals(requested, true) && searchFilter == requestedFilter) {
             if (found.isNotEmpty()) results = found
-            message = if (ru) "Поиск БКС обновлён: найдено ${if (found.isNotEmpty()) found.size else results.size}" else "BCS search updated: ${if (found.isNotEmpty()) found.size else results.size} found"
+            message = if (found.isNotEmpty()) {
+                if (ru) "БКС: ${found.size} результатов" else "BCS: ${found.size} results"
+            } else if (results.isNotEmpty()) {
+                if (ru) "Показаны быстрые результаты" else "Fast results shown"
+            } else {
+                if (ru) "В БКС ничего не найдено" else "Nothing found in BCS"
+            }
         }
         searching = false
     }
