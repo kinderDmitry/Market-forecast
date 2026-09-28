@@ -292,6 +292,29 @@ class MarketRepository(
         return out.values.toList()
     }
 
+    /** Types retained by the BCS identity catalogue used by search and market widgets.
+     * This is deliberately independent of the removed mass-market subsystem.
+     */
+    private fun isSupportedCatalogType(type: String): Boolean {
+        val t = type.uppercase(Locale.US)
+        return t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY") ||
+            t.contains("FOREX")
+    }
+
+    /** Streams the authoritative BCS instrument catalogue for search/market widgets.
+     * This serves the search/catalogue layer only; it has no background scanning state or side effects.
+     */
+    private fun instrumentCatalogStream(type: String, onInstrument: (SearchResult) -> Unit) {
+        val types = when (type.uppercase(Locale.US)) {
+            "FX", "CURRENCY" -> listOf("CURRENCY")
+            "STOCKS", "STOCK" -> listOf("STOCK")
+            else -> listOf("STOCK", "CURRENCY")
+        }
+        for (instrumentType in types) {
+            loadCatalogType(instrumentType, Int.MAX_VALUE, onItem = onInstrument)
+        }
+    }
+
     /** Resolves selected favourites directly through BCS, without downloading a catalogue. */
     fun resolveSelectedInstrument(symbol: String, filter: String): SearchResult? {
         if (!isBcsConfigured()) return null

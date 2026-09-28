@@ -217,7 +217,7 @@ fun MarketForecastApp(ctx: Context) {
             // Entry/levels use the same canonical live price across timeframes.
             val candles = if (live > 0.0) mergeRealtimeCandle(candlesRaw, live, time, System.currentTimeMillis(), selected) else candlesRaw
             // One instrument only: fetch the real BCS higher/lower timeframe context in parallel.
-            // This replaces the old synthetic "MTF" approximation without reintroducing a scanner.
+            // This replaces the old synthetic "MTF" approximation without restoring the removed mass-market subsystem.
             val mtfContexts = withContext(Dispatchers.IO) {
                 val requests = listOf("15M" to ("60d" to "15m"), "1H" to ("2y" to "1h"), "4H" to ("2y" to "4h"), "1D" to ("5y" to "1d"), "1W" to ("10y" to "1wk"))
                 coroutineScope { requests.map { (name, pair) -> async { name to runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) } }.awaitAll().toMap().filterValues { it.size >= 40 } }
