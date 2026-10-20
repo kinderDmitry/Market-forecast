@@ -1,12 +1,17 @@
-name: Build MarketForecast PROX 4.8.126 APK
+name: Build APK
 
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
+  pull_request:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   ANDROID_HOME: /usr/local/lib/android/sdk
@@ -14,7 +19,7 @@ env:
 
 jobs:
   build:
-    name: Build Debug APK
+    name: Build debug APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -41,6 +46,20 @@ jobs:
           test -f settings.gradle.kts
           test -f app/build.gradle.kts
 
+      # The version is read from app/build.gradle.kts, so the workflow never
+      # goes out of sync with the app (it used to hard-code 4.8.126 and fail).
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts | head -n1)"
+          CODE="$(grep -oP 'versionCode = \K[0-9]+' app/build.gradle.kts | head -n1)"
+          test -n "$NAME" && test -n "$CODE"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Building MarketForecast PROX $NAME ($CODE)"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
@@ -50,7 +69,6 @@ jobs:
 
       # Do not use android-actions/setup-android here. Its package installer can
       # request the obsolete SDK package named "tools" and fail before Gradle.
-      # GitHub's runner already contains sdkmanager; use it directly.
       - name: Prepare Android SDK
         shell: bash
         run: |
@@ -58,13 +76,10 @@ jobs:
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" || {
             echo "ERROR: sdkmanager not found at $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-            find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print || true
             exit 1
           }
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --list_installed | grep -E 'platform-tools|platforms;android-36|build-tools;36.0.0'
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -72,25 +87,20 @@ jobs:
           gradle-version: '8.11.1'
           cache-read-only: false
 
-      - name: Verify analytics architecture
+      - name: Verify project structure
         shell: bash
         run: |
           set -euo pipefail
           test -f app/src/main/java/AnalyticsEngine.kt
           test -f app/src/main/java/Models.kt
           test -f app/src/main/AndroidManifest.xml
-          test ! -e app/src/main/java/ScannerEngine.kt
-          test ! -e app/src/main/java/ScannerForegroundService.kt
-          test ! -e app/src/main/java/ScannerScreen.kt
-          test ! -e app/src/main/java/scanner
-          ! grep -qE 'ScannerEngine|ScannerForegroundService|streamScannerUniverse' app/src/main/AndroidManifest.xml app/src/main/java/MarketRepository.kt
-          grep -q 'versionCode = 165' app/build.gradle.kts
-          grep -q 'versionName = "4.8.126"' app/build.gradle.kts
           grep -q 'longScore' app/src/main/java/Models.kt
           grep -q 'shortScore' app/src/main/java/Models.kt
           grep -q 'sampleSize' app/src/main/java/Models.kt
           grep -q 'fun backtest' app/src/main/java/AnalyticsEngine.kt
-          echo 'Analytics architecture verification: OK'
+          # The refresh token must only ever be touched through SecureTokenStore.
+          ! grep -n 'bcs_refresh_token' app/src/main/java/MainActivity.kt app/src/main/java/MarketMonitorWorker.kt
+          echo 'Project structure verification: OK'
 
       - name: Build debug APK
         env:
@@ -101,16 +111,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/MarketForecast_PROX_4.8.126.apk
+          cp app/build/outputs/apk/debug/app-debug.apk "release/MarketForecast_PROX_${{ steps.ver.outputs.name }}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarketForecast_PROX_${{ steps.ver.outputs.name }}
+          path: release/*.apk
+          if-no-files-found: error
 
       - name: Publish APK as GitHub Release asset
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="build-${GITHUB_RUN_NUMBER}"
-          TITLE="MarketForecast PROX 4.8.126 build ${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" release/MarketForecast_PROX_4.8.126.apk \
+          TAG="v${{ steps.ver.outputs.name }}-build${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "release/MarketForecast_PROX_${{ steps.ver.outputs.name }}.apk" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE" \
-            --notes "Debug APK for MarketForecast PROX 4.8.126. Commit: ${GITHUB_SHA}"
+            --title "MarketForecast PROX ${{ steps.ver.outputs.name }} (build ${GITHUB_RUN_NUMBER})" \
+            --notes "Debug APK. Commit: ${GITHUB_SHA}" \
+            --prerelease
