@@ -606,12 +606,20 @@ object AnalyticsEngine {
             if (f != null && f.signal != "NO TRADE") {
                 val dir = if (f.signal == "LONG") 1 else -1
                 val horizon = c.subList(i, min(i+8,c.size))
-                val hit = if (dir>0) horizon.any { it.high >= f.tp1 } else horizon.any { it.low <= f.tp1 }
-                val stop = if (dir>0) horizon.any { it.low <= f.stop } else horizon.any { it.high >= f.stop }
-                if (hit && !stop) wins++ else if (!hit && !stop) {
-                    val end = horizon.last().close
-                    if ((dir>0 && end>f.entry) || (dir<0 && end<f.entry)) wins++
+                // Walk the horizon bar by bar so the ORDER of events matters: a stop touched first is a loss,
+                // TP1 touched first is a win. A bar touching both is resolved as STOP, exactly like TrackingEngine.
+                var outcome = 0
+                for (bar in horizon) {
+                    val stopHit = if (dir > 0) bar.low <= f.stop else bar.high >= f.stop
+                    val tpHit = if (dir > 0) bar.high >= f.tp1 else bar.low <= f.tp1
+                    if (stopHit) { outcome = -1; break }
+                    if (tpHit) { outcome = 1; break }
                 }
+                if (outcome == 0) {
+                    val end = horizon.last().close
+                    if ((dir > 0 && end > f.entry) || (dir < 0 && end < f.entry)) outcome = 1
+                }
+                if (outcome == 1) wins++
                 total++
             }
             i += 8

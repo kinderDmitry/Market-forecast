@@ -17,12 +17,14 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
         val p = applicationContext.getSharedPreferences("mfprefs", Context.MODE_PRIVATE)
         val ru = p.getBoolean("ru", true)
         val repo = MarketRepository(
-            bcsRefreshToken = p.getString("bcs_refresh_token", "")?.ifBlank { null },
+            bcsRefreshToken = SecureTokenStore.get(p).ifBlank { null },
             prefs = p,
             context = applicationContext
         )
         val tracked = readTracked(p).toMutableList()
         val history = readHistory(p).toMutableList()
+        val trackedOriginal = tracked.toList()
+        val historyOriginal = history.toList()
         val now = System.currentTimeMillis()
         var retryNeeded = false
 
@@ -43,7 +45,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
         if (alertNews) {
             val latest = runCatching { repo.marketNews(30, ru, NewsCategory.ALL) }.getOrDefault(emptyList())
             if (latest.isNotEmpty()) p.edit().putString("news_cache", encodeNews(latest)).apply()
-            val seen = p.getStringSet("seen_news", emptySet()).orEmpty().toMutableSet()
+            val seen = OrderedKeyStore.load(p, "seen_news")
             if (seen.isEmpty()) {
                 latest.forEach { if (it.url.isNotBlank()) seen += it.url }
             } else {
@@ -54,14 +56,14 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                     seen += n.url
                 }
             }
-            p.edit().putStringSet("seen_news", seen.toList().takeLast(400).toSet()).apply()
+            OrderedKeyStore.save(p, "seen_news", seen)
         }
 
         // Dividend alerts use the same cache-first rule, so enabling the switch does not
         // generate a burst of notifications for the whole existing calendar.
         if (alertDividends) {
             val latest = runCatching { repo.dividendCalendar(limit = 80) }.getOrDefault(emptyList())
-            val seen = p.getStringSet("seen_dividends", emptySet()).orEmpty().toMutableSet()
+            val seen = OrderedKeyStore.load(p, "seen_dividends")
             if (seen.isEmpty()) {
                 latest.forEach { seen += "${it.symbol}|${it.date}|${it.amount}" }
             } else {
@@ -72,7 +74,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                     seen += "${d.symbol}|${d.date}|${d.amount}"
                 }
             }
-            p.edit().putStringSet("seen_dividends", seen.toList().takeLast(400).toSet()).apply()
+            OrderedKeyStore.save(p, "seen_dividends", seen)
         }
 
         // Each tracked forecast is evaluated independently. TP1/TP2/TP3/SL milestones
@@ -189,9 +191,12 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
             previous[symbol] = r.signal
         }
 
+        // Merge with whatever the UI stored while this (slow, network-bound) run was in progress.
+        val mergedTracked = TrackingMerge.mergeTracked(readTracked(p), trackedOriginal, tracked)
+        val mergedHistory = TrackingMerge.mergeHistory(readHistory(p), historyOriginal, history)
         p.edit()
-            .putString("tracked", encodeTracked(tracked))
-            .putString("forecast_history", encodeHistory(history))
+            .putString("tracked", encodeTracked(mergedTracked))
+            .putString("forecast_history", encodeHistory(mergedHistory))
             .putString("favorite_signals", encodeSignalMap(previous))
             .putString("favorite_prices", encodePriceMap(previousPrices))
             .putLong("monitor_last_run", now)
