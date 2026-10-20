@@ -1,0 +1,20 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Release signing material (the debug keystore in /signing is intentionally tracked)
+*.jks
+*.keystore
+!signing/mfp-debug.keystore
+keystore.properties
+
+# Unpacked uploads used by the CI "Locate Gradle project" step
+.mfp_unpack/
