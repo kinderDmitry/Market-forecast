@@ -165,7 +165,7 @@ internal class ScannerController(
 
     val newCount: Int get() = hits.count { it.isNew }
 
-    fun setAutoStart(value: Boolean) {
+    fun changeAutoStart(value: Boolean) {
         autoStart = value
         prefs.edit().putBoolean(PREF_AUTO, value).apply()
     }

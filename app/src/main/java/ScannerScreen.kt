@@ -131,7 +131,7 @@ internal fun ScannerScreen(
         item {
             GradientCard(Modifier.fillMaxWidth()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(30.dp))
+                    Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(30.dp).pulse(c.running))
                     Column(Modifier.weight(1f).padding(start = 10.dp)) {
                         Text(if (ru) "Сканер прогнозов" else "Forecast scanner", fontWeight = FontWeight.Black, fontSize = 18.sp)
                         Text(
@@ -159,7 +159,7 @@ internal fun ScannerScreen(
                 }
                 if (c.running) {
                     val fraction = if (c.total > 0) c.done.toFloat() / c.total.toFloat() else 0f
-                    LinearProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().padding(top = 12.dp))
+                    GlowProgressBar(fraction, Modifier.fillMaxWidth().padding(top = 12.dp))
                     val elapsed = ((now - c.startedAt) / 1000).coerceAtLeast(1)
                     val eta = if (c.done >= 12 && c.total > c.done) (elapsed * (c.total - c.done) / c.done) else -1L
                     Text(
@@ -194,7 +194,7 @@ internal fun ScannerScreen(
                         if (ru) "Искать новые прогнозы при открытии сканера" else "Look for new forecasts when the scanner opens",
                         fontSize = 12.sp, modifier = Modifier.weight(1f)
                     )
-                    Switch(checked = c.autoStart, onCheckedChange = { c.setAutoStart(it) })
+                    Switch(checked = c.autoStart, onCheckedChange = { c.changeAutoStart(it) })
                 }
             }
         }
@@ -287,14 +287,14 @@ internal fun ScannerScreen(
 @Composable
 private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, onOpen: () -> Unit, onFav: () -> Unit) {
     val color = signalColor(h.signal)
-    GradientCard(Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
+    GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
                     if (h.isNew) {
                         Spacer(Modifier.width(8.dp))
-                        Tag(if (h.prevSignal.isBlank()) "NEW" else (if (ru) "СМЕНА" else "FLIP"), Accent)
+                        Tag(if (h.prevSignal.isBlank()) "NEW" else (if (ru) "СМЕНА" else "FLIP"), Accent, pulse = true)
                     }
                 }
                 Text(
@@ -321,13 +321,14 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, onOpen: () -> Unit, o
 }
 
 @Composable
-private fun Tag(text: String, color: Color) {
+private fun Tag(text: String, color: Color, pulse: Boolean = false) {
     Text(
         text,
         color = color,
         fontSize = 11.sp,
         fontWeight = FontWeight.Black,
         modifier = Modifier
+            .pulse(pulse, 0.94f)
             .clip(RoundedCornerShape(50))
             .background(color.copy(alpha = 0.14f))
             .padding(horizontal = 9.dp, vertical = 4.dp)
@@ -346,9 +347,9 @@ private fun Metric(label: String, value: String, color: Color) {
 @Composable
 internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> Unit, onStart: () -> Unit) {
     if (c == null) return
-    GradientCard(Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
+    GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(28.dp))
+            Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(28.dp).pulse(c.running))
             Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                 Text(if (ru) "Сканер рынка" else "Market scanner", fontWeight = FontWeight.Black, fontSize = 15.sp)
                 val status = when {
@@ -368,10 +369,7 @@ internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> 
             }
         }
         if (c.running && c.total > 0) {
-            LinearProgressIndicator(
-                progress = { (c.done.toFloat() / c.total.toFloat()).coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
-            )
+            GlowProgressBar(c.done.toFloat() / c.total.toFloat(), Modifier.fillMaxWidth().padding(top = 10.dp))
         }
         val top = c.hits.take(3)
         if (top.isNotEmpty()) {

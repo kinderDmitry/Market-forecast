@@ -95,19 +95,19 @@ import kotlin.math.log10
 import kotlin.math.pow
 
 internal val Accent = Color(0xFF0066D6)
-private val Accent2 = Color(0xFF003A82)
+internal val Accent2 = Color(0xFF003A82)
 private val Blue = Color(0xFF145EA8)
 internal val Positive = Color(0xFF00D084)
 internal val Negative = Color(0xFFFF4757)
 internal val Warning = Color(0xFFFFA502)
 private val DarkBg = Color(0xFF000000)
-private val DarkCard = Color(0xFF05080C)
-private val DarkLine = Color(0xFF0059C7)
+internal val DarkCard = Color(0xFF05080C)
+internal val DarkLine = Color(0xFF0059C7)
 private val LightBg = Color(0xFFF5F7FA)
 private val LightText = Color(0xFF15121F)
 private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
-private val DarkMuted = Color(0xFF8FA7B8)
+internal val DarkMuted = Color(0xFF8FA7B8)
 
 private enum class Screen { HOME, SEARCH, SCANNER, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
@@ -122,6 +122,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
+    remember(prefs) { UiPrefs.animations = prefs.getBoolean("ui_animations", true); true }
     val scope = rememberCoroutineScope()
     var tokenVersion by remember { mutableIntStateOf(0) }
     val bcsToken = remember(tokenVersion) { SecureTokenStore.get(prefs) }
@@ -500,16 +501,26 @@ fun MarketForecastApp(ctx: Context) {
 
     val scheme = darkColorScheme(
         primary = Accent,
-        onPrimary = Color.Black,
+        onPrimary = Color.White,
+        primaryContainer = Color(0xFF0A2A52),
+        onPrimaryContainer = Color(0xFFD6E8FF),
         secondary = Accent2,
         onSecondary = Color.White,
+        secondaryContainer = Color(0xFF0A2A52),
+        onSecondaryContainer = Color(0xFFD6E8FF),
         tertiary = Blue,
         background = DarkBg,
         surface = DarkCard,
         surfaceVariant = Color(0xFF03070D),
+        surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF04080E),
+        surfaceContainer = Color(0xFF070D16),
+        surfaceContainerHigh = Color(0xFF0B1320),
+        surfaceContainerHighest = Color(0xFF101B2D),
         onBackground = DarkText,
         onSurface = DarkText,
         onSurfaceVariant = DarkMuted,
+        error = Negative,
         outline = DarkLine,
         outlineVariant = DarkLine.copy(alpha = 0.45f)
     )
@@ -532,14 +543,14 @@ fun MarketForecastApp(ctx: Context) {
             dismissButton = { TextButton(onClick = { showPopupPermissionPrompt = false; prefs.edit().putBoolean("popup_prompt_done", true).apply() }) { Text(if (ru) "Позже" else "Later") } }
         )
     }
-    MaterialTheme(colorScheme = scheme) {
+    MaterialTheme(colorScheme = scheme, typography = MfpTypography, shapes = MfpShapes) {
         Scaffold(
             containerColor = Color.Transparent,
             topBar = {
                 if (screen != Screen.HOME && screen != Screen.NEWS_DETAIL) {
                     TopAppBar(
                         title = { BrandWordmark(screenTitle(screen, ru)) },
-                        navigationIcon = { IconButton(onClick = { screen = Screen.HOME }) { Icon(Icons.Default.ArrowBack, contentDescription = null, tint = Accent) } },
+                        navigationIcon = { IconButton(onClick = { screen = Screen.HOME }) { Box(Modifier.size(36.dp).clip(CircleShape).background(Accent.copy(alpha = 0.16f)).border(1.dp, DarkLine.copy(alpha = 0.8f), CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.ArrowBack, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp)) } } },
                         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
                     )
                 }
@@ -548,8 +559,9 @@ fun MarketForecastApp(ctx: Context) {
         ) { pad ->
             Box(Modifier.fillMaxSize().padding(pad)) {
                 CosmicBackground()
+                AuroraGlow()
                 Box(Modifier.fillMaxSize()) {
-                AnimatedContent(targetState = screen, label = "screen") { s ->
+                AnimatedContent(targetState = screen, transitionSpec = { screenTransition(targetState.ordinal >= initialState.ordinal) }, label = "screen") { s ->
                     when (s) {
                         Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav, { tokenVersion++ }) { load(it.symbol) }
@@ -632,12 +644,13 @@ private fun BrandWordmark(subtitle: String = "") {
 
 @Composable
 private fun BrandHero(ru: Boolean) {
-    // Minimal home header: logo only. The old "Market Forecast" title is intentionally removed.
-    Box(Modifier.fillMaxWidth().padding(vertical = 2.dp), contentAlignment = Alignment.Center) {
+    // Minimal home header: logo only, on a breathing halo.
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        GlowHalo(Modifier.size(170.dp))
         Image(
             painter = painterResource(R.drawable.mfp_icon),
             contentDescription = "App logo",
-            modifier = Modifier.size(86.dp).clip(RoundedCornerShape(24.dp)),
+            modifier = Modifier.size(86.dp).entrance().clip(RoundedCornerShape(24.dp)),
             contentScale = ContentScale.Crop
         )
     }
@@ -752,7 +765,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
                 Text(symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text(if (price > 0) fmt(price) else "—", fontSize = 18.sp, fontWeight = FontWeight.Black, color = Accent)
+                FlashPrice(price, if (price > 0) fmt(price) else "—", Accent, 18.sp)
                 Text(String.format(Locale.US, "%+.2f%%", changePct), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (changePct >= 0) Positive else Negative)
             }
         }
@@ -819,7 +832,7 @@ private fun forecastTimeframeColor(f: Forecast?): Color = when {
 @Composable
 private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Unit) {
     val f = state.forecast
-    GradientCard(Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
+    GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(if (ru) "АНАЛИТИЧЕСКИЙ ЦЕНТР" else "ANALYTICS CENTER", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Accent, letterSpacing = 1.4.sp)
@@ -850,10 +863,21 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
     }
 }
 
-@Composable private fun MarketPickCard(x: MarketPick, ru:Boolean, onOpen:()->Unit) { GradientCard(Modifier.width(190.dp).clickable(onClick=onOpen)) { Text(x.name.ifBlank{x.symbol},fontWeight=FontWeight.Black,fontSize=12.sp); Text(x.symbol.removeSuffix(".ME"),fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant); Text(fmt(x.price),fontSize=18.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=4.dp)); Text(String.format(Locale.US, "%+.2f%%", x.changePct), color = if (x.changePct >= 0) Positive else Negative, fontSize = 11.sp, fontWeight = FontWeight.Bold); Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){SignalPill(x.signal,signalColor(x.signal));Text("${x.confidence}%",color=Accent,fontWeight=FontWeight.Black,fontSize=12.sp)} } }
-@Composable private fun IndexCard(x: MarketIndex) { GradientCard(Modifier.width(150.dp)) { Text(x.name, fontWeight = FontWeight.Bold, fontSize = 12.sp); Text(fmt(x.price), fontSize = 17.sp, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 4.dp)); Text(String.format(Locale.US, "%+.2f%%", x.changePct), color = if (x.changePct >= 0) Positive else Negative, fontSize = 12.sp, fontWeight = FontWeight.Bold); Text(x.source, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
-@Composable private fun FavoriteChip(sym: String, repo: MarketRepository, ru: Boolean, onOpen: () -> Unit) { var p by remember(sym) { mutableStateOf<Double?>(null) }; LaunchedEffect(sym) { p = withContext(Dispatchers.IO) { runCatching { repo.quote(sym) }.getOrNull() } }; GradientCard(Modifier.width(150.dp).clickable(onClick = onOpen)) { Text(sym.removeSuffix(".ME"), fontWeight = FontWeight.Black); Text(if (p != null) fmt(p!!) else "—", fontSize = 17.sp, color = Accent, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 4.dp)); Text(if (ru) "Открыть прогноз →" else "Open forecast →", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
-@Composable private fun MarketCard(state: MarketState, ru: Boolean, prefs: android.content.SharedPreferences, onOpen: () -> Unit) { GradientCard(Modifier.fillMaxWidth().clickable(onClick = onOpen)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Column { Text(state.meta.shortName.ifBlank { state.symbol }, fontWeight = FontWeight.Black); Text(state.symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) CurrencyDisplay.format(state.livePrice, state.meta.currency, prefs) else "—", fontSize = 27.sp, fontWeight = FontWeight.Black, color = Accent) }; state.forecast?.let { SignalPill(it.signal, signalColor(it.signal)) } }; state.forecast?.let { Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) { StatBlock(if (ru) "Уверенность" else "Confidence", "${it.confidence}%", Accent); StatBlock(if (ru) "Оценка" else "Score", "%.1f".format(Locale.US, it.score), Blue); StatBlock(if (ru) "Риск/прибыль" else "R/R", "%.2f".format(Locale.US, it.rr), Warning); StatBlock(if (ru) "Режим рынка" else "Regime", it.regime, Positive) } } } }
+@Composable private fun MarketPickCard(x: MarketPick, ru:Boolean, onOpen:()->Unit) { GradientCard(Modifier.width(190.dp).tapCard(onClick=onOpen)) { Text(x.name.ifBlank{x.symbol},fontWeight=FontWeight.Black,fontSize=12.sp); Text(x.symbol.removeSuffix(".ME"),fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant); Text(fmt(x.price),fontSize=18.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=4.dp)); Text(String.format(Locale.US, "%+.2f%%", x.changePct), color = if (x.changePct >= 0) Positive else Negative, fontSize = 11.sp, fontWeight = FontWeight.Bold); Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){SignalPill(x.signal,signalColor(x.signal));Text("${x.confidence}%",color=Accent,fontWeight=FontWeight.Black,fontSize=12.sp)} } }
+@Composable private fun IndexCard(x: MarketIndex) {
+    val up = x.changePct >= 0
+    GradientCard(Modifier.width(150.dp)) {
+        Text(x.name, fontWeight = FontWeight.Bold, fontSize = 12.sp, maxLines = 1)
+        Text(fmt(x.price), fontSize = 17.sp, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(if (up) Icons.Default.ArrowUpward else Icons.Default.ArrowDownward, null, tint = if (up) Positive else Negative, modifier = Modifier.size(14.dp))
+            Text(String.format(Locale.US, "%+.2f%%", x.changePct), color = if (up) Positive else Negative, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        Text(x.source, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+@Composable private fun FavoriteChip(sym: String, repo: MarketRepository, ru: Boolean, onOpen: () -> Unit) { var p by remember(sym) { mutableStateOf<Double?>(null) }; LaunchedEffect(sym) { p = withContext(Dispatchers.IO) { runCatching { repo.quote(sym) }.getOrNull() } }; GradientCard(Modifier.width(150.dp).tapCard(onClick = onOpen)) { Text(sym.removeSuffix(".ME"), fontWeight = FontWeight.Black); Text(if (p != null) fmt(p!!) else "—", fontSize = 17.sp, color = Accent, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 4.dp)); Text(if (ru) "Открыть прогноз →" else "Open forecast →", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+@Composable private fun MarketCard(state: MarketState, ru: Boolean, prefs: android.content.SharedPreferences, onOpen: () -> Unit) { GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Column { Text(state.meta.shortName.ifBlank { state.symbol }, fontWeight = FontWeight.Black); Text(state.symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); FlashPrice(state.livePrice, if (state.livePrice > 0) CurrencyDisplay.format(state.livePrice, state.meta.currency, prefs) else "—", Accent, 27.sp) }; state.forecast?.let { SignalPill(it.signal, signalColor(it.signal)) } }; state.forecast?.let { Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) { StatBlock(if (ru) "Уверенность" else "Confidence", "${it.confidence}%", Accent); StatBlock(if (ru) "Оценка" else "Score", "%.1f".format(Locale.US, it.score), Blue); StatBlock(if (ru) "Риск/прибыль" else "R/R", "%.2f".format(Locale.US, it.rr), Warning); StatBlock(if (ru) "Режим рынка" else "Regime", it.regime, Positive) } } } }
 
 @Composable private fun Analysis(state: MarketState, ru: Boolean, tf: String, favorite: Boolean, favs: Set<String>, save: (Set<String>) -> Unit, onTf: (String) -> Unit, refresh: () -> Unit, track: () -> Boolean, tracked: List<TrackedForecast>, prefs: android.content.SharedPreferences) {
     val ctx = LocalContext.current
@@ -1070,7 +1094,7 @@ private fun regimeRu(regime: String): String = when (regime) {
         }
         items(filtered, key = { "${it.symbol}|${it.classCode}|${it.type}" }) { r ->
             val isFav = favs.contains(r.symbol)
-            GradientCard(Modifier.fillMaxWidth().clickable { searchHistory = saveSearchHistory(prefs, prefix); pick(r) }) {
+            GradientCard(Modifier.fillMaxWidth().tapCard { searchHistory = saveSearchHistory(prefs, prefix); pick(r) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(signalColor(if (r.type.contains("CURRENCY", true)) "LONG" else "NO TRADE").copy(alpha=.12f)),
@@ -1107,7 +1131,7 @@ private fun regimeRu(regime: String): String = when (regime) {
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("PRICE_ASC","PRICE_DESC","CONF_DESC").forEach { k -> FilterChip(selected=sort==k,onClick={sort=k},label={Text(if(ru) when(k){"PRICE_ASC"->"Цена ↑";"PRICE_DESC"->"Цена ↓";else->"Уверенность ↓"} else k,fontSize=11.sp)}) } } }
         if (sorted.isEmpty()) item { EmptyCard(if (ru) "Избранное пусто. Найди инструмент через Поиск." else "Favorites are empty. Find an instrument in Search.") }
         items(sorted, key={it.symbol}) { r ->
-            GradientCard(Modifier.fillMaxWidth().clickable { load(r.symbol) }) {
+            GradientCard(Modifier.fillMaxWidth().tapCard { load(r.symbol) }) {
                 Row(verticalAlignment=Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text(r.symbol.removeSuffix(".ME"), fontWeight=FontWeight.Black, fontSize=16.sp); Text(if(ru) "Live цена • уверенность ${r.confidence}%" else "Live price • confidence ${r.confidence}%", fontSize=11.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
                     Text(r.price?.let(::fmt) ?: "—", fontSize=18.sp, fontWeight=FontWeight.Black, color=Accent, modifier=Modifier.padding(end=6.dp))
@@ -1180,7 +1204,7 @@ private fun regimeRu(regime: String): String = when (regime) {
         movePct != null && movePct < 0 -> Negative
         else -> Warning
     }
-    GradientCard(Modifier.fillMaxWidth().clickable(onClick = open)) {
+    GradientCard(Modifier.fillMaxWidth().tapCard(onClick = open)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(t.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
@@ -1276,7 +1300,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     // closing price with today's live quote; live quotes belong only to Tracking.
     val elapsedEnd = if (h.result.isBlank()) System.currentTimeMillis() else (tracked.firstOrNull { it.symbol == h.symbol && it.createdAt == h.time }?.checkAt ?: h.time)
     val elapsed = (elapsedEnd - h.time).coerceAtLeast(0L)
-    GradientCard(Modifier.fillMaxWidth().clickable(onClick = open)) {
+    GradientCard(Modifier.fillMaxWidth().tapCard(onClick = open)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
@@ -1323,7 +1347,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 
 @Composable private fun NewsCard(n: NewsItem, ru: Boolean, openArticle: (String) -> Unit) {
-    GradientCard(Modifier.fillMaxWidth().clickable { if (n.url.isNotBlank()) openArticle(n.url) }) {
+    GradientCard(Modifier.fillMaxWidth().tapCard { if (n.url.isNotBlank()) openArticle(n.url) }) {
         Text(n.title, fontWeight = FontWeight.Bold, fontSize = 12.sp)
         if (n.instrument.isNotBlank()) Text("${if (ru) "Инструмент" else "Instrument"}: ${n.instrument.removeSuffix(".ME")}", color = Accent, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
         if (n.body.isNotBlank()) Text(n.body.take(420), fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1432,7 +1456,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     var alertSignal by remember{mutableStateOf(prefs.getBoolean("alert_signal",true))}; var alertNews by remember{mutableStateOf(prefs.getBoolean("alert_news",true))}; var alertDividends by remember{mutableStateOf(prefs.getBoolean("alert_dividends",true))}; var alertResult by remember{mutableStateOf(prefs.getBoolean("alert_result",true))}; var alertTp1 by remember{mutableStateOf(prefs.getBoolean("alert_tp1",true))}; var alertTp2 by remember{mutableStateOf(prefs.getBoolean("alert_tp2",true))}; var alertTp3 by remember{mutableStateOf(prefs.getBoolean("alert_tp3",true))}; var alertSl by remember{mutableStateOf(prefs.getBoolean("alert_sl",true))}; var alertPrice by remember{mutableStateOf(prefs.getBoolean("alert_price",false))}
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
-        item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang)}}
+        item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()}}}
         item{BcsConnectionSettings(ru,prefs,onTokenSaved)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
@@ -1450,17 +1474,42 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=12.sp);Switch(checked = value, onCheckedChange = on)}}
 
-@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.SCANNER to Icons.Default.AutoGraph,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.SCANNER->"Сканер";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.SCANNER->"Scanner";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=11.sp,maxLines=1,softWrap=false)})}}}
-@Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=12.sp)}}
-@Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){GradientCard(modifier.clickable(onClick=on)){Column(Modifier.padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(icon,null,tint=Accent,modifier=Modifier.size(22.dp));Text(title,fontWeight=FontWeight.Bold,fontSize=11.sp,modifier=Modifier.padding(top=5.dp))}}}
-@Composable internal fun SectionHeader(t:String,s:String){
-    Column {
-        Text(t,fontSize=17.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)))
-        if(s.isNotBlank()) Text(s,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){
+    MfpBottomBar(
+        listOf(
+            NavItem(Screen.HOME, Icons.Default.Home, if(ru)"Главная" else "Home"),
+            NavItem(Screen.SEARCH, Icons.Default.Search, if(ru)"Поиск" else "Search"),
+            NavItem(Screen.SCANNER, Icons.Default.AutoGraph, if(ru)"Сканер" else "Scanner"),
+            NavItem(Screen.FAVORITES, Icons.Default.Star, if(ru)"Избранное" else "Favorites"),
+            NavItem(Screen.HISTORY, Icons.Default.History, if(ru)"История" else "History"),
+            NavItem(Screen.SETTINGS, Icons.Default.Settings, if(ru)"Настройки" else "Settings")
+        ),
+        s, on
+    )
+}
+@Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){
+    val shape=RoundedCornerShape(18.dp)
+    Row(
+        Modifier.fillMaxWidth().entrance().clip(shape).tapCard(on)
+            .background(Brush.horizontalGradient(listOf(Color(0xFF08142A),Color.Black)))
+            .border(1.dp,Brush.horizontalGradient(listOf(DarkLine,Accent.copy(.45f))),shape)
+            .padding(horizontal=16.dp,vertical=15.dp),
+        verticalAlignment=Alignment.CenterVertically
+    ){
+        Icon(Icons.Default.Search,null,tint=Accent)
+        Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp).weight(1f),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=13.sp)
+        Icon(Icons.Default.AutoGraph,null,tint=Accent.copy(.7f),modifier=Modifier.size(18.dp))
     }
 }
-@Composable internal fun GradientCard(modifier:Modifier,content:@Composable ColumnScope.()->Unit){Card(modifier,shape=RoundedCornerShape(21.dp),colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface),border=androidx.compose.foundation.BorderStroke(1.2.dp,DarkLine.copy(.90f))){Column(Modifier.background(Brush.linearGradient(listOf(Accent.copy(.025f),Accent2.copy(.018f),Color.Transparent))).padding(15.dp),content=content)}}
-@Composable private fun SettingCard(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,value:String,on:()->Unit){GradientCard(Modifier.fillMaxWidth().clickable(onClick=on)){Row(verticalAlignment=Alignment.CenterVertically){Icon(icon,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(title,fontWeight=FontWeight.Bold);Text(value,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}}
+@Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){
+    CardSurface(modifier.tapCard(on),8.dp){
+        Column(Modifier.fillMaxWidth(),horizontalAlignment=Alignment.CenterHorizontally){
+            Box(Modifier.size(38.dp).clip(CircleShape).background(Accent.copy(.16f)),contentAlignment=Alignment.Center){Icon(icon,null,tint=Accent,modifier=Modifier.size(21.dp))}
+            Text(title,fontWeight=FontWeight.Bold,fontSize=11.sp,textAlign=TextAlign.Center,modifier=Modifier.padding(top=6.dp))
+        }
+    }
+}
+@Composable private fun SettingCard(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,value:String,on:()->Unit){GradientCard(Modifier.fillMaxWidth().tapCard(onClick=on)){Row(verticalAlignment=Alignment.CenterVertically){Icon(icon,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(title,fontWeight=FontWeight.Bold);Text(value,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}}
 @Composable private fun SettingGroup(title:String,content:@Composable ColumnScope.()->Unit){GradientCard(Modifier.fillMaxWidth()){Text(title,fontWeight=FontWeight.Bold,fontSize=12.sp,color=MaterialTheme.colorScheme.onSurface);Spacer(Modifier.height(7.dp));content()}}
 @Composable private fun MetricCard(title:String,value:String,color:Color,modifier:Modifier){
     Card(modifier,shape=RoundedCornerShape(17.dp),colors=CardDefaults.cardColors(containerColor=Color.Black),border=androidx.compose.foundation.BorderStroke(1.2.dp,DarkLine.copy(.82f))){
@@ -1472,13 +1521,13 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 @Composable internal fun EmptyCard(text:String){GradientCard(Modifier.fillMaxWidth()){Text(text,Modifier.padding(4.dp),fontSize=12.sp)}}
 @Composable private fun StatBlock(l:String,v:String,c:Color){Column{Text(l,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Text(v,fontSize=12.sp,fontWeight=FontWeight.Black,color=c)}}
-@Composable private fun SignalPill(s:String,c:Color){Box(Modifier.clip(RoundedCornerShape(50)).background(c.copy(.12f)).border(1.dp,c.copy(.35f),RoundedCornerShape(50)).padding(horizontal=9.dp,vertical=5.dp)){Text(s,color=c,fontSize=11.sp,fontWeight=FontWeight.Black)}}
+@Composable private fun SignalPill(s:String,c:Color){Row(Modifier.clip(RoundedCornerShape(50)).background(c.copy(.12f)).border(1.dp,c.copy(.4f),RoundedCornerShape(50)).padding(horizontal=10.dp,vertical=5.dp),verticalAlignment=Alignment.CenterVertically){PulseDot(c,6.dp,s.contains("LONG")||s.contains("SHORT"));Spacer(Modifier.width(4.dp));Text(s,color=c,fontSize=11.sp,fontWeight=FontWeight.Black)}}
 @Composable private fun PriceBadge(l:String,v:Double,c:Color){Column(horizontalAlignment=Alignment.CenterHorizontally){Text(l,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Text(fmt(v),fontSize=11.sp,fontWeight=FontWeight.Black,color=c)}}
 @Composable private fun LevelRow(l:String,v:Double,c:Color){Row(Modifier.fillMaxWidth().padding(vertical=4.dp),horizontalArrangement=Arrangement.SpaceBetween){Text(l,fontSize=11.sp);Text(fmt(v),fontWeight=FontWeight.Bold,color=c,fontSize=12.sp)}}
-@Composable private fun Loading(ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){CircularProgressIndicator(Modifier.size(22.dp),color=Accent);Text(if(ru)"Загрузка актуальных данных…" else "Loading live data…",Modifier.padding(start=10.dp),fontSize=12.sp)}}}
+@Composable private fun Loading(ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){PulseDot(Accent,8.dp);Text(if(ru)"Загрузка актуальных данных…" else "Loading live data…",Modifier.padding(start=10.dp),fontSize=12.sp)};Spacer(Modifier.height(12.dp));SkeletonLine(0.92f);Spacer(Modifier.height(8.dp));SkeletonLine(0.64f);Spacer(Modifier.height(8.dp));SkeletonLine(0.78f)}}
 @Composable private fun ErrorCard(s:String,ru:Boolean){GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Данные временно недоступны" else "Data temporarily unavailable",color=Negative,fontWeight=FontWeight.Bold);Text(s,fontSize=11.sp,modifier=Modifier.padding(top=5.dp))}}
 
-@Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier, shape = RoundedCornerShape(12.dp), color = Color.Black, contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
+@Composable private fun InAppNotice(text: String, modifier: Modifier = Modifier) { Surface(modifier.entrance(), shape = RoundedCornerShape(14.dp), color = Color(0xFF050B14), contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.2.dp, DarkLine.copy(.92f))) { Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) } }
 private fun loadFavoriteOrder(p: android.content.SharedPreferences, favs: Set<String>): List<String> = (p.getString("favorite_order", "").orEmpty().split("\n").filter { it.isNotBlank() }.filter { it in favs } + favs.filter { it !in p.getString("favorite_order", "").orEmpty().split("\n") }).distinct()
 private fun loadSearchHistory(p: android.content.SharedPreferences): List<String> = p.getString("search_history", "").orEmpty().split("\n").filter { it.isNotBlank() }.take(20)
 private fun saveSearchHistory(p: android.content.SharedPreferences, q: String): List<String> { val out = (listOf(q) + loadSearchHistory(p).filterNot { it.equals(q, true) }).take(20); p.edit().putString("search_history", out.joinToString("\n")).apply(); return out }
