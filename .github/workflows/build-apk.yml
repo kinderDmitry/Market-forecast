@@ -101,6 +101,7 @@ jobs:
           test -f app/src/main/java/MarketScanner.kt
           test -f app/src/main/java/ScannerScreen.kt
           test -f app/src/main/java/InstrumentSearchEngine.kt
+          test -f app/src/main/java/DesignSystem.kt
           # The refresh token must only ever be touched through SecureTokenStore.
           ! grep -n 'bcs_refresh_token' app/src/main/java/MainActivity.kt app/src/main/java/MarketMonitorWorker.kt
           echo 'Project structure verification: OK'
