@@ -94,12 +94,12 @@ import kotlin.math.roundToInt
 import kotlin.math.log10
 import kotlin.math.pow
 
-private val Accent = Color(0xFF0066D6)
+internal val Accent = Color(0xFF0066D6)
 private val Accent2 = Color(0xFF003A82)
 private val Blue = Color(0xFF145EA8)
-private val Positive = Color(0xFF00D084)
-private val Negative = Color(0xFFFF4757)
-private val Warning = Color(0xFFFFA502)
+internal val Positive = Color(0xFF00D084)
+internal val Negative = Color(0xFFFF4757)
+internal val Warning = Color(0xFFFFA502)
 private val DarkBg = Color(0xFF000000)
 private val DarkCard = Color(0xFF05080C)
 private val DarkLine = Color(0xFF0059C7)
@@ -109,7 +109,7 @@ private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
 private val DarkMuted = Color(0xFF8FA7B8)
 
-private enum class Screen { HOME, SEARCH, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
+private enum class Screen { HOME, SEARCH, SCANNER, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,8 +123,10 @@ class MainActivity : ComponentActivity() {
 fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
-    val bcsToken = SecureTokenStore.get(prefs)
+    var tokenVersion by remember { mutableIntStateOf(0) }
+    val bcsToken = remember(tokenVersion) { SecureTokenStore.get(prefs) }
     val repo = remember(bcsToken) { MarketRepository(bcsRefreshToken = bcsToken.ifBlank { null }, prefs = prefs, context = ctx) }
+    val scanner = remember(repo) { ScannerController(ctx.applicationContext, repo, prefs) }
     var ru by remember { mutableStateOf(prefs.getBoolean("ru", true)) }
     var interval by remember { mutableIntStateOf(prefs.getInt("notify_interval", 15).coerceAtLeast(15)) }
     var notifications by remember { mutableStateOf(prefs.getBoolean("notifications_enabled", false)) }
@@ -143,7 +145,7 @@ fun MarketForecastApp(ctx: Context) {
     val launchTarget = launchIntent?.getStringExtra("mfp_target")?.takeIf { fromNotification }
     var selected by remember { mutableStateOf(launchSymbol ?: prefs.getString("selected", "SBER") ?: "SBER") }
     var tf by remember { mutableStateOf(launchIntent?.getStringExtra("mfp_timeframe") ?: "1D") }
-    var screen by remember { mutableStateOf(when(launchTarget){"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;else->Screen.HOME}) }
+    var screen by remember { mutableStateOf(when(launchTarget){"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;"SCANNER"->Screen.SCANNER;else->Screen.HOME}) }
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
@@ -152,9 +154,6 @@ fun MarketForecastApp(ctx: Context) {
     var news by remember { mutableStateOf(loadCachedNews(prefs)) }
     var marketNews by remember { mutableStateOf(loadCachedNews(prefs)) }
     var newsCategory by remember { mutableStateOf(NewsCategory.ALL) }
-    var marketMode by remember { mutableStateOf(prefs.getString("market_today_mode", if(ru) "ПРОГНОЗЫ" else "FORECASTS") ?: if(ru) "ПРОГНОЗЫ" else "FORECASTS") }
-    var marketPicks by remember { mutableStateOf<List<MarketPick>>(emptyList()) }
-    var marketLoading by remember { mutableStateOf(true) }
     var refreshValue by remember { mutableIntStateOf(prefs.getInt("refresh_value", 15).coerceAtLeast(1)) }
     var refreshUnit by remember { mutableStateOf(prefs.getString("refresh_unit", "MIN") ?: "MIN") }
     var displayCurrency by remember { mutableStateOf(prefs.getString("display_currency", "RUB") ?: "RUB") }
@@ -170,6 +169,7 @@ fun MarketForecastApp(ctx: Context) {
 
     var showPopupPermissionPrompt by remember { mutableStateOf(false) }
 
+    fun startScanner() { scanner.start(scope, favorites) }
     fun saveFav(v: Set<String>) {
         favorites = v
         val current = favoriteOrder.filter { it in v }
@@ -271,14 +271,33 @@ fun MarketForecastApp(ctx: Context) {
             val secondary = withContext(Dispatchers.IO) {
                 val indexJob = async { runCatching { repo.marketIndices() }.getOrDefault(emptyList()) }
                 val newsJob = async { runCatching { repo.marketNews(30, ru, newsCategory) }.getOrDefault(emptyList()) }
-                val picksJob = async { runCatching { repo.marketToday(marketMode, 12) }.getOrDefault(emptyList()) }
-                Triple(indexJob.await(), newsJob.await(), picksJob.await())
+                indexJob.await() to newsJob.await()
             }
             indices = secondary.first
             if (secondary.second.isNotEmpty()) { marketNews = secondary.second; saveCachedNews(prefs, secondary.second) }
             else if (marketNews.isEmpty()) lastDataError = if (ru) "Новости временно не подгрузились" else "News could not be loaded"
-            marketPicks = secondary.third
-            marketLoading = false
+        }
+    }
+    // The BCS catalogue (every stock, foreign stock, receipt and currency) is stored on disk, so a normal
+    // launch is instant; a stale copy refreshes in the background and becomes searchable page by page.
+    LaunchedEffect(repo) {
+        scanner.restore()
+        CatalogStatus.size = withContext(Dispatchers.IO) { repo.catalogSize() }
+        if (repo.isBcsConfigured()) {
+            CatalogStatus.syncing = true
+            CatalogStatus.failed = false
+            withContext(Dispatchers.IO) { runCatching { repo.syncCatalog { CatalogStatus.size = maxOf(CatalogStatus.size, it) } } }
+            CatalogStatus.size = withContext(Dispatchers.IO) { repo.catalogSize() }
+            CatalogStatus.failed = CatalogStatus.size == 0
+            CatalogStatus.syncing = false
+        }
+    }
+    // Opening the scanner looks for new forecasts straight away when the last run is older than 30 minutes.
+    LaunchedEffect(screen) {
+        if (screen == Screen.SCANNER && scanner.autoStart && !scanner.running && repo.isBcsConfigured()) {
+            if (!scanner.hasBaseline) scanner.restore()
+            val stale = System.currentTimeMillis() - scanner.lastFinishedAt > ScannerController.AUTO_START_AFTER_MS
+            if (stale) scanner.start(scope, favorites)
         }
     }
     // Opening History always triggers an immediate monitor pass. This is intentionally
@@ -304,31 +323,17 @@ fun MarketForecastApp(ctx: Context) {
         if (q.isEmpty()) { results = emptyList(); searching = false; return@LaunchedEffect }
         val requested = q
         val requestedFilter = searchFilter
-
-        // Modern-search behaviour: render local suggestions immediately, then let
-        // the authoritative BCS resolver refresh them in the same coroutine.
-        // LaunchedEffect cancellation prevents an older query from overwriting a newer one.
-        val local = withContext(Dispatchers.Default) { repo.searchLocal(requested, requestedFilter) }
-        if (query.trim().equals(requested, true) && searchFilter == requestedFilter && local.isNotEmpty()) {
-            results = local
-        }
-
-        // Start authoritative BCS lookup immediately after the first character.
-        // Local index is already rendered above; cancellation guarantees that fast typing
-        // cannot let an older network response overwrite the current query.
+        // Stage 1: the in-memory index of the whole catalogue answers on every keystroke, with no network.
+        results = withContext(Dispatchers.Default) { repo.searchLocal(requested, requestedFilter) }
+        // Stage 2 (only after a short pause in typing): ask BCS for an exact ticker the index does not know yet.
+        delay(250)
         searching = true
-        val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested, requestedFilter) }.getOrDefault(emptyList()) }
-        if (query.trim().equals(requested, true) && searchFilter == requestedFilter) {
-            if (found.isNotEmpty()) results = found
-            message = if (found.isNotEmpty()) {
-                if (ru) "БКС: ${found.size} результатов" else "BCS: ${found.size} results"
-            } else if (results.isNotEmpty()) {
-                if (ru) "Показаны быстрые результаты" else "Fast results shown"
-            } else {
-                if (ru) "В БКС ничего не найдено" else "Nothing found in BCS"
-            }
+        try {
+            val found = withContext(Dispatchers.IO) { runCatching { repo.search(requested, requestedFilter) }.getOrDefault(emptyList()) }
+            if (query.trim().equals(requested, true) && searchFilter == requestedFilter && found.isNotEmpty()) results = found
+        } finally {
+            searching = false
         }
-        searching = false
     }
     LaunchedEffect(ru) {
         prefs.edit().putBoolean("ru", ru).apply()
@@ -339,7 +344,6 @@ fun MarketForecastApp(ctx: Context) {
         marketNews = withContext(Dispatchers.IO) { runCatching { repo.marketNews(30, ru, newsCategory) }.getOrDefault(emptyList()) }
     }
     LaunchedEffect(newsCategory) { marketNews = withContext(Dispatchers.IO) { runCatching { repo.marketNews(30, ru, newsCategory) }.getOrDefault(emptyList()) } }
-    LaunchedEffect(marketMode) { marketLoading = true; marketPicks = withContext(Dispatchers.IO) { runCatching { repo.marketToday(marketMode, 20) }.getOrDefault(emptyList()) }; marketLoading = false; prefs.edit().putString("market_today_mode", marketMode).apply() }
 
     // Poll only while the screen is visible; background tracking is handled by MarketMonitorWorker.
     var inForeground by remember { mutableStateOf(true) }
@@ -354,6 +358,7 @@ fun MarketForecastApp(ctx: Context) {
         lifecycle?.addObserver(observer)
         onDispose { lifecycle?.removeObserver(observer) }
     }
+    SideEffect { scanner.ru = ru; scanner.isForeground = { inForeground } }
     // One foreground refresh clock is the source of truth. Fast live work (quote/tracking)
     // is deliberately executed before slower news/market-ranking feeds so a slow source can
     // never make the chart appear frozen. Tracking candles are cached; every tick refreshes
@@ -466,12 +471,10 @@ fun MarketForecastApp(ctx: Context) {
                 val refreshResults = withContext(Dispatchers.IO) {
                     val newsJob = async { runCatching { repo.marketNews(30, ru, newsCategory) }.getOrNull() }
                     val indicesJob = async { runCatching { repo.marketIndices() }.getOrDefault(indices) }
-                    val picksJob = async { runCatching { repo.marketToday(marketMode, 20) }.getOrDefault(marketPicks) }
-                    Triple(newsJob.await(), indicesJob.await(), picksJob.await())
+                    newsJob.await() to indicesJob.await()
                 }
                 refreshResults.first?.let { if (it.isNotEmpty()) { marketNews = it; saveCachedNews(prefs, it) } }
                 indices = refreshResults.second
-                marketPicks = refreshResults.third
                 if (screen == Screen.ANALYSIS) {
                     val instrumentNews = withContext(Dispatchers.IO) { runCatching { repo.news(selected, 12, ru) }.getOrNull() }
                     if (!instrumentNews.isNullOrEmpty()) { news = instrumentNews; saveCachedNews(prefs, instrumentNews); state = state.copy(news = instrumentNews) }
@@ -541,18 +544,23 @@ fun MarketForecastApp(ctx: Context) {
                     )
                 }
             },
-            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.FAVORITES, Screen.HISTORY, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
+            bottomBar = { if (screen in setOf(Screen.HOME, Screen.SEARCH, Screen.SCANNER, Screen.FAVORITES, Screen.HISTORY, Screen.SETTINGS)) BottomNav(screen, ru) { screen = it } }
         ) { pad ->
             Box(Modifier.fillMaxSize().padding(pad)) {
                 CosmicBackground()
                 Box(Modifier.fillMaxSize()) {
                 AnimatedContent(targetState = screen, label = "screen") { s ->
                     when (s) {
-                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, marketPicks, marketLoading, marketMode, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, { marketMode = it }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
-                        Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav) { load(it.symbol) }
+                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
+                        Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav, { tokenVersion++ }) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
-                        Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo)
+                        Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo, { tokenVersion++ })
+                        Screen.SCANNER -> ScannerScreen(
+                            scanner, favorites, ru, { load(it) },
+                            { sym -> if (favorites.any { it.equals(sym, true) }) saveFav(favorites.filterNot { it.equals(sym, true) }.toSet()) else saveFav(favorites + sym) },
+                            { startScanner() }
+                        )
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
@@ -596,7 +604,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; Screen.SCANNER -> if (ru) "📡 Сканер прогнозов" else "📡 Forecast scanner"; else -> "Market Forecast"
 }
 
 @Composable
@@ -636,10 +644,11 @@ private fun BrandHero(ru: Boolean) {
 }
 
 @Composable
-private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, picks: List<MarketPick>, marketLoading: Boolean, marketMode: String, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, setMarketMode: (String) -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
+private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, scanner: ScannerController, openScanner: () -> Unit, startScan: () -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
         item { BrandHero(ru) }
         item { SearchLauncher(ru, search) }
+        item { ScannerEntryCard(scanner, ru, openScanner, startScan) }
         item {
             SectionHeader(
                 if (ru) "АНАЛИТИЧЕСКИЙ ЦЕНТР" else "ANALYTICS CENTER",
@@ -999,7 +1008,7 @@ private fun regimeRu(regime: String): String = when (regime) {
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
 @Composable private fun TrackedForSymbol(tracked: List<TrackedForecast>, symbol: String, ru: Boolean) { val items = tracked.filter { it.symbol == symbol }.take(6); if (items.isEmpty()) return; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Отслеживание" else "Monitoring", "${items.size} • ${if (ru) "без дублей по TF" else "unique by timeframe"}"); items.forEach { t -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("${t.signal} • ${t.timeframe}", fontWeight = FontWeight.Bold, fontSize = 12.sp); Text(if (ru) "Вход ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}" else "Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(t.result, fontWeight = FontWeight.Black, fontSize = 11.sp, color = when(t.result){"PENDING"->Warning;"FLAT"->Warning;"FAIL"->Negative;else->Positive}) } } } }
 
-@Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, searchFilter: String, onFilterChange: (String) -> Unit, save: (Set<String>) -> Unit, pick: (SearchResult) -> Unit) {
+@Composable private fun SearchScreen(q: String, setQ: (String) -> Unit, results: List<SearchResult>, loading: Boolean, ru: Boolean, favs: Set<String>, searchFilter: String, onFilterChange: (String) -> Unit, save: (Set<String>) -> Unit, retryCatalog: () -> Unit, pick: (SearchResult) -> Unit) {
     val ctx = LocalContext.current
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
     var searchHistory by remember { mutableStateOf(loadSearchHistory(prefs)) }
@@ -1010,8 +1019,8 @@ private fun regimeRu(regime: String): String = when (regime) {
             GradientCard(Modifier.fillMaxWidth()) {
                 Text(if (ru) "🔎 Поиск инструмента" else "🔎 Instrument search", fontWeight = FontWeight.Black, fontSize = 16.sp)
                 Text(
-                    if (ru) "Начните с первой буквы — акции и валюты появятся сразу. Можно вводить русское или английское название/тикер."
-                    else "Type the first letter — stocks and currencies appear immediately. Russian or English names/tickers are supported.",
+                    if (ru) "Ищет по всему каталогу БКС: все акции и валюты. Результаты появляются с первой буквы, понимает русские и английские названия, неверную раскладку и опечатки."
+                    else "Searches the whole BCS catalogue of stocks and currencies. Results appear from the first letter; Russian and English names, wrong keyboard layout and typos are understood.",
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp)
                 )
@@ -1020,7 +1029,7 @@ private fun regimeRu(regime: String): String = when (regime) {
                     onValueChange = setQ,
                     modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
                     singleLine = true,
-                    placeholder = { Text(if (ru) "Например: с, s, циан, cian, usd…" else "For example: s, c, cian, usd…") },
+                    placeholder = { Text(if (ru) "Название или тикер: сбер, gazprom, usd…" else "Name or ticker: sber, gazprom, usd…") },
                     leadingIcon = { Icon(Icons.Default.Search, null) },
                     trailingIcon = { if (q.isNotEmpty()) IconButton({ setQ("") }) { Icon(Icons.Default.Close, if (ru) "Очистить" else "Clear") } },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -1037,6 +1046,7 @@ private fun regimeRu(regime: String): String = when (regime) {
                 }
             }
         }
+        item { CatalogStatusLine(ru, SecureTokenStore.get(prefs).isNotBlank(), retryCatalog) }
         if (prefix.isBlank() && searchHistory.isNotEmpty()) {
             item { SectionHeader(if (ru) "История поиска" else "Search history", if (ru) "Последние запросы" else "Recent searches") }
             items(searchHistory) { h ->
@@ -1054,11 +1064,11 @@ private fun regimeRu(regime: String): String = when (regime) {
                 )
             }
         }
-        if (loading) item { Loading(ru) }
+        if (loading && filtered.isEmpty()) item { Loading(ru) }
         if (!loading && prefix.isNotBlank() && filtered.isEmpty()) {
             item { EmptyCard(if (ru) "Ничего не найдено. Попробуйте другую букву, русское название или тикер." else "Nothing found. Try another letter, Russian name, or ticker.") }
         }
-        items(filtered.take(50), key = { "${it.symbol}|${it.type}" }) { r ->
+        items(filtered, key = { "${it.symbol}|${it.classCode}|${it.type}" }) { r ->
             val isFav = favs.contains(r.symbol)
             GradientCard(Modifier.fillMaxWidth().clickable { searchHistory = saveSearchHistory(prefs, prefix); pick(r) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1069,7 +1079,7 @@ private fun regimeRu(regime: String): String = when (regime) {
                     Column(Modifier.weight(1f).padding(start = 10.dp)) {
                         Text(r.name, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         Text(r.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 12.sp, color = Accent)
-                        Text("${r.exchange} • ${r.type} • ${r.source}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("${typeLabel(r.type, ru)} • ${r.classCode.ifBlank { r.exchange }}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     IconButton({ if (isFav) save(favs - r.symbol) else save(favs + r.symbol) }) { Icon(if (isFav) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }
                 }
@@ -1406,23 +1416,24 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun Stats(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean) { val done=history.filter{it.directionOk!=null};val wins=done.count{it.directionOk==true};val longs=history.count{it.signal.contains("LONG")};val shorts=history.count{it.signal.contains("SHORT")};val avg=if(history.isEmpty())0 else history.map{it.confidence}.average().roundToInt();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard(if(ru) "ПРОГНОЗЫ" else "FORECASTS",history.size.toString(),Accent,Modifier.weight(1f));MetricCard(if(ru) "УСПЕШНЫЕ" else "WINS",wins.toString(),Positive,Modifier.weight(1f));MetricCard(if(ru) "ТОЧНОСТЬ" else "ACCURACY",if(done.isEmpty())"—" else "${wins*100/done.size}%",Warning,Modifier.weight(1f))}};item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard("LONG",longs.toString(),Positive,Modifier.weight(1f));MetricCard("SHORT",shorts.toString(),Negative,Modifier.weight(1f));MetricCard(if(ru) "СРЕДНЯЯ УВЕРЕННОСТЬ" else "AVG CONF","$avg%",Blue,Modifier.weight(1f))}};item{GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Активные отслеживания" else "Active monitoring",fontWeight=FontWeight.Black);Text(tracked.count{it.result=="PENDING"}.toString(),fontSize=28.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=5.dp));Text(if(ru)"Уникальность обеспечивается парой инструмент + таймфрейм." else "Uniqueness is enforced by instrument + timeframe.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
 }
 
-@Composable private fun BcsConnectionSettings(ru:Boolean,prefs:android.content.SharedPreferences){
+@Composable private fun BcsConnectionSettings(ru:Boolean,prefs:android.content.SharedPreferences,onSaved:()->Unit){
     var token by remember { mutableStateOf(SecureTokenStore.get(prefs)) }
     var saved by remember { mutableStateOf(token.isNotBlank()) }
     SettingGroup(if(ru)"БКС" else "BCS"){
-        Text(if(ru)"Поиск акций и валют работает напрямую через API БКС. Каталог инструментов в приложении не загружается и не кэшируется." else "Stock and currency search uses the BCS API directly. No instrument catalogue is downloaded or cached in the app.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(if(ru)"Токен открывает полный каталог БКС: поиск по всем акциям и валютам, сканер прогнозов и рыночные данные. Каталог хранится на устройстве и обновляется раз в 12 часов." else "The token unlocks the full BCS catalogue: search across all stocks and currencies, the forecast scanner and market data. The catalogue is stored on the device and refreshed every 12 hours.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedTextField(value=token,onValueChange={token=it;saved=false},modifier=Modifier.fillMaxWidth().padding(top=8.dp),singleLine=true,label={Text(if(ru)"Refresh-токен БКС" else "BCS refresh token")},visualTransformation=PasswordVisualTransformation())
-        Button(onClick={SecureTokenStore.set(prefs,token);saved=token.isNotBlank()},enabled=token.isNotBlank(),modifier=Modifier.fillMaxWidth().padding(top=7.dp),shape=RoundedCornerShape(13.dp)){Text(if(ru)if(saved)"БКС подключён" else "Сохранить токен" else if(saved)"BCS connected" else "Save token",fontWeight=FontWeight.Black)}
+        Button(onClick={SecureTokenStore.set(prefs,token);saved=token.isNotBlank();onSaved()},enabled=token.isNotBlank(),modifier=Modifier.fillMaxWidth().padding(top=7.dp),shape=RoundedCornerShape(13.dp)){Text(if(ru)if(saved)"БКС подключён" else "Сохранить токен" else if(saved)"BCS connected" else "Save token",fontWeight=FontWeight.Black)}
         Text(if(token.isNotBlank()&&saved)if(ru)"Источник инструментов и рыночных данных: БКС API" else "Instrument and market-data source: BCS API" else if(ru)"Введите refresh-токен БКС с правами только для чтения." else "Enter a BCS read-only refresh token.",fontSize=11.sp,color=if(token.isNotBlank()&&saved)Positive else Warning,modifier=Modifier.padding(top=5.dp))
+        Box(Modifier.padding(top=6.dp)){CatalogStatusLine(ru,token.isNotBlank()&&saved,onSaved)}
     }
 }
-@Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit,repo:MarketRepository){
+@Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit,repo:MarketRepository,onTokenSaved:()->Unit){
     val ctx = LocalContext.current
     var alertSignal by remember{mutableStateOf(prefs.getBoolean("alert_signal",true))}; var alertNews by remember{mutableStateOf(prefs.getBoolean("alert_news",true))}; var alertDividends by remember{mutableStateOf(prefs.getBoolean("alert_dividends",true))}; var alertResult by remember{mutableStateOf(prefs.getBoolean("alert_result",true))}; var alertTp1 by remember{mutableStateOf(prefs.getBoolean("alert_tp1",true))}; var alertTp2 by remember{mutableStateOf(prefs.getBoolean("alert_tp2",true))}; var alertTp3 by remember{mutableStateOf(prefs.getBoolean("alert_tp3",true))}; var alertSl by remember{mutableStateOf(prefs.getBoolean("alert_sl",true))}; var alertPrice by remember{mutableStateOf(prefs.getBoolean("alert_price",false))}
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang)}}
-        item{BcsConnectionSettings(ru,prefs)}
+        item{BcsConnectionSettings(ru,prefs,onTokenSaved)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}
@@ -1439,16 +1450,16 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 }
 @Composable private fun AlertToggle(label:String,value:Boolean,on:(Boolean)->Unit){Row(Modifier.fillMaxWidth().padding(vertical=2.dp),verticalAlignment=Alignment.CenterVertically){Text(label,Modifier.weight(1f),fontSize=12.sp);Switch(checked = value, onCheckedChange = on)}}
 
-@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=11.sp)})}}}
+@Composable private fun BottomNav(s:Screen,ru:Boolean,on:(Screen)->Unit){NavigationBar{listOf(Screen.HOME to Icons.Default.Home,Screen.SEARCH to Icons.Default.Search,Screen.SCANNER to Icons.Default.AutoGraph,Screen.FAVORITES to Icons.Default.Star,Screen.HISTORY to Icons.Default.History,Screen.SETTINGS to Icons.Default.Settings).forEach{(scr,icon)->NavigationBarItem(s==scr,{on(scr)},icon={Icon(icon,null)},label={Text(if(ru)when(scr){Screen.HOME->"Главная";Screen.SEARCH->"Поиск";Screen.SCANNER->"Сканер";Screen.FAVORITES->"Избранное";Screen.HISTORY->"История";else->"Настройки"}else when(scr){Screen.HOME->"Home";Screen.SEARCH->"Search";Screen.SCANNER->"Scanner";Screen.FAVORITES->"Favorites";Screen.HISTORY->"History";else->"Settings"},fontSize=11.sp,maxLines=1,softWrap=false)})}}}
 @Composable private fun SearchLauncher(ru:Boolean,on:()->Unit){Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Color.Black).border(1.dp,DarkLine.copy(.9f),RoundedCornerShape(17.dp)).clickable(onClick=on).padding(15.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Search,null,tint=Accent);Text(if(ru)"Поиск акций и валют…" else "Search stocks and currencies…",Modifier.padding(start=10.dp),color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=12.sp)}}
 @Composable private fun QuickAction(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,on:()->Unit,modifier:Modifier){GradientCard(modifier.clickable(onClick=on)){Column(Modifier.padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(icon,null,tint=Accent,modifier=Modifier.size(22.dp));Text(title,fontWeight=FontWeight.Bold,fontSize=11.sp,modifier=Modifier.padding(top=5.dp))}}}
-@Composable private fun SectionHeader(t:String,s:String){
+@Composable internal fun SectionHeader(t:String,s:String){
     Column {
         Text(t,fontSize=17.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)))
         if(s.isNotBlank()) Text(s,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
-@Composable private fun GradientCard(modifier:Modifier,content:@Composable ColumnScope.()->Unit){Card(modifier,shape=RoundedCornerShape(21.dp),colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface),border=androidx.compose.foundation.BorderStroke(1.2.dp,DarkLine.copy(.90f))){Column(Modifier.background(Brush.linearGradient(listOf(Accent.copy(.025f),Accent2.copy(.018f),Color.Transparent))).padding(15.dp),content=content)}}
+@Composable internal fun GradientCard(modifier:Modifier,content:@Composable ColumnScope.()->Unit){Card(modifier,shape=RoundedCornerShape(21.dp),colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface),border=androidx.compose.foundation.BorderStroke(1.2.dp,DarkLine.copy(.90f))){Column(Modifier.background(Brush.linearGradient(listOf(Accent.copy(.025f),Accent2.copy(.018f),Color.Transparent))).padding(15.dp),content=content)}}
 @Composable private fun SettingCard(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,value:String,on:()->Unit){GradientCard(Modifier.fillMaxWidth().clickable(onClick=on)){Row(verticalAlignment=Alignment.CenterVertically){Icon(icon,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(title,fontWeight=FontWeight.Bold);Text(value,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}}
 @Composable private fun SettingGroup(title:String,content:@Composable ColumnScope.()->Unit){GradientCard(Modifier.fillMaxWidth()){Text(title,fontWeight=FontWeight.Bold,fontSize=12.sp,color=MaterialTheme.colorScheme.onSurface);Spacer(Modifier.height(7.dp));content()}}
 @Composable private fun MetricCard(title:String,value:String,color:Color,modifier:Modifier){
@@ -1459,7 +1470,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
         }
     }
 }
-@Composable private fun EmptyCard(text:String){GradientCard(Modifier.fillMaxWidth()){Text(text,Modifier.padding(4.dp),fontSize=12.sp)}}
+@Composable internal fun EmptyCard(text:String){GradientCard(Modifier.fillMaxWidth()){Text(text,Modifier.padding(4.dp),fontSize=12.sp)}}
 @Composable private fun StatBlock(l:String,v:String,c:Color){Column{Text(l,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Text(v,fontSize=12.sp,fontWeight=FontWeight.Black,color=c)}}
 @Composable private fun SignalPill(s:String,c:Color){Box(Modifier.clip(RoundedCornerShape(50)).background(c.copy(.12f)).border(1.dp,c.copy(.35f),RoundedCornerShape(50)).padding(horizontal=9.dp,vertical=5.dp)){Text(s,color=c,fontSize=11.sp,fontWeight=FontWeight.Black)}}
 @Composable private fun PriceBadge(l:String,v:Double,c:Color){Column(horizontalAlignment=Alignment.CenterHorizontally){Text(l,fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Text(fmt(v),fontSize=11.sp,fontWeight=FontWeight.Black,color=c)}}
@@ -1478,8 +1489,15 @@ private fun matchesSearchFilter(r: SearchResult, filter:String):Boolean=when(fil
     else->r.type.uppercase(Locale.US) in setOf("STOCK","FOREIGN_STOCK","DEPOSITARY_RECEIPTS","CURRENCY")
 }
 
-private fun signalColor(s:String)=when{ s.contains("LONG")->Positive; s.contains("SHORT")->Negative; else->Warning }
-private fun fmt(v:Double):String=when{abs(v)>=1000->String.format(Locale.US,"%,.2f",v);abs(v)>=1->String.format(Locale.US,"%.2f",v);else->String.format(Locale.US,"%.6f",v)}
+internal fun signalColor(s:String)=when{ s.contains("LONG")->Positive; s.contains("SHORT")->Negative; else->Warning }
+private fun typeLabel(type: String, ru: Boolean): String = when (type.uppercase(Locale.US)) {
+    "STOCK" -> if (ru) "Акция" else "Stock"
+    "FOREIGN_STOCK" -> if (ru) "Иностранная акция" else "Foreign stock"
+    "DEPOSITARY_RECEIPTS" -> if (ru) "Депозитарная расписка" else "Depositary receipt"
+    "CURRENCY" -> if (ru) "Валюта" else "Currency"
+    else -> type
+}
+internal fun fmt(v:Double):String=when{abs(v)>=1000->String.format(Locale.US,"%,.2f",v);abs(v)>=1->String.format(Locale.US,"%.2f",v);else->String.format(Locale.US,"%.6f",v)}
 private fun formatElapsed(ms: Long): String { val s=ms/1000; val d=s/86400; val h=(s%86400)/3600; val m=(s%3600)/60; val sec=s%60; return when { d>0 -> "${d}д ${h}ч"; h>0 -> "${h}ч ${m}м"; m>0 -> "${m}м ${sec}с"; else -> "${sec}с" } }
 private fun dateTime(t:Long):String=SimpleDateFormat("dd.MM.yyyy HH:mm:ss",Locale.getDefault()).format(Date(t))
 private fun tfMillis(tf:String)=when(tf){"15M"->15*60_000L;"1H"->60*60_000L;"4H"->4*60*60_000L;"1W"->7*24*60*60_000L;else->24*60*60_000L}

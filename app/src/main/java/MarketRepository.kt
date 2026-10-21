@@ -60,34 +60,99 @@ class MarketRepository(
         // effectively instant without turning this into a downloaded instrument catalogue.
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
         private const val SEARCH_CACHE_MS = 10 * 60_000L
-        private const val SEARCH_INDEX_PREFS = "mfp_search_index_v3_full_bcs"
-        private const val SEARCH_INDEX_MAX = 100000
+        // Old builds stored up to 100k instruments as one SharedPreferences string, which every
+        // getSharedPreferences() call had to parse. It is deleted on first run; the catalogue now
+        // lives in a file and in a process-wide in-memory index.
+        private const val LEGACY_SEARCH_INDEX_PREFS = "mfp_search_index_v3_full_bcs"
         private const val BCS_CATALOG_FILE = "bcs_catalog_v2.json"
+        private const val CATALOG_SYNCED_AT = "bcs_catalog_synced_at"
+        private const val SEARCH_LIMIT = 300
+        private const val CATALOG_TTL_MS = 12 * 60 * 60_000L
+        private const val INDEX_LIST_TTL_MS = 6 * 60 * 60_000L
+        private const val PREV_CLOSE_TTL_MS = 30 * 60_000L
+        private val searchEngine = InstrumentSearchEngine()
+        @Volatile private var catalogLoaded = false
+        private val catalogLock = Any()
+        private val catalogSyncLock = Any()
+        @Volatile private var indexListCache: Pair<Long, List<SearchResult>>? = null
+        private val prevCloseCache = ConcurrentHashMap<String, Pair<Long, Double>>()
     }
     private val ua = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36 MarketForecastPROX/4.8.107"
-    private val searchEngine = InstrumentSearchEngine(popularSeeds()).also { engine ->
-        loadSearchIndex().forEach { engine.addAll(listOf(it)) }
-        loadCatalogDisk().forEach { engine.addAll(listOf(it)) }
+    private fun ensureCatalogLoaded() {
+        if (catalogLoaded) return
+        synchronized(catalogLock) {
+            if (catalogLoaded) return
+            if (context == null) return
+            prefs?.edit()?.remove(LEGACY_SEARCH_INDEX_PREFS)?.apply()
+            val cached = loadCatalogDisk()
+            if (cached.isNotEmpty()) searchEngine.addAll(cached)
+            catalogLoaded = true
+        }
     }
 
-    /** Immediate local suggestions. These never claim to be authoritative quotes. */
-    fun searchLocal(query: String, filter: String = "ALL"): List<SearchResult> =
-        searchEngine.search(query, filter, 30)
+    /** Number of instruments currently searchable (the full BCS catalogue once synced). */
+    fun catalogSize(): Int { ensureCatalogLoaded(); return searchEngine.size() }
 
-    private fun loadSearchIndex(): List<SearchResult> {
-        val raw = prefs?.getString(SEARCH_INDEX_PREFS, "").orEmpty()
-        if (raw.isBlank()) return emptyList()
-        return runCatching {
-            val a = JSONArray(raw)
-            buildList {
-                for (i in 0 until a.length()) {
-                    val o = a.optJSONObject(i) ?: continue
-                    val symbol = o.optString("symbol").trim()
-                    if (symbol.isBlank()) continue
-                    add(SearchResult(symbol, o.optString("name", symbol), o.optString("exchange", "БКС"), o.optString("type", "STOCK"), "БКС", o.optString("classCode")))
+    /** Every instrument of the catalogue, used by the market scanner as its universe. */
+    fun catalogSnapshot(): List<SearchResult> { ensureCatalogLoaded(); return searchEngine.all() }
+
+    fun catalogSyncedAt(): Long = prefs?.getLong(CATALOG_SYNCED_AT, 0L) ?: 0L
+
+    /**
+     * Downloads the COMPLETE BCS catalogue (stocks, foreign stocks, depositary receipts, currencies)
+     * and keeps it on disk. Instruments become searchable page by page while it downloads.
+     * Skipped when the stored copy is fresh unless [force] is set. Returns the index size.
+     */
+    fun syncCatalog(force: Boolean = false, onProgress: ((Int) -> Unit)? = null): Int {
+        ensureCatalogLoaded()
+        if (!isBcsConfigured()) return searchEngine.size()
+        fun fresh(): Boolean {
+            val age = System.currentTimeMillis() - catalogSyncedAt()
+            return age in 0 until CATALOG_TTL_MS && searchEngine.size() > 0
+        }
+        if (!force && fresh()) return searchEngine.size()
+        synchronized(catalogSyncLock) {
+            if (!force && fresh()) return searchEngine.size()
+            val collected = LinkedHashMap<String, SearchResult>()
+            val pending = ArrayList<SearchResult>()
+            var complete = true
+            for (type in TRADING_INSTRUMENT_TYPES) {
+                try {
+                    loadCatalogType(
+                        type, Int.MAX_VALUE,
+                        onPage = { _, _, _ ->
+                            if (pending.isNotEmpty()) { searchEngine.addAll(pending); pending.clear() }
+                            onProgress?.invoke(collected.size)
+                        },
+                        onItem = { item ->
+                            if (isSupportedCatalogType(item.type) && collected.putIfAbsent(catalogIdentity(item), item) == null) {
+                                pending.add(item)
+                            }
+                        }
+                    )
+                } catch (t: Throwable) {
+                    complete = false
+                }
+                if (pending.isNotEmpty()) { searchEngine.addAll(pending); pending.clear() }
+            }
+            if (collected.isNotEmpty()) {
+                if (complete) {
+                    // A fully successful download is authoritative: delisted instruments disappear.
+                    searchEngine.replaceAll(collected.values)
+                    persistCatalogDisk(collected.values)
+                    prefs?.edit()?.putLong(CATALOG_SYNCED_AT, System.currentTimeMillis())?.apply()
+                } else {
+                    persistCatalogDisk(searchEngine.all())
                 }
             }
-        }.getOrDefault(emptyList())
+        }
+        return searchEngine.size()
+    }
+
+    /** Instant local search over the whole catalogue. */
+    fun searchLocal(query: String, filter: String = "ALL"): List<SearchResult> {
+        ensureCatalogLoaded()
+        return searchEngine.search(query, filter, SEARCH_LIMIT)
     }
 
     private fun loadCatalogDisk(): List<SearchResult> {
@@ -126,22 +191,6 @@ class MarketRepository(
         }
     }
 
-    private fun rememberSearchResults(values: Collection<SearchResult>, persist: Boolean = false) {
-        if (values.isEmpty()) return
-        // Never serialize the entire learned index once per instrument. The old path
-        // could rewrite a 50k-entry JSON blob thousands of times during first search.
-        searchEngine.addAll(values)
-        if (!persist) return
-        val merged = searchEngine.all().takeLast(SEARCH_INDEX_MAX)
-        val a = JSONArray()
-        merged.forEach { r ->
-            a.put(JSONObject().apply {
-                put("symbol", r.symbol); put("name", r.name); put("exchange", r.exchange); put("type", r.type); put("classCode", r.classCode)
-            })
-        }
-        prefs?.edit()?.putString(SEARCH_INDEX_PREFS, a.toString())?.apply()
-    }
-
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
         val cacheKey = "${if (bcsRefreshToken.isNullOrBlank()) "LEGACY" else "BCS"}|$clean|$range|$interval"
@@ -158,6 +207,9 @@ class MarketRepository(
             val normalized = fetched.getOrNull()?.let { normalizeInterval(it, interval) }.orEmpty()
             if (normalized.isNotEmpty()) {
                 candleCache[cacheKey] = System.currentTimeMillis() to normalized
+                if (candleCache.size > 250) {
+                    candleCache.entries.minByOrNull { it.value.first }?.let { candleCache.remove(it.key) }
+                }
                 return normalized
             }
             // Stale-while-revalidate: temporary BCS timeout/rate-limit must not
@@ -196,92 +248,70 @@ class MarketRepository(
     }
 
     /**
-     * Fast two-stage search: internet metadata first, BCS only for exact ticker
-     * confirmation when it is cheap/necessary. No BCS directory walk is performed
-     * for autocomplete and no full instrument catalogue is downloaded.
-     */
-    /**
-     * Authoritative BCS search. Search metadata comes only from the official BCS
-     * information API; no MOEX/Internet autocomplete participates in the result set.
-     * A small persisted cache is only an acceleration layer for data previously
-     * received from BCS, never a second market-data source.
+     * Search over the full BCS catalogue. Matching is local and instant. BCS is asked directly only
+     * when an exact ticker was typed that the index does not contain yet (a new listing, or the
+     * catalogue is still downloading).
      */
     fun search(query: String, filter: String = "ALL"): List<SearchResult> {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
-        val normalized = normalizeSearchText(q)
-        val cacheKey = "BCS|${filter.uppercase(Locale.US)}|$normalized"
-        searchCache[cacheKey]?.let { cached ->
-            if (System.currentTimeMillis() - cached.first <= SEARCH_CACHE_MS && cached.second.isNotEmpty()) return cached.second
-            searchCache.remove(cacheKey)
-        }
-
-        val aliases = mapOf(
-            "сбер" to "SBER", "сбербанк" to "SBER", "газпром" to "GAZP", "лукойл" to "LKOH",
-            "роснефть" to "ROSN", "новатэк" to "NVTK", "татнефть" to "TATN", "магнит" to "MGNT",
-            "мосбиржа" to "MOEX", "яндекс" to "YDEX", "озон" to "OZON", "циан" to "CNRU",
-            "аэрофлот" to "AFLT", "втб" to "VTBR", "мтс" to "MTSS", "норникель" to "GMKN",
-            "полюс" to "PLZL", "фосагро" to "PHOR", "ростелеком" to "RTKM", "алроса" to "ALRS",
-            "совкомфлот" to "FLOT", "доллар" to "USD000UTSTOM", "евро" to "EUR_RUB__TOM",
-            "юань" to "CNYRUB_TOM", "фунт" to "GBP_RUB__TOM", "иена" to "JPY_RUB__TOM"
-        )
-        val tickerCandidate = aliases[normalized]
-            ?: normalizeFx(q)?.symbol
-            ?: q.uppercase(Locale.US).replace("/", "").replace("-", "")
-                .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
-
-        val direct = tickerCandidate?.let { candidate ->
-            runCatching { bcsInstrumentInfo(candidate) }.getOrNull()?.let { info ->
-                val board = info.optJSONArray("boards")?.let { chooseBoard(it) }
-                SearchResult(
-                    info.optString("ticker").ifBlank { candidate },
-                    info.optString("displayName").ifBlank { info.optString("shortName") }.ifBlank { candidate },
-                    board?.optString("exchange").orEmpty().ifBlank { "БКС" },
-                    info.optString("instrumentType").ifBlank { if (candidate.contains("RUB", true) || candidate.endsWith("UTSTOM")) "CURRENCY" else "STOCK" },
-                    "БКС", board?.optString("classCode").orEmpty()
-                )
-            }
-        }?.takeIf { matchesSearchFilter(it, filter) }
-
-        // Search the locally persisted BCS directory cache. The cache is populated
-        // exclusively from /instruments/by-type below and therefore remains an
-        // official-BCS identity cache rather than an external search source.
-        val cachedBcs = searchEngine.search(q, filter, 30)
-            .filter { it.source == "БКС" }
-            .filter { matchesSearchFilter(it, filter) }
-
-        val merged = buildList {
-            direct?.let { add(it) }
-            addAll(cachedBcs)
-        }.distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }.take(50)
-
-        // If the BCS cache has never been warmed, fetch the official BCS directory
-        // once in this call. This is the only potentially expensive first search;
-        // subsequent searches are local against the BCS-derived cache.
-        if (merged.isEmpty() && isBcsConfigured()) {
-            runCatching {
-                instrumentCatalogStream(filter) { item -> rememberSearchResults(listOf(item), persist = false) }
-                rememberSearchResults(searchEngine.all(), persist = true)
-            }
-            val warmed = searchEngine.search(q, filter, 30)
-                .filter { it.source == "БКС" && matchesSearchFilter(it, filter) }
-            val final = buildList { direct?.let { add(it) }; addAll(warmed) }
-                .distinctBy { "${it.symbol.uppercase(Locale.US)}@${it.classCode.uppercase(Locale.US)}" }
-                .take(50)
-            if (final.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to final
-            return final
-        }
-
-        if (merged.isNotEmpty()) searchCache[cacheKey] = System.currentTimeMillis() to merged
-        return merged
+        ensureCatalogLoaded()
+        val local = searchEngine.search(q, filter, SEARCH_LIMIT)
+        val candidate = q.uppercase(Locale.US).replace("/", "").replace("-", "")
+            .takeIf { it.matches(Regex("[A-Z0-9_.=]{2,24}")) }
+        val direct = candidate
+            ?.takeIf { isBcsConfigured() && local.isEmpty() }
+            ?.let { runCatching { resolveSelectedInstrument(it, filter) }.getOrNull() }
+        if (direct != null) searchEngine.addAll(listOf(direct))
+        return buildList {
+            if (direct != null) add(direct)
+            addAll(local)
+        }.distinctBy { it.symbol.uppercase(Locale.US) }.take(SEARCH_LIMIT)
     }
 
-    private fun matchesSearchFilter(item: SearchResult, filter: String): Boolean {
-        val t = item.type.uppercase(Locale.US)
-        return when (filter.uppercase(Locale.US)) {
-            "FX" -> t.contains("CURRENCY") || t.contains("FOREX") || item.symbol.endsWith("=X")
-            "STOCK" -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
-            else -> t in setOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS", "CURRENCY")
+    /**
+     * One-request daily history (about 14 months) for the market scanner and index widgets.
+     * The board comes from the catalogue, so no extra instrument lookup is needed.
+     */
+    fun loadScanCandles(symbol: String, classCode: String): List<Candle> {
+        if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
+        val ticker = canonicalSymbol(symbol).substringBefore("@")
+        val board = classCode.ifBlank { bcsInstrument(ticker).second }
+        val end = System.currentTimeMillis()
+        val start = end - 430L * 86_400_000L
+        val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(board)}&timeFrame=D&startDate=${enc(isoUtc(start))}&endDate=${enc(isoUtc(end))}"
+        val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
+        val raw = parseBcsCandles(root).distinctBy { it.time }.sortedBy { it.time }
+        return normalizeInterval(raw, "1d")
+    }
+
+    private fun previousClose(item: SearchResult): Double {
+        val now = System.currentTimeMillis()
+        prevCloseCache[item.symbol]?.let { if (now - it.first < PREV_CLOSE_TTL_MS) return it.second }
+        val candles = loadScanCandles(item.symbol, item.classCode)
+        val prev = candles.dropLast(1).lastOrNull()?.close ?: candles.lastOrNull()?.close ?: 0.0
+        if (prev > 0.0) prevCloseCache[item.symbol] = now to prev
+        return prev
+    }
+
+    /** Index tiles. The list of indices and previous closes are cached; only quotes are refreshed. */
+    fun marketIndices(): List<MarketIndex> {
+        if (!isBcsConfigured()) return emptyList()
+        val now = System.currentTimeMillis()
+        val cachedList = indexListCache
+        val items = if (cachedList != null && now - cachedList.first < INDEX_LIST_TTL_MS) {
+            cachedList.second
+        } else {
+            val fresh = runCatching { loadCatalogType("INDEX", Int.MAX_VALUE).filter { it.type.contains("INDEX", true) } }.getOrDefault(emptyList())
+            if (fresh.isNotEmpty()) indexListCache = now to fresh
+            fresh.ifEmpty { cachedList?.second.orEmpty() }
+        }
+        return items.take(12).mapNotNull { item ->
+            runCatching {
+                val prev = previousClose(item)
+                val live = quote(item.symbol) ?: return@runCatching null
+                MarketIndex(item.symbol, item.name, live, if (prev <= 0.0) 0.0 else (live - prev) / prev * 100.0, "БКС")
+            }.getOrNull()
         }
     }
 
@@ -307,8 +337,8 @@ class MarketRepository(
     private fun instrumentCatalogStream(type: String, onInstrument: (SearchResult) -> Unit) {
         val types = when (type.uppercase(Locale.US)) {
             "FX", "CURRENCY" -> listOf("CURRENCY")
-            "STOCKS", "STOCK" -> listOf("STOCK")
-            else -> listOf("STOCK", "CURRENCY")
+            "STOCKS", "STOCK" -> listOf("STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPTS")
+            else -> TRADING_INSTRUMENT_TYPES
         }
         for (instrumentType in types) {
             loadCatalogType(instrumentType, Int.MAX_VALUE, onItem = onInstrument)
@@ -477,47 +507,9 @@ class MarketRepository(
     fun fxCatalog(): List<SearchResult> = if (!isBcsConfigured()) emptyList() else
         instrumentCatalog("FX")
 
-    private fun normalizeSearchText(value: String): String =
-        value.trim().lowercase(Locale.ROOT)
-            .replace('ё', 'е')
-            .replace(Regex("\\s+"), " ")
-
-    private fun compactSearch(value: String): String =
-        normalizeSearchText(value).replace(Regex("[^\\p{L}\\p{Nd}]+"), "")
 
     private fun catalogIdentity(item: SearchResult): String =
         "${item.symbol.trim().uppercase(Locale.US)}@${item.classCode.trim().uppercase(Locale.US)}"
-
-    private fun transliterateRuToLat(value: String): String {
-        val map = mapOf('а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ё' to "e", 'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m", 'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r", 'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f", 'х' to "h", 'ц' to "c", 'ч' to "ch", 'ш' to "sh", 'щ' to "sch", 'ъ' to "", 'ы' to "y", 'ь' to "", 'э' to "e", 'ю' to "yu", 'я' to "ya")
-        return buildString { value.forEach { append(map[it] ?: it) } }
-    }
-
-    private fun popularSeeds(): List<SearchResult> = listOf(
-        "SBER" to "Сбербанк", "GAZP" to "Газпром", "LKOH" to "Лукойл", "ROSN" to "Роснефть",
-        "NVTK" to "Новатэк", "TATN" to "Татнефть", "MGNT" to "Магнит", "MOEX" to "Московская биржа",
-        "YDEX" to "Яндекс", "OZON" to "Ozon", "CNRU" to "ЦИАН", "AFLT" to "Аэрофлот",
-        "VTBR" to "ВТБ", "MTSS" to "МТС", "GMKN" to "Норникель", "PLZL" to "Полюс",
-        "PHOR" to "ФосАгро", "RTKM" to "Ростелеком", "ALRS" to "АЛРОСА", "FLOT" to "Совкомфлот",
-        "IRAO" to "Интер РАО", "ENPG" to "Эн+", "TCSG" to "Т-Банк", "HEAD" to "HeadHunter",
-        "VKCO" to "VK", "RUAL" to "РУСАЛ", "SNGS" to "Сургутнефтегаз", "SNGSP" to "Сургутнефтегаз-п",
-        "CHMF" to "Северсталь", "NLMK" to "НЛМК", "MAGN" to "ММК", "PIKK" to "ПИК",
-        "ASTR" to "Астра", "SOFL" to "Софтлайн", "BELU" to "Белуга", "MVID" to "М.Видео",
-        "AFKS" to "АФК Система", "HYDR" to "РусГидро", "FEES" to "Россети",
-        "USD000UTSTOM" to "Доллар / Рубль",
-        "EUR_RUB__TOM" to "Евро / Рубль", "CNYRUB_TOM" to "Юань / Рубль"
-    ).map { (symbol, name) ->
-        SearchResult(symbol, name, "БКС", if (symbol in setOf("USD000UTSTOM", "EUR_RUB__TOM", "CNYRUB_TOM")) "CURRENCY" else "STOCK", "БКС")
-    }
-
-    private fun normalizeFx(q: String): SearchResult? {
-        val x = q.uppercase(Locale.US).replace("/", "").replace("-", "").replace(" ", "")
-        if (x.length != 6 || !x.all { it.isLetter() }) return null
-        val base = x.take(3); val quote = x.takeLast(3)
-        return if (bcsFx("${base}${quote}=X") != null)
-            SearchResult(bcsFx("${base}${quote}=X")!!, "$base/$quote", "БКС", "CURRENCY", "БКС", "CETS")
-        else null
-    }
 
     /** Multi-source market news. The UI must still receive a feed if one provider is unavailable. */
     fun marketNews(limit: Int = 30, ru: Boolean = true, category: NewsCategory = NewsCategory.ALL): List<NewsItem> {
@@ -562,109 +554,6 @@ class MarketRepository(
 
     private fun finamMarketNews(limit:Int,category:NewsCategory):List<NewsItem>{val html=getText("https://www.finam.ru/publications/section/market/",15000);val out=mutableListOf<NewsItem>();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val m=p.matcher(html);while(m.find()&&out.size<limit){val href=htmlDecode(m.group(1).orEmpty());val title=stripHtml(m.group(2).orEmpty());if(title.length<12)continue;val low=title.lowercase(Locale.US);val fx=listOf("рубл","доллар","евро","юань","валют","курс").any{low.contains(it)};val stock=listOf("акци","сбер","газпром","лукойл","роснефт","новатэк","дивиденд","яндекс","озон").any{low.contains(it)};val cat=when{fx&&!stock->NewsCategory.FX;stock->NewsCategory.STOCKS;else->NewsCategory.ALL};if(cat==NewsCategory.ALL||(category!=NewsCategory.ALL&&cat!=category))continue;val url=if(href.startsWith("http"))href else "https://www.finam.ru"+if(href.startsWith("/"))href else "/$href";out+=NewsItem(title,"Финам",url,0L,title,cat,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
     private fun moexNews(limit:Int,category:NewsCategory):List<NewsItem>{val url=when(category){NewsCategory.STOCKS->"https://www.moex.com/ru/news/?ncat=111";NewsCategory.FX->"https://www.moex.com/ru/news/?ncat=118";else->"https://www.moex.com/ru/news/"};val html=runCatching{getText(url,15000)}.getOrNull()?:return emptyList();val p=Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",Pattern.DOTALL or Pattern.CASE_INSENSITIVE);val out=mutableListOf<NewsItem>();val m=p.matcher(html);while(m.find()&&out.size<limit){val title=stripHtml(m.group(2).orEmpty());val href=htmlDecode(m.group(1).orEmpty());if(title.length<12)continue;val full=if(href.startsWith("http"))href else "https://www.moex.com"+href;out+=NewsItem(title,"Московская биржа",full,0L,title,category,"",extractInstrument(title,""))};return out.distinctBy{it.url}}
-
-    fun marketToday(mode: String, limit: Int = 20): List<MarketPick> {
-        // Market Today is latency-sensitive. Each instrument is isolated so one
-        // provider failure cannot abort the whole market list.
-        val catalog = runCatching { instrumentCatalog("ALL") }.getOrDefault(emptyList())
-        val normalizedCatalog = catalog
-            .map { it.copy(symbol = canonicalSymbol(it.symbol)) }
-            .distinctBy { it.symbol.uppercase(Locale.US) }
-        val stockCandidates = normalizedCatalog.filterNot {
-            it.type.contains("CURRENCY", true) || it.type.contains("FOREX", true)
-        }.map { it.symbol }
-        val fxCandidates = normalizedCatalog.filter {
-            it.type.contains("CURRENCY", true) || it.type.contains("FOREX", true)
-        }.map { it.symbol }
-        val candidates = when (mode) {
-            "FX" -> fxCandidates
-            "STOCKS", "LIQUID", "GROWTH", "FALL" -> stockCandidates
-            else -> stockCandidates + fxCandidates
-        }.distinct().take(32)
-        val metaBySymbol = normalizedCatalog.associateBy { it.symbol.uppercase(Locale.US) }
-
-        val futures = candidates.map { symbol ->
-            // Keep the worker body as a single expression. Besides being simpler, this
-            // avoids Kotlin parser edge-cases around labelled returns inside nested
-            // ExecutorService lambdas and makes one bad instrument fully isolated.
-            analysisPool.submit<MarketPick?> {
-                runCatching {
-                    val candles = load(symbol, "2y", "1d")
-                    if (candles.size < 30) {
-                        null
-                    } else {
-                        val live = reconcileLivePrice(symbol, candles, quote(symbol))
-                        if (!live.isFinite() || live <= 0.0) {
-                            null
-                        } else {
-                            val forecast = AnalyticsEngine.analyze(candles, live)
-                            val previous = candles.dropLast(1).lastOrNull()?.close ?: candles.last().open
-                            val changePct = if (previous > 0.0) {
-                                (live - previous) / previous * 100.0
-                            } else {
-                                0.0
-                            }
-                            val meta = metaBySymbol[symbol.uppercase(Locale.US)]
-                            val type = if (meta?.type.orEmpty().contains("CURRENCY", true) || meta?.type.orEmpty().contains("FOREX", true)) "FX" else "STOCK"
-
-                            MarketPick(
-                                symbol = symbol,
-                                name = meta?.name?.ifBlank { symbol } ?: symbol,
-                                price = live,
-                                signal = forecast.signal,
-                                confidence = forecast.confidence,
-                                score = forecast.score,
-                                type = type,
-                                changePct = changePct,
-                                volume = candles.last().volume
-                            )
-                        }
-                    }
-                }.getOrNull()
-            }
-        }
-
-        val picks = futures.mapNotNull { future ->
-            try {
-                future.get(18, TimeUnit.SECONDS)
-            } catch (_: Throwable) {
-                null
-            }
-        }
-
-        val filtered = when (mode) {
-            "STOCKS" -> picks.filter { it.type == "STOCK" }
-            "FX" -> picks.filter { it.type == "FX" }
-            "LIQUID" -> picks.filter { it.type == "STOCK" }.sortedByDescending { it.volume }
-            "GROWTH" -> picks.filter { it.type == "STOCK" }.sortedByDescending { it.changePct }
-            "FALL" -> picks.filter { it.type == "STOCK" }.sortedBy { it.changePct }
-            else -> picks
-        }
-
-        return if (mode == "LIQUID" || mode == "GROWTH" || mode == "FALL") {
-            filtered.take(limit.coerceAtMost(16))
-        } else {
-            filtered
-                .sortedWith(
-                    compareByDescending<MarketPick> { it.confidence }
-                        .thenByDescending { abs(it.score) }
-                )
-                .take(limit.coerceAtMost(16))
-        }
-    }
-
-    fun marketIndices(): List<MarketIndex> {
-        if (!isBcsConfigured()) return emptyList()
-        return loadCatalogType("INDEX", Int.MAX_VALUE).filter { it.type.contains("INDEX", true) }.take(12).mapNotNull { item ->
-            runCatching {
-                val candles = load(item.symbol, "1y", "1d")
-                val last = candles.lastOrNull() ?: return@runCatching null
-                val prev = candles.dropLast(1).lastOrNull()?.close ?: last.close
-                val live = quote(item.symbol) ?: return@runCatching null
-                MarketIndex(item.symbol, item.name, live, if (prev == 0.0) 0.0 else (live - prev) / prev * 100.0, "БКС")
-            }.getOrNull()
-        }
-    }
 
     fun quote(symbol: String): Double? {
         val clean = symbol.trim().uppercase(Locale.US)
@@ -793,22 +682,6 @@ class MarketRepository(
 
     private val bcsInstrumentCache = ConcurrentHashMap<String, Pair<String, String>>()
 
-    // BCS identifies Russian shares by ticker + classCode.  Older versions of the
-    // app stored them as Yahoo-style symbols (for example SBER.ME).  The BCS API
-    // itself uses SBER/TQBR.  Do not let the legacy .ME suffix make a valid BCS
-    // instrument look unsupported.  TQBR is the documented class for the normal
-    // Russian-equity board; the information service is still preferred whenever
-    // it can provide a more specific class.
-    private val bcsRuEquityTickers = setOf(
-        "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "TATNP", "MGNT", "CNRU",
-        "MOEX", "YDEX", "OZON", "PHOR", "MTSS", "IRAO", "GMKN", "NLMK",
-        "CHMF", "ALRS", "SNGS", "SNGSP", "RTKM", "RTKMP", "VTBR", "AFLT",
-        "RUAL", "PLZL", "HYDR", "ENPG", "PIKK", "MAGN", "CBOM", "AFKS",
-        "FEES", "LSRG", "TRMK", "UPRO", "VKCO", "HEAD", "X5", "BELU",
-        "SMLT", "MTLR", "MTLRP", "SELG", "FLOT", "POSI", "ASTR", "SVCB",
-        "SIBN", "T", "FIXP", "HHRU", "RENI", "SOFL", "GECO", "BSPB", "ROLO"
-    )
-
     /**
      * Canonical internal symbol normalization. Legacy Yahoo-style suffixes are
      * accepted only at the boundary; the rest of the app uses one identifier.
@@ -851,11 +724,12 @@ class MarketRepository(
         // class for known Russian equities instead of reporting a valid instrument
         // as "not supported".  This is still 100% BCS data; there is no fallback
         // quote provider here.
-        val info = runCatching { bcsInstrumentInfo(ticker) }.getOrNull()
+        // The catalogue index already knows the trading board of every instrument: no request needed.
+        val indexedBoard = runCatching { ensureCatalogLoaded(); searchEngine.find(ticker)?.classCode }.getOrNull().orEmpty()
+        val info = if (indexedBoard.isBlank()) runCatching { bcsInstrumentInfo(ticker) }.getOrNull() else null
         val infoBoard = info?.optJSONArray("boards")?.let { chooseBoard(it)?.optString("classCode").orEmpty() }.orEmpty()
-        val board = infoBoard.ifBlank {
-            if (ticker in bcsRuEquityTickers) "TQBR"
-            else throw IllegalStateException("БКС: инструмент $ticker не найден в каталоге")
+        val board = indexedBoard.ifBlank { infoBoard }.ifBlank {
+            throw IllegalStateException("БКС: инструмент $ticker не найден в каталоге")
         }
         val pair = ticker to board
         bcsInstrumentCache[ticker] = pair
