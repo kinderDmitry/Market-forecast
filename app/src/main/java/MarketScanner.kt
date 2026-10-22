@@ -25,8 +25,8 @@ import org.json.JSONObject
 import java.util.Locale
 import kotlin.math.abs
 
-/** What part of the BCS catalogue the scanner walks through. Nothing is capped or hand-picked. */
-internal enum class ScanScope { ALL, RU_STOCKS, FOREIGN, FX, FAVORITES }
+/** What part of the BCS catalogue the scanner walks through. MAIN = the liquid main boards (a minute); ALL = every instrument. */
+internal enum class ScanScope { MAIN, ALL, RU_STOCKS, FOREIGN, FX, FAVORITES }
 
 /** One actionable forecast found by the scanner. */
 internal data class ScanHit(
@@ -223,19 +223,15 @@ internal class ScannerController(
     private class ScanResult(val status: Int, val hit: ScanHit?)
 
     private suspend fun runScan(selected: ScanScope, favorites: Set<String>) {
-        if (CatalogStatus.syncing) {
-            message = tr("Каталог инструментов ещё загружается, сканер начнёт сразу после него…", "The instrument catalogue is still downloading; the scan starts right after it…")
-            while (CatalogStatus.syncing) delay(400)
-            message = null
-        }
+        // A stored catalogue is used right away (it refreshes in the background); only a first launch has to wait.
         if (repo.catalogSize() == 0) {
             message = tr("Загружаю каталог инструментов БКС…", "Downloading the BCS instrument catalogue…")
-            withContext(Dispatchers.IO) { runCatching { repo.syncCatalog() } }
+            withContext(Dispatchers.IO) { runCatching { repo.bootstrapCatalog() }; if (repo.catalogSize() == 0) runCatching { repo.syncCatalog() } }
             message = null
         }
         val universe = withContext(Dispatchers.IO) { buildUniverse(selected, favorites) }
         if (universe.isEmpty()) {
-            message = tr("Каталог инструментов пуст. Проверьте токен БКС и подключение к сети.", "The catalogue is empty. Check your BCS token and the network.")
+            message = tr("Каталог инструментов пуст. ${repo.lastCatalogError ?: repo.lastBcsError ?: "Проверьте токен БКС и подключение к сети."}", "The catalogue is empty. ${repo.lastCatalogError ?: repo.lastBcsError ?: "Check your BCS token and the network."}")
             return
         }
         total = universe.size
@@ -245,6 +241,7 @@ internal class ScannerController(
         val baseline = hasBaseline
         val found = LinkedHashMap<String, ScanHit>()
         val scanned = HashSet<String>()
+        val failedItems = ArrayList<SearchResult>()
         val gate = Semaphore(PARALLEL)
 
         fun publish() {
@@ -265,13 +262,34 @@ internal class ScannerController(
                             scanned.add(item.symbol)
                             done += 1
                             when (result.status) {
-                                STATUS_FAILED -> failed += 1
+                                STATUS_FAILED -> { failed += 1; failedItems.add(item) }
                                 STATUS_HIT -> result.hit?.let { found[item.symbol] = it }
                             }
                             if (result.status == STATUS_HIT || done % 10 == 0) publish()
                         }
                     }
                 }.awaitAll()
+            }
+            // Second chance for requests that lost a rate-limit race (only when the failure is not systemic).
+            if (failedItems.isNotEmpty() && failedItems.size * 2 < total) {
+                delay(1500)
+                val retry = failedItems.toList()
+                failedItems.clear()
+                failed -= retry.size
+                coroutineScope {
+                    retry.map { item ->
+                        async {
+                            gate.withPermit {
+                                val r = scanOne(item, previous, baseline)
+                                when (r.status) {
+                                    STATUS_FAILED -> failed += 1
+                                    STATUS_HIT -> r.hit?.let { found[item.symbol] = it }
+                                }
+                                if (r.status == STATUS_HIT) publish()
+                            }
+                        }
+                    }.awaitAll()
+                }
             }
         } finally {
             publish()
@@ -297,7 +315,7 @@ internal class ScannerController(
             )
         }
         message = when {
-            failed > 0 && failed >= total / 2 -> tr("Не удалось получить данные по $failed из $total инструментов. Проверьте токен и сеть.", "Could not get data for $failed of $total instruments. Check the token and the network.")
+            failed > 0 && failed >= total / 2 -> tr("Не удалось получить данные по $failed из $total инструментов. ${repo.lastBcsError ?: "Проверьте токен и сеть."}", "Could not get data for $failed of $total instruments. ${repo.lastBcsError ?: "Check the token and the network."}")
             !baseline -> tr("Первое сканирование завершено: ${found.size} сигналов. Со следующего запуска новые прогнозы будут отмечены.", "First scan finished: ${found.size} signals. New forecasts will be flagged from the next run.")
             newOnes > 0 -> tr("Найдено новых прогнозов: $newOnes.", "New forecasts found: $newOnes.")
             else -> tr("Новых прогнозов нет. Активных сигналов: ${found.size}.", "No new forecasts. Active signals: ${found.size}.")
@@ -355,6 +373,7 @@ internal class ScannerController(
         val catalog = repo.catalogSnapshot()
         val picked = catalog.filter { r ->
             when (selected) {
+                ScanScope.MAIN -> boardRank(r) == 0
                 ScanScope.ALL -> true
                 ScanScope.RU_STOCKS -> r.type.equals("STOCK", true)
                 ScanScope.FOREIGN -> r.type.equals("FOREIGN_STOCK", true) || r.type.equals("DEPOSITARY_RECEIPTS", true)
@@ -392,7 +411,7 @@ internal class ScannerController(
     }
 
     private fun loadScope(): ScanScope =
-        runCatching { ScanScope.valueOf(prefs.getString(PREF_SCOPE, ScanScope.ALL.name).orEmpty()) }.getOrDefault(ScanScope.ALL)
+        runCatching { ScanScope.valueOf(prefs.getString(PREF_SCOPE, ScanScope.MAIN.name).orEmpty()) }.getOrDefault(ScanScope.MAIN)
 
     companion object {
         private const val PREF_SCOPE = "scanner_scope"

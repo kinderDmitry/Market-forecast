@@ -200,8 +200,10 @@ fun MarketForecastApp(ctx: Context) {
         loadJob?.cancel()
         loadJob = scope.launch {
             val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; else -> "5y" to "1d" }
+            var loadError: String? = null
             val candlesRaw = withContext(Dispatchers.IO) {
-                runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse {
+                runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse { err ->
+                    loadError = err.message
                     // Never blank the chart merely because BCS timed out while switching
                     // timeframes. The repository already keeps a stale-while-revalidate
                     // cache; if a refresh still fails, retain the currently displayed
@@ -227,7 +229,12 @@ fun MarketForecastApp(ctx: Context) {
                 coroutineScope { requests.map { (name, pair) -> async { name to runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) } }.awaitAll().toMap().filterValues { it.size >= 40 } }
             }
             val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live, mtfContexts) }.getOrNull() } else null
-            state = MarketState(selected, candles, f, false, if (f == null) "Актуальная цена БКС недоступна или недостаточно рыночных данных" else null, System.currentTimeMillis(), time, news, live, meta, repo.forecastSource(selected))
+            state = MarketState(selected, candles, f, false, if (f != null) null else when {
+                candles.isEmpty() -> if (ru) "Не удалось получить свечи БКС${loadError?.let { ": " + it.take(140) }.orEmpty()}. Данные запрашиваются повторно." else "Could not get BCS candles${loadError?.let { ": " + it.take(140) }.orEmpty()}. Retrying."
+                live <= 0.0 -> if (ru) "БКС не вернул актуальную цену инструмента. Возможно, торги закрыты." else "BCS returned no live price. Trading may be closed."
+                candles.size < 30 -> if (ru) "Недостаточно истории: ${candles.size} свечей на таймфрейме $time, нужно не менее 30." else "Not enough history: ${candles.size} candles on $time, at least 30 are needed."
+                else -> if (ru) "Не удалось построить прогноз по этим данным." else "A forecast could not be built from this data."
+            }, System.currentTimeMillis(), time, news, live, meta, repo.forecastSource(selected))
             val fresh = withContext(Dispatchers.IO) { runCatching { repo.news(selected, 12, ru) }.getOrDefault(emptyList()) }
             if (fresh.isNotEmpty()) { news = fresh; saveCachedNews(prefs, fresh); state = state.copy(news = fresh) }
         }
@@ -284,13 +291,26 @@ fun MarketForecastApp(ctx: Context) {
     LaunchedEffect(repo) {
         scanner.restore()
         CatalogStatus.size = withContext(Dispatchers.IO) { repo.catalogSize() }
+        if (CatalogStatus.size == 0) {
+            // First launch: the main board and the currencies are searchable within a second, long before BCS finishes.
+            CatalogStatus.size = withContext(Dispatchers.IO) { runCatching { repo.bootstrapCatalog() }.getOrDefault(0) }
+        }
         if (repo.isBcsConfigured()) {
-            CatalogStatus.syncing = true
-            CatalogStatus.failed = false
-            withContext(Dispatchers.IO) { runCatching { repo.syncCatalog { CatalogStatus.size = maxOf(CatalogStatus.size, it) } } }
-            CatalogStatus.size = withContext(Dispatchers.IO) { repo.catalogSize() }
-            CatalogStatus.failed = CatalogStatus.size == 0
-            CatalogStatus.syncing = false
+            // Retries on its own (15 s, 30 s, 45 s): a rate-limit hiccup must not leave the catalogue half downloaded.
+            var attempt = 0
+            while (true) {
+                CatalogStatus.syncing = true
+                CatalogStatus.failed = false
+                withContext(Dispatchers.IO) { runCatching { repo.syncCatalog { CatalogStatus.size = maxOf(CatalogStatus.size, it) } } }
+                CatalogStatus.size = withContext(Dispatchers.IO) { repo.catalogSize() }
+                CatalogStatus.error = repo.lastCatalogError ?: if (CatalogStatus.size == 0) repo.lastBcsError else null
+                CatalogStatus.failed = CatalogStatus.size == 0
+                CatalogStatus.syncing = false
+                if (CatalogStatus.error == null && !CatalogStatus.failed) break
+                if (attempt >= 3) break
+                attempt++
+                delay(15_000L * attempt)
+            }
         }
     }
     // Opening the scanner looks for new forecasts straight away when the last run is older than 30 minutes.
@@ -712,16 +732,18 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
     var results by remember(symbol) { mutableStateOf<Map<String, FavoriteTfResult>>(emptyMap()) }
     var loading by remember(symbol) { mutableStateOf(true) }
     var updatedAt by remember(symbol) { mutableLongStateOf(0L) }
+    var loadError by remember(symbol) { mutableStateOf<String?>(null) }
 
     suspend fun refreshAnalysis() {
         loading = true
+        loadError = null
         val quote = withContext(Dispatchers.IO) { runCatching { repo.quote(symbol) }.getOrNull() }
         val now = System.currentTimeMillis()
         val computed: List<Pair<String, FavoriteTfResult>> = coroutineScope {
             tfs.map { timeframe ->
                 async(Dispatchers.IO) {
                     val pair = timeframePair(timeframe)
-                    val raw = runCatching { repo.load(symbol, pair.first, pair.second) }.getOrDefault(emptyList())
+                    val raw = runCatching { repo.load(symbol, pair.first, pair.second) }.onFailure { loadError = it.message }.getOrDefault(emptyList())
                     val live = quote?.takeIf { it.isFinite() && it > 0.0 } ?: raw.lastOrNull()?.close ?: 0.0
                     val merged = mergeRealtimeCandle(raw, live, timeframe, now, symbol)
                     val forecast = if (merged.size >= 30 && live > 0.0) {
@@ -736,7 +758,16 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
         updatedAt = now
         loading = false
     }
-    LaunchedEffect(symbol) { refreshAnalysis() }
+    LaunchedEffect(symbol) {
+        refreshAnalysis()
+        // Nothing came back (rate limit, network hiccup): retry quickly instead of waiting a whole minute.
+        var attempt = 0
+        while (attempt < 3 && results.values.none { it.forecast != null }) {
+            delay(8_000L * (attempt + 1))
+            refreshAnalysis()
+            attempt++
+        }
+    }
     LaunchedEffect(symbol) {
         while (true) {
             delay(10_000)
@@ -783,7 +814,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
                 val f = results[tf]?.forecast
                 val c = forecastTimeframeColor(f)
                 val label = when {
-                    f == null -> "$tf • …"
+                    f == null -> if (loading) "$tf • …" else "$tf • —"
                     f.signal.contains("SHORT") -> "$tf • S ${f.confidence}%"
                     f.signal.contains("LONG") -> "$tf • L ${f.confidence}%"
                     else -> "$tf • ${f.confidence}%"
@@ -809,7 +840,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
                 fontSize = 11.sp, fontWeight = FontWeight.Bold, color = signalColor(best.second.signal), modifier = Modifier.padding(top = 8.dp)
             )
         } else if (!loading) {
-            Text(if (ru) "Нет подтверждённого входа — NO TRADE" else "No confirmed entry — NO TRADE", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Warning, modifier = Modifier.padding(top = 8.dp))
+            Text(if (results.values.none { it.forecast != null }) (if (ru) "Данные БКС не получены: ${(repo.lastBcsError ?: loadError ?: "повторяю запрос…").take(130)}" else "No BCS data: ${(repo.lastBcsError ?: loadError ?: "retrying…").take(130)}") else if (ru) "Нет подтверждённого входа — NO TRADE" else "No confirmed entry — NO TRADE", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Warning, modifier = Modifier.padding(top = 8.dp))
         }
     }
 }
@@ -1440,7 +1471,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
 @Composable private fun Stats(history: List<HistoryEntry>, tracked: List<TrackedForecast>, ru: Boolean) { val done=history.filter{it.directionOk!=null};val wins=done.count{it.directionOk==true};val longs=history.count{it.signal.contains("LONG")};val shorts=history.count{it.signal.contains("SHORT")};val avg=if(history.isEmpty())0 else history.map{it.confidence}.average().roundToInt();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard(if(ru) "ПРОГНОЗЫ" else "FORECASTS",history.size.toString(),Accent,Modifier.weight(1f));MetricCard(if(ru) "УСПЕШНЫЕ" else "WINS",wins.toString(),Positive,Modifier.weight(1f));MetricCard(if(ru) "ТОЧНОСТЬ" else "ACCURACY",if(done.isEmpty())"—" else "${wins*100/done.size}%",Warning,Modifier.weight(1f))}};item{Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){MetricCard("LONG",longs.toString(),Positive,Modifier.weight(1f));MetricCard("SHORT",shorts.toString(),Negative,Modifier.weight(1f));MetricCard(if(ru) "СРЕДНЯЯ УВЕРЕННОСТЬ" else "AVG CONF","$avg%",Blue,Modifier.weight(1f))}};item{GradientCard(Modifier.fillMaxWidth()){Text(if(ru)"Активные отслеживания" else "Active monitoring",fontWeight=FontWeight.Black);Text(tracked.count{it.result=="PENDING"}.toString(),fontSize=28.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=5.dp));Text(if(ru)"Уникальность обеспечивается парой инструмент + таймфрейм." else "Uniqueness is enforced by instrument + timeframe.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
 }
 
-@Composable private fun BcsConnectionSettings(ru:Boolean,prefs:android.content.SharedPreferences,onSaved:()->Unit){
+@Composable private fun BcsConnectionSettings(ru:Boolean,prefs:android.content.SharedPreferences,repo:MarketRepository,onSaved:()->Unit){
     var token by remember { mutableStateOf(SecureTokenStore.get(prefs)) }
     var saved by remember { mutableStateOf(token.isNotBlank()) }
     SettingGroup(if(ru)"БКС" else "BCS"){
@@ -1449,6 +1480,30 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
         Button(onClick={SecureTokenStore.set(prefs,token);saved=token.isNotBlank();onSaved()},enabled=token.isNotBlank(),modifier=Modifier.fillMaxWidth().padding(top=7.dp),shape=RoundedCornerShape(13.dp)){Text(if(ru)if(saved)"БКС подключён" else "Сохранить токен" else if(saved)"BCS connected" else "Save token",fontWeight=FontWeight.Black)}
         Text(if(token.isNotBlank()&&saved)if(ru)"Источник инструментов и рыночных данных: БКС API" else "Instrument and market-data source: BCS API" else if(ru)"Введите refresh-токен БКС с правами только для чтения." else "Enter a BCS read-only refresh token.",fontSize=11.sp,color=if(token.isNotBlank()&&saved)Positive else Warning,modifier=Modifier.padding(top=5.dp))
         Box(Modifier.padding(top=6.dp)){CatalogStatusLine(ru,token.isNotBlank()&&saved,onSaved)}
+        var report by remember { mutableStateOf<List<String>>(emptyList()) }
+        var checking by remember { mutableStateOf(false) }
+        val checkScope = rememberCoroutineScope()
+        OutlinedButton(
+            onClick = {
+                if (!checking) {
+                    checking = true
+                    report = emptyList()
+                    checkScope.launch {
+                        report = withContext(Dispatchers.IO) { runCatching { repo.diagnose() }.getOrElse { listOf("✗ " + (it.message ?: "ошибка")) } }
+                        checking = false
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            shape = RoundedCornerShape(13.dp)
+        ) {
+            if (checking) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Refresh, null)
+            Spacer(Modifier.width(6.dp))
+            Text(if (ru) "Проверить подключение" else "Test connection", fontWeight = FontWeight.Bold)
+        }
+        report.forEach { line ->
+            Text(line, fontSize = 11.sp, color = if (line.startsWith("✓")) Positive else if (line.startsWith("✗")) Negative else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
+        }
     }
 }
 @Composable private fun Settings(ru:Boolean,notifications:Boolean,interval:Int,prefs:android.content.SharedPreferences,refreshValue:Int,refreshUnit:String,displayCurrency:String,toggleLang:()->Unit,toggleNotif:(Boolean)->Unit,setInterval:(Int)->Unit,setRefreshValue:(Int)->Unit,setRefreshUnit:(String)->Unit,setDisplayCurrency:(String)->Unit,clearHistory:()->Unit,runNow:()->Unit,repo:MarketRepository,onTokenSaved:()->Unit){
@@ -1457,7 +1512,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()}}}
-        item{BcsConnectionSettings(ru,prefs,onTokenSaved)}
+        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}

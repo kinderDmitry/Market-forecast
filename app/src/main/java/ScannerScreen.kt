@@ -63,6 +63,7 @@ internal object CatalogStatus {
     var size by mutableIntStateOf(0)
     var syncing by mutableStateOf(false)
     var failed by mutableStateOf(false)
+    var error by mutableStateOf<String?>(null)
 }
 
 private fun agoText(ms: Long, ru: Boolean): String {
@@ -82,6 +83,7 @@ private fun etaText(seconds: Long, ru: Boolean): String {
 }
 
 private fun scopeLabel(s: ScanScope, ru: Boolean): String = when (s) {
+    ScanScope.MAIN -> if (ru) "Основные акции" else "Main boards"
     ScanScope.ALL -> if (ru) "Весь рынок" else "Whole market"
     ScanScope.RU_STOCKS -> if (ru) "Акции РФ" else "Russian stocks"
     ScanScope.FOREIGN -> if (ru) "Иностранные" else "Foreign"
@@ -393,14 +395,21 @@ internal fun CatalogStatusLine(ru: Boolean, hasToken: Boolean, onRetry: () -> Un
         else "Search uses the BCS catalogue. Add your refresh token in settings to download all stocks and currencies."
         CatalogStatus.syncing && CatalogStatus.size == 0 -> if (ru) "Загружаю каталог БКС…" else "Downloading the BCS catalogue…"
         CatalogStatus.syncing -> if (ru) "В каталоге ${CatalogStatus.size} инструментов, загрузка продолжается…" else "${CatalogStatus.size} instruments, still downloading…"
+        CatalogStatus.size > 0 && CatalogStatus.error != null -> {
+            val why = CatalogStatus.error.orEmpty().take(110)
+            if (ru) "В каталоге ${CatalogStatus.size} инструментов, но загрузка не завершена ($why). Нажмите «повторить»." else "${CatalogStatus.size} instruments, but the download is incomplete ($why). Tap retry."
+        }
         CatalogStatus.size > 0 -> if (ru) "В каталоге ${CatalogStatus.size} акций и валют БКС" else "${CatalogStatus.size} BCS stocks and currencies"
-        CatalogStatus.failed -> if (ru) "Каталог не загрузился. Проверьте сеть и токен." else "The catalogue could not be downloaded. Check network and token."
+        CatalogStatus.failed -> {
+            val why = CatalogStatus.error?.take(110)?.let { " ($it)" }.orEmpty()
+            if (ru) "Каталог не загрузился$why. Проверьте сеть и токен." else "The catalogue could not be downloaded$why. Check network and token."
+        }
         else -> ""
     }
     if (text.isBlank()) return
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(text, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-        if (hasToken && !CatalogStatus.syncing && CatalogStatus.failed) {
+        if (hasToken && !CatalogStatus.syncing && (CatalogStatus.failed || CatalogStatus.error != null)) {
             IconButton(onClick = onRetry) { Icon(Icons.Default.Refresh, if (ru) "Повторить" else "Retry") }
         }
     }

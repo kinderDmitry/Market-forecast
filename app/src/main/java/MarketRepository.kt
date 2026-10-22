@@ -18,6 +18,10 @@ import kotlin.math.ceil
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import java.util.concurrent.atomic.AtomicInteger
 
 
 internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: Double?): Double {
@@ -25,6 +29,9 @@ internal fun reconcileLivePrice(symbol: String, candles: List<Candle>, quoted: D
     // current quote, fail closed instead of presenting stale data as "now".
     return quoted?.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
 }
+
+/** HTTP error that keeps the status code and the server's Retry-After hint. The message still starts with "HTTP <code>". */
+private class BcsHttpException(val code: Int, val retryAfterMs: Long, message: String) : IllegalStateException(message)
 
 /** Market-data repository. BCS is the sole market-data provider; news/dividends are separate informational feeds. */
 class MarketRepository(
@@ -40,6 +47,7 @@ class MarketRepository(
         private val candleCache = ConcurrentHashMap<String, Pair<Long, List<Candle>>>()
         private val quoteCache = ConcurrentHashMap<String, Pair<Long, Double>>()
         private const val CANDLE_CACHE_MS = 120_000L
+        private const val LONG_CANDLE_CACHE_MS = 600_000L
         private const val QUOTE_CACHE_MS = 5_000L
         // Only instruments the app can actually search: shares (including
         // foreign shares/DRs) and currencies. Do not download ETFs, indices,
@@ -52,10 +60,41 @@ class MarketRepository(
         // requests can run concurrently from UI/workers.
         private val bcsHttpGate = Any()
         private var bcsLastRequestAt = 0L
-        private const val BCS_MIN_REQUEST_GAP_MS = 105L
+        private const val BCS_MIN_REQUEST_GAP_MS = 112L
         // Reuse worker pools instead of creating/shutting down threads on every refresh.
         private val analysisPool = Executors.newFixedThreadPool(8)
         private val prefetchPool = Executors.newFixedThreadPool(6)
+        // Background work (catalogue download, market scanner) is marked on its thread and always yields the
+        // shared 10 RPS budget to interactive requests (analysis, quotes), so the UI never waits for a scan.
+        private val backgroundHttp = ThreadLocal<Boolean>()
+        private val interactiveWaiting = AtomicInteger(0)
+        // Dedicated pools: catalogue pages and candle chunks are fetched in parallel. They never nest.
+        private val catalogPool = Executors.newFixedThreadPool(6) { task ->
+            Thread({ backgroundHttp.set(true); task.run() }, "mfp-catalog").apply { isDaemon = true }
+        }
+        private val chunkPool = Executors.newFixedThreadPool(6) { task -> Thread(task, "mfp-candles").apply { isDaemon = true } }
+        // Identical candle requests that are in flight at the same moment share one download.
+        private val inflightCandles = ConcurrentHashMap<String, FutureTask<List<Candle>>>()
+        private const val CATALOG_WINDOW = 5
+        private const val CATALOG_DEFAULT_PAGE = 100
+        private const val CATALOG_BIG_PAGE = 1000
+        private const val CATALOG_PAGE_SIZE_PREF = "bcs_catalog_page_size"
+        // The four catalogue types download concurrently; their page requests share catalogPool and the rate limiter.
+        private val catalogTypePool = Executors.newFixedThreadPool(4) { task -> Thread(task, "mfp-catalog-type").apply { isDaemon = true } }
+        // Adaptive rate limit: the gap between requests grows on HTTP 429 and shrinks back after successes,
+        // so the app converges to whatever BCS really allows instead of hammering it.
+        @Volatile private var bcsGapMs = BCS_MIN_REQUEST_GAP_MS
+        @Volatile private var bcsBlockedUntil = 0L
+        // One access token for the whole process: every MarketRepository instance shares it.
+        private val tokenLock = Any()
+        @Volatile private var sharedAccessToken: String? = null
+        @Volatile private var sharedAccessExpiresAt = 0L
+        @Volatile private var sharedAccessFingerprint = 0
+        @Volatile private var authFailedUntil = 0L
+        @Volatile private var authFailure: String? = null
+        @Volatile private var lastRequestError: String? = null
+        // Russian shares and currencies first: they become searchable within seconds.
+        private val CATALOG_SYNC_ORDER = listOf("STOCK", "CURRENCY", "DEPOSITARY_RECEIPTS", "FOREIGN_STOCK")
         // Search results are metadata only; a short TTL makes repeated typing/navigation
         // effectively instant without turning this into a downloaded instrument catalogue.
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResult>>>()
@@ -98,6 +137,10 @@ class MarketRepository(
 
     fun catalogSyncedAt(): Long = prefs?.getLong(CATALOG_SYNCED_AT, 0L) ?: 0L
 
+    /** Why the last catalogue download was incomplete (null when it succeeded). Shown in the UI. */
+    @Volatile var lastCatalogError: String? = null
+        private set
+
     /**
      * Downloads the COMPLETE BCS catalogue (stocks, foreign stocks, depositary receipts, currencies)
      * and keeps it on disk. Instruments become searchable page by page while it downloads.
@@ -115,28 +158,61 @@ class MarketRepository(
             if (!force && fresh()) return searchEngine.size()
             val collected = LinkedHashMap<String, SearchResult>()
             val pending = ArrayList<SearchResult>()
-            var complete = true
-            for (type in TRADING_INSTRUMENT_TYPES) {
-                try {
+            val state = Any()
+            val errors = java.util.Collections.synchronizedList(ArrayList<Throwable>())
+            val pageSize = choosePageSize()
+            fun flush() {
+                synchronized(state) {
+                    if (pending.isNotEmpty()) { searchEngine.addAll(ArrayList(pending)); pending.clear() }
+                }
+            }
+            fun runType(type: String): Boolean {
+                return try {
                     loadCatalogType(
-                        type, Int.MAX_VALUE,
+                        type, Int.MAX_VALUE, pageSize,
                         onPage = { _, _, _ ->
-                            if (pending.isNotEmpty()) { searchEngine.addAll(pending); pending.clear() }
-                            onProgress?.invoke(collected.size)
+                            flush()
+                            onProgress?.invoke(synchronized(state) { collected.size })
                         },
                         onItem = { item ->
-                            if (isSupportedCatalogType(item.type) && collected.putIfAbsent(catalogIdentity(item), item) == null) {
-                                pending.add(item)
+                            if (isSupportedCatalogType(item.type)) synchronized(state) {
+                                if (collected.putIfAbsent(catalogIdentity(item), item) == null) pending.add(item)
                             }
                         }
                     )
+                    true
                 } catch (t: Throwable) {
-                    complete = false
+                    errors.add(t)
+                    false
+                } finally {
+                    flush()
                 }
-                if (pending.isNotEmpty()) { searchEngine.addAll(pending); pending.clear() }
+            }
+            // All types at once: the small ones (currencies, receipts) are searchable immediately, the big ones stream in.
+            val futures = CATALOG_SYNC_ORDER.map { type -> type to catalogTypePool.submit(Callable { runType(type) }) }
+            val failedTypes = ArrayList<String>()
+            for ((type, future) in futures) {
+                val ok = try { future.get(10, TimeUnit.MINUTES) } catch (t: Throwable) { errors.add(t); false }
+                if (!ok) failedTypes += type
+            }
+            // Persist what we have: a killed app resumes from here, not from zero.
+            if (collected.isNotEmpty()) persistCatalogDisk(searchEngine.all())
+            // A transient rate-limit storm is usually over by now: give failed types one more pass.
+            for (type in failedTypes.toList()) if (runType(type)) failedTypes.remove(type)
+            val complete = failedTypes.isEmpty()
+            val existing = searchEngine.size()
+            // A "successful" download that is suspiciously small must not wipe a good catalogue.
+            val suspicious = complete && existing > 200 && collected.size < existing / 2
+            lastCatalogError = when {
+                suspicious -> "БКС вернул подозрительно мало инструментов (${collected.size} вместо ${existing})"
+                complete -> null
+                else -> errors.lastOrNull()?.let { friendlyBcsError(it) } ?: "неизвестная ошибка"
+            }
+            if (!complete && pageSize > CATALOG_DEFAULT_PAGE && errors.any { it.message.orEmpty().contains("HTTP 400") }) {
+                prefs?.edit()?.remove(CATALOG_PAGE_SIZE_PREF)?.apply() // the big page size was rejected: probe again next time
             }
             if (collected.isNotEmpty()) {
-                if (complete) {
+                if (complete && !suspicious) {
                     // A fully successful download is authoritative: delisted instruments disappear.
                     searchEngine.replaceAll(collected.values)
                     persistCatalogDisk(collected.values)
@@ -147,6 +223,58 @@ class MarketRepository(
             }
         }
         return searchEngine.size()
+    }
+
+    /**
+     * Instant start. While the index is empty (first launch), the shares of the main board and the currency
+     * pairs come straight from the public MOEX ISS: two tiny requests, no token, outside the BCS rate limit.
+     * Search, favourites and the scanner work within a second; the full BCS catalogue then replaces this.
+     */
+    fun bootstrapCatalog(): Int {
+        ensureCatalogLoaded()
+        if (searchEngine.size() > 0) return searchEngine.size()
+        val items = java.util.Collections.synchronizedList(ArrayList<SearchResult>())
+        val sources = listOf(
+            Triple("https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME,SECNAME", "TQBR", "STOCK"),
+            Triple("https://iss.moex.com/iss/engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME,SECNAME", "CETS", "CURRENCY")
+        )
+        val futures = sources.map { (url, board, type) ->
+            catalogTypePool.submit(Callable {
+                val data = JSONObject(getText(url, 8000)).optJSONObject("securities")?.optJSONArray("data") ?: return@Callable 0
+                var n = 0
+                for (i in 0 until data.length()) {
+                    val row = data.optJSONArray(i) ?: continue
+                    val ticker = row.optString(0).trim()
+                    if (ticker.isBlank()) continue
+                    val name = row.optString(1).ifBlank { row.optString(2) }.ifBlank { ticker }
+                    items.add(SearchResult(ticker, name, "MOEX", type, "MOEX", board))
+                    n++
+                }
+                n
+            })
+        }
+        futures.forEach { runCatching { it.get(12, TimeUnit.SECONDS) } }
+        if (items.isNotEmpty() && searchEngine.size() == 0) {
+            val copy = ArrayList(items)
+            searchEngine.addAll(copy)
+            persistCatalogDisk(copy)
+        }
+        return searchEngine.size()
+    }
+
+    /** Big pages are 10x fewer requests. Probed once; the verdict is remembered. */
+    private fun choosePageSize(): Int {
+        val saved = prefs?.getInt(CATALOG_PAGE_SIZE_PREF, 0) ?: 0
+        if (saved > 0) return saved
+        return try {
+            fetchCatalogPage("STOCK", 0, CATALOG_BIG_PAGE)
+            prefs?.edit()?.putInt(CATALOG_PAGE_SIZE_PREF, CATALOG_BIG_PAGE)?.apply()
+            CATALOG_BIG_PAGE
+        } catch (t: Throwable) {
+            val m = t.message.orEmpty()
+            if (m.contains("HTTP 400") || m.contains("HTTP 422")) prefs?.edit()?.putInt(CATALOG_PAGE_SIZE_PREF, CATALOG_DEFAULT_PAGE)?.apply()
+            CATALOG_DEFAULT_PAGE
+        }
     }
 
     /** Instant local search over the whole catalogue. */
@@ -194,33 +322,56 @@ class MarketRepository(
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
         val cacheKey = "${if (bcsRefreshToken.isNullOrBlank()) "LEGACY" else "BCS"}|$clean|$range|$interval"
+        val ttl = if (interval == "1d" || interval == "1wk") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
         val cached = candleCache[cacheKey]
-        if (cached != null && System.currentTimeMillis() - cached.first <= CANDLE_CACHE_MS && cached.second.isNotEmpty()) {
+        if (cached != null && System.currentTimeMillis() - cached.first <= ttl && cached.second.isNotEmpty()) {
             return cached.second
         }
-        // Forecast integrity rule: ALL forecast candles come from BCS. Never
-        // silently fall back to another provider for a forecast dataset.
-        // dataset, otherwise the same instrument can have different prices/levels
-        // between screens and timeframes.
-        if (!bcsRefreshToken.isNullOrBlank()) {
-            val fetched = runCatching { loadBcs(clean, range, interval) }
-            val normalized = fetched.getOrNull()?.let { normalizeInterval(it, interval) }.orEmpty()
-            if (normalized.isNotEmpty()) {
-                candleCache[cacheKey] = System.currentTimeMillis() to normalized
-                if (candleCache.size > 250) {
-                    candleCache.entries.minByOrNull { it.value.first }?.let { candleCache.remove(it.key) }
-                }
-                return normalized
-            }
-            // Stale-while-revalidate: temporary BCS timeout/rate-limit must not
-            // make an already loaded timeframe disappear from the UI.
-            cached?.second?.takeIf { it.isNotEmpty() }?.let { return it }
-            throw IllegalStateException("БКС: не удалось получить свечи для $symbol ($interval): ${fetched.exceptionOrNull()?.message ?: "пустой ответ"}")
+        // Forecast integrity rule: ALL forecast candles come from BCS. Never silently fall back to another
+        // provider, otherwise the same instrument can have different prices/levels between screens.
+        if (bcsRefreshToken.isNullOrBlank()) {
+            throw IllegalStateException("БКС не подключен. Подключите refresh-токен БКС для получения прогнозов.")
         }
-        // Forecasts are intentionally fail-closed: without BCS credentials there is
-        // no fallback provider. This prevents a hidden secondary price source from entering
-        // a forecast and reintroducing cross-screen/timeframe price divergence.
-        throw IllegalStateException("БКС не подключен. Подключите refresh-токен БКС для получения прогнозов.")
+        // Analysis, the favourites feed and the multi-timeframe context often ask for the same series at the
+        // same moment: only one request set goes out, the others wait for it.
+        val task = FutureTask<List<Candle>>(Callable { fetchAndCache(clean, range, interval, cacheKey, cached?.second) })
+        val running = inflightCandles.putIfAbsent(cacheKey, task)
+        if (running != null) return awaitCandles(running)
+        try { task.run() } finally { inflightCandles.remove(cacheKey, task) }
+        return awaitCandles(task)
+    }
+
+    private fun awaitCandles(task: FutureTask<List<Candle>>): List<Candle> =
+        try { task.get(120, TimeUnit.SECONDS) } catch (e: ExecutionException) { throw e.cause ?: e }
+
+    private fun fetchAndCache(clean: String, range: String, interval: String, cacheKey: String, stale: List<Candle>?): List<Candle> {
+        // Refresh = ONE small request for the newest bars, merged into what we already have.
+        if (stale != null && stale.size >= 40) {
+            val incremental = runCatching { loadBcsIncremental(clean, interval, stale) }
+            val merged = incremental.getOrNull()
+            if (merged != null) {
+                candleCache[cacheKey] = System.currentTimeMillis() to merged
+                return merged
+            }
+            if (incremental.isFailure) {
+                // Temporary trouble: keep serving the loaded history and look again in 15 s instead of re-downloading everything.
+                val ttl = if (interval == "1d" || interval == "1wk") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
+                candleCache[cacheKey] = (System.currentTimeMillis() - ttl + 15_000L) to stale
+                return stale
+            }
+        }
+        val fetched = runCatching { loadBcs(clean, range, interval) }
+        val normalized = fetched.getOrNull()?.let { normalizeInterval(it, interval) }.orEmpty()
+        if (normalized.isNotEmpty()) {
+            candleCache[cacheKey] = System.currentTimeMillis() to normalized
+            if (candleCache.size > 250) {
+                candleCache.entries.minByOrNull { it.value.first }?.let { candleCache.remove(it.key) }
+            }
+            return normalized
+        }
+        // Stale-while-revalidate: a temporary BCS timeout/rate-limit must not make a loaded timeframe disappear.
+        stale?.takeIf { it.isNotEmpty() }?.let { return it }
+        throw IllegalStateException("БКС: не удалось получить свечи для $clean ($interval): ${fetched.exceptionOrNull()?.message ?: "пустой ответ"}")
     }
 
     /** Priority prefetch for the Analytics Center. Historical candles are cached
@@ -275,14 +426,19 @@ class MarketRepository(
      */
     fun loadScanCandles(symbol: String, classCode: String): List<Candle> {
         if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
-        val ticker = canonicalSymbol(symbol).substringBefore("@")
-        val board = classCode.ifBlank { bcsInstrument(ticker).second }
-        val end = System.currentTimeMillis()
-        val start = end - 430L * 86_400_000L
-        val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(board)}&timeFrame=D&startDate=${enc(isoUtc(start))}&endDate=${enc(isoUtc(end))}"
-        val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
-        val raw = parseBcsCandles(root).distinctBy { it.time }.sortedBy { it.time }
-        return normalizeInterval(raw, "1d")
+        backgroundHttp.set(true)
+        try {
+            val ticker = canonicalSymbol(symbol).substringBefore("@")
+            val board = classCode.ifBlank { bcsInstrument(ticker).second }
+            val end = System.currentTimeMillis()
+            val start = end - 430L * 86_400_000L
+            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(board)}&timeFrame=D&startDate=${enc(isoUtc(start))}&endDate=${enc(isoUtc(end))}"
+            val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
+            val raw = parseBcsCandles(root).distinctBy { it.time }.sortedBy { it.time }
+            return normalizeInterval(raw, "1d")
+        } finally {
+            backgroundHttp.set(false)
+        }
     }
 
     private fun previousClose(item: SearchResult): Double {
@@ -369,136 +525,92 @@ class MarketRepository(
         return item.takeIf { ok }
     }
 
-    private fun loadCatalogPage(type: String, page: Int): List<SearchResult> {
+    private class CatalogPage(val items: JSONArray, val totalPages: Int)
+
+    /** One catalogue page. Retries only what is worth retrying. */
+    private fun fetchCatalogPage(type: String, page: Int, size: Int = CATALOG_DEFAULT_PAGE): CatalogPage {
         var last: Throwable? = null
-        for (attempt in 0..4) {
+        for (attempt in 0..2) {
             try {
                 val root = JSONObject(getTextAuth(
-                    "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
-                    9000, bcsHeaders()
+                    "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=$size",
+                    20000, bcsHeaders()
                 ))
-                val arr = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
-                val out = ArrayList<SearchResult>(arr.length())
+                val items = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
+                // Optional paging metadata: when the server reports it, no empty trailing pages are requested.
+                var pages = -1
+                for (k in listOf("totalPages", "total_pages", "pages")) if (root.has(k)) { pages = root.optInt(k, -1); break }
+                return CatalogPage(items, pages)
+            } catch (t: Throwable) {
+                last = t
+                val m = t.message.orEmpty()
+                val retryable = m.contains("429") || m.contains("408") || m.contains("HTTP 5") ||
+                    m.contains("timeout", true) || m.contains("timed out", true)
+                if (!retryable) break
+                Thread.sleep(400L * (attempt + 1))
+            }
+        }
+        throw last ?: IllegalStateException("БКС: не удалось получить страницу каталога")
+    }
+
+    /**
+     * Downloads one instrument type page by page with a sliding window of [CATALOG_WINDOW] parallel requests:
+     * a slow page never stalls the pages behind it. Pages are processed strictly in order, so the result is
+     * identical to a sequential download. A failed page is never skipped: it fails the type.
+     */
+    private fun loadCatalogType(type: String, maxPagesPerType: Int, pageSize: Int = CATALOG_DEFAULT_PAGE, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null, onItem: ((SearchResult) -> Unit)? = null): List<SearchResult> {
+        val out = LinkedHashMap<String, SearchResult>()
+        val inflight = ArrayList<Pair<Int, java.util.concurrent.Future<CatalogPage>>>()
+        var nextToSubmit = 0
+        var limit = maxPagesPerType
+        var finished = false
+        fun fill() {
+            while (inflight.size < CATALOG_WINDOW && (limit == Int.MAX_VALUE || nextToSubmit < limit)) {
+                val p = nextToSubmit++
+                inflight.add(p to catalogPool.submit(Callable { fetchCatalogPage(type, p, pageSize) }))
+            }
+        }
+        try {
+            fill()
+            while (!finished && inflight.isNotEmpty()) {
+                val (page, future) = inflight.removeAt(0)
+                val result = try {
+                    future.get(90, TimeUnit.SECONDS)
+                } catch (e: ExecutionException) {
+                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type: ${e.cause?.message ?: e.message}")
+                }
+                val arr = result.items
+                if (result.totalPages > 0) limit = minOf(limit, result.totalPages + 1)
+                if (arr.length() == 0) {
+                    // Page 0 may be empty on one-based deployments: keep going, page 1 decides.
+                    if (page == 0) { onPage?.invoke(0, 0, false); fill(); continue }
+                    onPage?.invoke(page, 0, true)
+                    finished = true
+                    break
+                }
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     val ticker = o.optString("ticker").trim()
                     if (ticker.isBlank()) continue
-                    out += SearchResult(
-                        ticker,
-                        o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { ticker },
-                        o.optString("exchange").ifBlank { "БКС" },
-                        o.optString("instrumentType").ifBlank { type },
-                        "БКС", o.optString("classCode")
-                    )
+                    val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
+                    val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
+                    val name = o.optString("displayName")
+                        .ifBlank { o.optString("shortName") }
+                        .ifBlank { o.optString("issuerName") }
+                        .ifBlank { ticker }
+                    val typeName = o.optString("instrumentType").ifBlank { type }
+                    val classCode = boardObj?.optString("classCode").orEmpty()
+                    val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
+                    out.putIfAbsent(catalogIdentity(item), item)
+                    onItem?.invoke(item)
                 }
-                return out
-            } catch (t: Throwable) {
-                last = t
-                Thread.sleep((180L * (attempt + 1)).coerceAtMost(900L))
+                // A short non-empty page is still a page: some deployments cap the size below the requested one.
+                onPage?.invoke(page, arr.length(), false)
+                if (nextToSubmit >= 3000) throw IllegalStateException("БКС: превышен безопасный предел страниц каталога")
+                fill()
             }
-        }
-        throw last ?: IllegalStateException("БКС: не удалось получить страницу инструментов")
-    }
-
-    private fun loadCatalogType(type: String, maxPagesPerType: Int, onPage: ((page: Int, items: Int, finished: Boolean) -> Unit)? = null, onItem: ((SearchResult) -> Unit)? = null): List<SearchResult> {
-        val out = LinkedHashMap<String, SearchResult>()
-        var page = 0
-        var consecutiveFailures = 0
-        while (maxPagesPerType == Int.MAX_VALUE || page < maxPagesPerType) {
-            var pageError: Throwable? = null
-            val arr = runCatching {
-                var last: Throwable? = null
-                for (attempt in 0..7) {
-                    try {
-                        val root = JSONObject(getTextAuth(
-                            "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=100",
-                            20000, bcsHeaders()
-                        ))
-                        return@runCatching root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
-                    } catch (t: Throwable) {
-                        last = t
-                        pageError = t
-                        val message = t.message.orEmpty()
-                        val retryable = message.contains("429") || message.contains("408") ||
-                            message.contains("500") || message.contains("502") ||
-                            message.contains("503") || message.contains("504") ||
-                            message.contains("timeout", true) || message.contains("timed out", true)
-                        if (!retryable) break
-                        Thread.sleep((500L shl attempt.coerceAtMost(3)).coerceAtMost(6000L))
-                    }
-                }
-                throw last ?: IllegalStateException("БКС: пустой ответ каталога")
-            }.getOrNull()
-
-            if (arr == null) {
-                // Do not advance the page after a transient error. Advancing would
-                // silently skip a whole page and produce a fake partial universe.
-                consecutiveFailures++
-                if (consecutiveFailures >= 3) {
-                    throw IllegalStateException("БКС: не удалось загрузить страницу $page типа $type: ${pageError?.message ?: "неизвестная ошибка"}")
-                }
-                continue
-            }
-            consecutiveFailures = 0
-            if (arr.length() == 0 && page == 0) {
-                // Some BCS deployments/examples have used one-based pagination.
-                // Probe page 1 once instead of treating an empty page 0 as an
-                // empty market. This keeps the BCS catalogue resilient across deployments
-                // without downloading a local catalogue.
-                val pageOne = runCatching {
-                    val root = JSONObject(getTextAuth(
-                        "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=1&size=100",
-                        20000, bcsHeaders()
-                    ))
-                    root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
-                }.getOrDefault(JSONArray())
-                if (pageOne.length() > 0) {
-                    for (i in 0 until pageOne.length()) {
-                        val o = pageOne.optJSONObject(i) ?: continue
-                        val ticker = o.optString("ticker").trim()
-                        if (ticker.isBlank()) continue
-                        val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                        val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
-                        val name = o.optString("displayName").ifBlank { o.optString("shortName") }.ifBlank { o.optString("issuerName") }.ifBlank { ticker }
-                        val typeName = o.optString("instrumentType").ifBlank { type }
-                        val classCode = boardObj?.optString("classCode").orEmpty()
-                        val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
-                        out.putIfAbsent(catalogIdentity(item), item)
-                        onItem?.invoke(item)
-                    }
-                    onPage?.invoke(1, pageOne.length(), false)
-                    // page=0 was rejected as empty, so this deployment is using
-                    // one-based pagination. Continue with page 2 rather than
-                    // requesting page 1 twice.
-                    page = 2
-                    continue
-                }
-                onPage?.invoke(page, 0, true)
-                break
-            }
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val ticker = o.optString("ticker").trim()
-                if (ticker.isBlank()) continue
-                val boardObj = o.optJSONArray("boards")?.let { chooseBoard(it) }
-                val exchange = boardObj?.optString("exchange").orEmpty().ifBlank { "БКС" }
-                val name = o.optString("displayName")
-                    .ifBlank { o.optString("shortName") }
-                    .ifBlank { o.optString("issuerName") }
-                    .ifBlank { ticker }
-                val typeName = o.optString("instrumentType").ifBlank { type }
-                val classCode = boardObj?.optString("classCode").orEmpty()
-                val item = SearchResult(ticker, name, exchange, typeName, "БКС", classCode)
-                out.putIfAbsent(catalogIdentity(item), item)
-                onItem?.invoke(item)
-            }
-            // Do not infer the end of the universe from page length. BCS deployments
-            // may cap the effective page size below the requested 100 (for example 25).
-            // A short non-empty page is therefore still a valid page, not EOF.
-            onPage?.invoke(page, arr.length(), arr.length() == 0)
-            if (arr.length() == 0) break
-            page++
-            if (page >= 2000) throw IllegalStateException("БКС: превышен безопасный предел страниц каталога")
+        } finally {
+            inflight.forEach { it.second.cancel(true) }
         }
         return out.values.toList()
     }
@@ -769,54 +881,142 @@ class MarketRepository(
         else -> null
     }
 
-    @Volatile private var bcsAccessToken: String? = null
-    @Volatile private var bcsAccessExpiresAt: Long = 0L
-    @Volatile private var bcsAccessRefreshFingerprint: Int = 0
-
     private fun bcsAccessToken(): String? {
         val refresh = bcsRefreshToken?.trim().orEmpty()
         if (refresh.isBlank()) return null
-        val now = System.currentTimeMillis()
         val fingerprint = refresh.hashCode()
-        val cached = bcsAccessToken
-        if (bcsAccessRefreshFingerprint == fingerprint && !cached.isNullOrBlank() && now < bcsAccessExpiresAt - 60_000L) return cached
-        val body = "client_id=trade-api-read&refresh_token=${enc(refresh)}&grant_type=refresh_token"
-        val text = postForm("https://be.broker.ru/trade-api-keycloak/realms/tradeapi/protocol/openid-connect/token", body, 12000)
-        val json = JSONObject(text)
-        val token = json.optString("access_token").takeIf { it.isNotBlank() } ?: return null
-        bcsAccessToken = token
-        bcsAccessRefreshFingerprint = fingerprint
-        bcsAccessExpiresAt = now + json.optLong("expires_in", 86400L) * 1000L
-        return token
+        synchronized(tokenLock) {
+            val now = System.currentTimeMillis()
+            val cached = sharedAccessToken
+            if (sharedAccessFingerprint == fingerprint && !cached.isNullOrBlank() && now < sharedAccessExpiresAt - 60_000L) return cached
+            // A rejected token is not retried by every parallel request: fail fast during a short cool-down.
+            if (sharedAccessFingerprint == fingerprint && now < authFailedUntil) {
+                throw IllegalStateException(authFailure ?: "БКС: не удалось получить access token")
+            }
+            try {
+                val body = "client_id=trade-api-read&refresh_token=${enc(refresh)}&grant_type=refresh_token"
+                val text = postForm("https://be.broker.ru/trade-api-keycloak/realms/tradeapi/protocol/openid-connect/token", body, 12000)
+                val json = JSONObject(text)
+                val token = json.optString("access_token").takeIf { it.isNotBlank() }
+                    ?: throw IllegalStateException("БКС: в ответе авторизации нет access_token")
+                sharedAccessToken = token
+                sharedAccessFingerprint = fingerprint
+                sharedAccessExpiresAt = now + json.optLong("expires_in", 86400L) * 1000L
+                authFailure = null
+                authFailedUntil = 0L
+                return token
+            } catch (t: Throwable) {
+                val m = t.message.orEmpty()
+                authFailure = when {
+                    m.contains("HTTP 400") || m.contains("HTTP 401") || m.contains("invalid_grant") ->
+                        "Токен БКС недействителен или истёк. Создайте новый refresh-токен и вставьте его в настройках."
+                    m.contains("timeout", true) || m.contains("timed out", true) || m.contains("Unable to resolve", true) ->
+                        "Нет связи с авторизацией БКС (сеть или таймаут)."
+                    else -> "Не удалось получить доступ к БКС: ${m.take(120)}"
+                }
+                sharedAccessFingerprint = fingerprint
+                authFailedUntil = System.currentTimeMillis() + 20_000L
+                throw IllegalStateException(authFailure)
+            }
+        }
     }
 
     private fun bcsHeaders(): Map<String,String> = mapOf("Authorization" to "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось получить access token")}", "Accept" to "application/json")
 
     private fun invalidateBcsAccessToken() {
-        bcsAccessToken = null
-        bcsAccessExpiresAt = 0L
-        bcsAccessRefreshFingerprint = 0
+        synchronized(tokenLock) {
+            sharedAccessToken = null
+            sharedAccessExpiresAt = 0L
+            sharedAccessFingerprint = 0
+            authFailedUntil = 0L
+        }
     }
 
     private fun loadBcs(symbol: String, range: String, interval: String): List<Candle> {
         val (ticker, classCode) = bcsInstrument(symbol)
         val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
-        val days = when (range) { "60d" -> 60; "2y" -> 730; "10y" -> 3650; else -> 3650 }
-        val end = System.currentTimeMillis()
-        val start = end - days * 86_400_000L
+        // History per timeframe: plenty for every indicator, the multi-timeframe context and the backtest,
+        // but few requests (M15 4, H1 4, H4 3, D 1, W 1 instead of 25 in total before).
+        val days = when (tf) {
+            "M15" -> 60; "H1" -> 240; "H4" -> 720; "D" -> 1400; "W" -> 3650
+            else -> when (range) { "60d" -> 60; "2y" -> 730; else -> 3650 }
+        }
         // BCS limits a single candle response to 1440 bars. Keep requests bounded.
         val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D" -> 1440; "W" -> 10080; else -> 43200 }
-        val out = mutableListOf<Candle>()
+        val end = System.currentTimeMillis()
+        val total = days * 86_400_000L
         val chunkMs = maxOf(86_400_000L, (1440L * maxSpan) * 60_000L)
-        var cursor = start
-        while (cursor < end && out.size < 5000) {
-            val chunkEnd = minOf(end, cursor + chunkMs)
-            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(classCode)}&timeFrame=$tf&startDate=${enc(isoUtc(cursor))}&endDate=${enc(isoUtc(chunkEnd))}"
-            val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
-            out += parseBcsCandles(root)
-            cursor = chunkEnd + 1000L
+        val chunks = ((total + chunkMs - 1) / chunkMs).toInt().coerceIn(1, 8)
+        // Newest chunk first. All chunks are requested in parallel.
+        val futures = (0 until chunks).map { i ->
+            val b = end - chunkMs * i
+            val a = maxOf(end - total, b - chunkMs)
+            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(classCode)}&timeFrame=$tf&startDate=${enc(isoUtc(a))}&endDate=${enc(isoUtc(b))}"
+            chunkPool.submit(Callable { parseBcsCandles(JSONObject(getTextAuth(url, 15000, bcsHeaders()))) })
+        }
+        val out = ArrayList<Candle>()
+        futures.forEachIndexed { i, future ->
+            try {
+                out += future.get(60, TimeUnit.SECONDS)
+            } catch (e: Throwable) {
+                // The newest chunk is mandatory. An older chunk that failed only shortens the history.
+                if (i == 0) {
+                    futures.forEach { it.cancel(true) }
+                    throw (if (e is ExecutionException) (e.cause ?: e) else e)
+                }
+            }
         }
         return out.distinctBy { it.time }.sortedBy { it.time }.takeLast(5000)
+    }
+
+    private fun bcsTimeFrame(interval: String): String =
+        when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
+
+    /** Only the bars newer than the cached series (with a small overlap for the still-forming bar). Null = a full download is needed. */
+    private fun loadBcsIncremental(symbol: String, interval: String, stale: List<Candle>): List<Candle>? {
+        val barMs = when (interval) {
+            "1m" -> 60_000L; "5m" -> 300_000L; "15m" -> 900_000L; "30m" -> 1_800_000L
+            "1h" -> 3_600_000L; "4h" -> 14_400_000L; "1wk" -> 7 * 86_400_000L; else -> 86_400_000L
+        }
+        val now = System.currentTimeMillis()
+        val from = stale.last().time - barMs * 3
+        // One response holds at most 1440 bars: a longer gap needs the full download.
+        if ((now - from) / barMs > 1300L) return null
+        val (ticker, classCode) = bcsInstrument(symbol)
+        val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(classCode)}&timeFrame=${bcsTimeFrame(interval)}&startDate=${enc(isoUtc(from))}&endDate=${enc(isoUtc(now))}"
+        val fresh = parseBcsCandles(JSONObject(getTextAuth(url, 15000, bcsHeaders())))
+        if (fresh.isEmpty()) return stale // market closed: nothing new
+        val firstNew = fresh.minOf { it.time }
+        return (stale.filter { it.time < firstNew } + fresh).distinctBy { it.time }.sortedBy { it.time }.takeLast(5000)
+    }
+
+    /** Step-by-step connection check shown in Settings: token -> catalogue -> candles -> live price. */
+    fun diagnose(): List<String> {
+        val out = ArrayList<String>()
+        fun step(name: String, block: () -> String) {
+            val t0 = System.currentTimeMillis()
+            val result = runCatching(block)
+            val ms = System.currentTimeMillis() - t0
+            out += result.fold(
+                onSuccess = { "✓ $name: $it ($ms мс)" },
+                onFailure = { "✗ $name: ${friendlyBcsError(it)} ($ms мс)" }
+            )
+        }
+        if (!isBcsConfigured()) return listOf("✗ Токен БКС не задан. Вставьте refresh-токен выше и нажмите «Сохранить».")
+        invalidateBcsAccessToken()
+        step("Авторизация") { if (bcsAccessToken().isNullOrBlank()) "access token не получен" else "access token получен" }
+        step("Каталог инструментов") {
+            val size = catalogSize()
+            val age = catalogSyncedAt().takeIf { it > 0 }?.let { ", обновлён ${(System.currentTimeMillis() - it) / 60_000} мин назад" }.orEmpty()
+            "$size инструментов$age" + (lastCatalogError?.let { ". Проблема: $it" }.orEmpty())
+        }
+        step("Свечи SBER (день)") {
+            val c = loadScanCandles("SBER", "")
+            if (c.isEmpty()) "пустой ответ" else "${c.size} свечей, последняя ${SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(java.util.Date(c.last().time))}"
+        }
+        step("Цена SBER") { quoteBcs("SBER")?.let { "$it" } ?: "цена не получена (торги закрыты?)" }
+        out += "Интервал между запросами сейчас ${bcsGapMs} мс" + if (bcsGapMs > BCS_MIN_REQUEST_GAP_MS) " (БКС ограничивает частоту, приложение подстроилось)" else ""
+        return out
     }
 
     private fun parseBcsCandles(root: JSONObject): List<Candle> {
@@ -975,12 +1175,48 @@ class MarketRepository(
         c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         return readResponse(c)
     }
+    private fun bcsRequestOk() {
+        if (bcsGapMs > BCS_MIN_REQUEST_GAP_MS) bcsGapMs = maxOf(BCS_MIN_REQUEST_GAP_MS, bcsGapMs - 8L)
+        lastRequestError = null
+    }
+
+    private fun bcsRateLimited(retryAfterMs: Long) {
+        bcsGapMs = minOf(bcsGapMs * 3 / 2 + 25L, 1500L)
+        bcsBlockedUntil = System.currentTimeMillis() + retryAfterMs.coerceIn(300L, 8000L)
+    }
+
+    /** Human-readable reason for the last BCS problem (token rejected, rate limit, network...), or null. */
+    val lastBcsError: String? get() = authFailure ?: lastRequestError
+
+    private fun friendlyBcsError(t: Throwable): String {
+        val m = t.message.orEmpty()
+        return when {
+            m.contains("HTTP 429") -> "Лимит запросов БКС (HTTP 429): приложение замедляет запросы автоматически"
+            m.contains("HTTP 401") || m.contains("HTTP 403") -> "Доступ отклонён (${m.take(12)}): проверьте токен БКС"
+            m.contains("HTTP 5") -> "Сервер БКС временно недоступен (${m.take(12)})"
+            m.contains("timeout", true) || m.contains("timed out", true) -> "БКС не отвечает (таймаут)"
+            m.contains("Unable to resolve", true) || m.contains("UnknownHost", true) -> "Нет подключения к интернету"
+            m.isBlank() -> t.javaClass.simpleName
+            else -> m.take(160)
+        }
+    }
+
     private fun bcsPace() {
-        synchronized(bcsHttpGate) {
-            val now = System.currentTimeMillis()
-            val wait = BCS_MIN_REQUEST_GAP_MS - (now - bcsLastRequestAt)
-            if (wait > 0) Thread.sleep(wait)
-            bcsLastRequestAt = System.currentTimeMillis()
+        val background = backgroundHttp.get() == true
+        if (background) {
+            // Yield to interactive requests (at most 3 s), so scans never slow the screen the user is looking at.
+            var waited = 0
+            while (interactiveWaiting.get() > 0 && waited < 3000) { Thread.sleep(20); waited += 20 }
+        } else interactiveWaiting.incrementAndGet()
+        try {
+            synchronized(bcsHttpGate) {
+                val now = System.currentTimeMillis()
+                val wait = maxOf(bcsGapMs - (now - bcsLastRequestAt), bcsBlockedUntil - now)
+                if (wait > 0) Thread.sleep(wait)
+                bcsLastRequestAt = System.currentTimeMillis()
+            }
+        } finally {
+            if (!background) interactiveWaiting.decrementAndGet()
         }
     }
     private fun postJson(url: String, body: String, timeout: Int, headers: Map<String,String>): String {
@@ -997,9 +1233,10 @@ class MarketRepository(
                     c.setRequestProperty("Authorization", "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось обновить access token")}")
                 }
                 c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                return readResponse(c)
+                return readResponse(c).also { bcsRequestOk() }
             } catch (t: Throwable) {
                 last = t
+                if (t is BcsHttpException && t.code == 429) bcsRateLimited(t.retryAfterMs)
                 val message = t.message.orEmpty()
                 when {
                     message.contains("HTTP 401") || message.contains("HTTP 403") -> {
@@ -1014,6 +1251,7 @@ class MarketRepository(
                 }
             }
         }
+        lastRequestError = last?.let { friendlyBcsError(it) }
         throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")
     }
     private fun getTextAuth(url: String, timeout: Int, headers: Map<String,String>): String {
@@ -1028,9 +1266,10 @@ class MarketRepository(
                 if (authRefreshUsed && headers.containsKey("Authorization")) {
                     c.setRequestProperty("Authorization", "Bearer ${bcsAccessToken() ?: throw IllegalStateException("BCS: не удалось обновить access token")}")
                 }
-                return readResponse(c)
+                return readResponse(c).also { bcsRequestOk() }
             } catch (t: Throwable) {
                 last = t
+                if (t is BcsHttpException && t.code == 429) bcsRateLimited(t.retryAfterMs)
                 val message = t.message.orEmpty()
                 when {
                     message.contains("HTTP 401") || message.contains("HTTP 403") -> {
@@ -1045,14 +1284,16 @@ class MarketRepository(
                 }
             }
         }
+        lastRequestError = last?.let { friendlyBcsError(it) }
         throw last ?: IllegalStateException("БКС HTTP: неизвестная ошибка")
     }
     private fun readResponse(c: HttpURLConnection): String {
         val code = c.responseCode
+        val retryAfterMs = (c.getHeaderField("Retry-After")?.trim()?.toLongOrNull() ?: 0L) * 1000L
         val stream = if (code in 200..299) c.inputStream else c.errorStream
         val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
         c.disconnect()
-        if (code !in 200..299) throw IllegalStateException("HTTP $code: ${text.take(240)}")
+        if (code !in 200..299) throw BcsHttpException(code, retryAfterMs, "HTTP $code: ${text.take(240)}")
         return text
     }
     private fun getText(url:String,timeout:Int):String{val c=URL(url).openConnection() as HttpURLConnection; c.requestMethod="GET";c.connectTimeout=timeout;c.readTimeout=timeout;c.setRequestProperty("User-Agent",ua);c.setRequestProperty("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");c.setRequestProperty("Accept-Language","ru-RU,ru;q=0.9,en;q=0.5");c.setRequestProperty("Accept-Encoding","gzip");try{if(c.responseCode !in 200..299)throw IllegalStateException("HTTP ${c.responseCode}");val raw=c.inputStream;val input=if(c.contentEncoding?.contains("gzip",true)==true) GZIPInputStream(raw) else raw;return input.bufferedReader(Charsets.UTF_8).use{it.readText()}}finally{c.disconnect()}}
