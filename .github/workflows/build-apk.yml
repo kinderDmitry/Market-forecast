@@ -102,6 +102,8 @@ jobs:
           test -f app/src/main/java/ScannerScreen.kt
           test -f app/src/main/java/InstrumentSearchEngine.kt
           test -f app/src/main/java/DesignSystem.kt
+          test -f app/src/main/java/ScanWorker.kt
+          test -f app/src/main/java/ReliabilityEngine.kt
           # The refresh token must only ever be touched through SecureTokenStore.
           ! grep -n 'bcs_refresh_token' app/src/main/java/MainActivity.kt app/src/main/java/MarketMonitorWorker.kt
           echo 'Project structure verification: OK'
@@ -111,11 +113,26 @@ jobs:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dkotlin.daemon.jvm.options=-Xmx3g"
         run: gradle --no-daemon --stacktrace :app:assembleDebug
 
+      # The optimised build (R8): noticeably faster and smaller. If it ever fails, the debug APK is published instead.
+      - name: Build release APK
+        id: release
+        continue-on-error: true
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dkotlin.daemon.jvm.options=-Xmx3g"
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+
       - name: Rename APK
         run: |
           set -euo pipefail
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk "release/MarketForecast_PROX_${{ steps.ver.outputs.name }}.apk"
+          NAME="MarketForecast_PROX_${{ steps.ver.outputs.name }}"
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk "release/${NAME}.apk"
+            cp app/build/outputs/apk/debug/app-debug.apk "release/${NAME}_debug.apk"
+          else
+            echo "::warning::The release (R8) build failed, publishing the debug APK instead."
+            cp app/build/outputs/apk/debug/app-debug.apk "release/${NAME}.apk"
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -131,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${{ steps.ver.outputs.name }}-build${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" "release/MarketForecast_PROX_${{ steps.ver.outputs.name }}.apk" \
+          gh release create "$TAG" release/*.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "MarketForecast PROX ${{ steps.ver.outputs.name }} (build ${GITHUB_RUN_NUMBER})" \
             --notes "Debug APK. Commit: ${GITHUB_SHA}" \
