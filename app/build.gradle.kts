@@ -11,8 +11,8 @@ android {
         applicationId = "com.marketforecast.prox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 170
-        versionName = "4.12.0"
+        versionCode = 171
+        versionName = "4.13.0"
     }
     buildFeatures { compose = true }
 
@@ -39,6 +39,18 @@ android {
         getByName("debug") {
             signingConfig = signingConfigs.getByName("mfpDebug")
         }
+        // The release build is what makes the app fast: R8 optimises and removes dead code, resources are shrunk,
+        // and ART compiles it ahead of time (a debug build is only interpreted / JIT-compiled).
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("mfpDebug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    lint {
+        checkReleaseBuilds = false
     }
 
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
