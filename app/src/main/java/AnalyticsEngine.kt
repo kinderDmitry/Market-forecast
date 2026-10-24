@@ -343,7 +343,7 @@ object AnalyticsEngine {
 
     private fun sigmoid(x: Double): Double = 1.0 / (1.0 + exp(-x.coerceIn(-8.0, 8.0)))
 
-    private fun historical(c: List<Candle>, direction: Int, regimeName: String, horizon: Int = 8): Historical {
+    private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, horizon: Int = 8): Historical {
         if (c.size < 150) return Historical(.5, 0, .5, .5, .5, .5, 1.0, 1.0)
         val end = c.lastIndex - 2
         var samples = 0; var tp1 = 0; var tp2 = 0; var tp3 = 0; var sl = 0
@@ -359,14 +359,15 @@ object AnalyticsEngine {
             if (dirEvidence < -.15 && same == 0.0) continue
             val future = c.subList(i + 1, min(c.size, i + 1 + horizon))
             if (future.isEmpty()) continue
-            val r1 = 0.8; val r2 = 1.5; val r3 = 2.2
+            // The same ladder the forecast really uses: stop = stopMult ATR, TP1 = 1R, TP2 = 2R, TP3 = 2.8R.
+            val r1 = stopMult; val r2 = stopMult * 2.0; val r3 = stopMult * 2.8
             var hit1 = false; var hit2 = false; var hit3 = false; var stopped = false
             var localMfe = 0.0; var localMae = 0.0
             for (f in future) {
                 val favorable = if (direction > 0) (f.high - p) / a else (p - f.low) / a
                 val adverse = if (direction > 0) (p - f.low) / a else (f.high - p) / a
                 localMfe = max(localMfe, favorable); localMae = max(localMae, adverse)
-                if (adverse >= 1.0) stopped = true
+                if (adverse >= stopMult) stopped = true
                 if (favorable >= r1) hit1 = true
                 if (favorable >= r2) hit2 = true
                 if (favorable >= r3) hit3 = true
@@ -515,7 +516,13 @@ object AnalyticsEngine {
         val reg = regime(c,s,a,ad,bb.second)
         val ev = evidence(c,reg,s,liq,lv,a)
         val setupType = setup(reg,s,liq,price,lv,a)
-        val longHist = historical(c,1,reg.name); val shortHist = historical(c,-1,reg.name)
+        val stopMult = when {
+            reg.name.contains("RANGE") -> 1.05
+            reg.name.contains("IMPULSE") -> 1.45
+            reg.name.contains("HIGH_VOLATILITY") -> 1.75
+            else -> 1.25
+        }
+        val longHist = historical(c,1,reg.name,stopMult); val shortHist = historical(c,-1,reg.name,stopMult)
         val stability = stableScore(c,entryOverride)
         val longDirection = directionProbability(ev.long,longHist,reg.confidence,stability)
         val shortDirection = directionProbability(ev.short,shortHist,reg.confidence,stability)
@@ -534,17 +541,13 @@ object AnalyticsEngine {
         val entryZoneLow: Double; val entryZoneHigh: Double
         if (dominant > 0) { entryZoneLow = max(lv.support1, price - a*.55); entryZoneHigh = min(price + a*.20, lv.resistance1) }
         else { entryZoneLow = max(lv.support1, price - a*.20); entryZoneHigh = min(lv.resistance1, price + a*.55) }
-        val stopDistance = (a * when {
-            reg.name.contains("RANGE") -> 1.05
-            reg.name.contains("IMPULSE") -> 1.45
-            reg.name.contains("HIGH_VOLATILITY") -> 1.75
-            else -> 1.25
-        }).coerceAtLeast(price*.004)
+        // Volatility decides the stop. The floor only guards against costs and data glitches (it used to be a flat 0.4%,
+        // which pushed every intraday stop and target several ATR away and made short horizons look tiny and unreachable).
+        val stopDistance = (a * stopMult).coerceAtLeast(price*.0015)
         val stop = if (dominant > 0) min(lv.support1 - a*.12, price-stopDistance) else max(lv.resistance1+a*.12, price+stopDistance)
         val risk = abs(price-stop).coerceAtLeast(a*.65)
-        val projectedMfe = if (dominant > 0) longHist.avgMfeR else shortHist.avgMfeR
-        val targetCap = max(1.8, min(3.8, projectedMfe.coerceAtLeast(2.0)))
-        val tp1R = min(.9, targetCap*.42); val tp2R = min(1.8, targetCap*.72); val tp3R = targetCap
+        // Targets: 1R / 2R / 2.8R of the risk (before: 0.9R / 1.8R / up to 3.8R, so TP1 was always smaller than the stop).
+        val tp1R = 1.0; val tp2R = 2.0; val tp3R = 2.8
         val tp1 = if (dominant > 0) price+risk*tp1R else price-risk*tp1R
         val tp2 = if (dominant > 0) price+risk*tp2R else price-risk*tp2R
         val tp3 = if (dominant > 0) price+risk*tp3R else price-risk*tp3R

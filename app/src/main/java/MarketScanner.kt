@@ -43,8 +43,8 @@ internal enum class ScanHorizon(
     val staleMs: Long
 ) {
     M15("15M", "15 минут", "15 min", "15 мин", "15 min", 15 * 60_000L, 90 * 60_000L),
-    H1("1H", "1 час", "1 hour", "Час", "Hour", 60 * 60_000L, 5 * 3_600_000L),
-    H4("4H", "4 часа", "4 hours", "4 часа", "4 hours", 4 * 3_600_000L, 40 * 3_600_000L),
+    H1("1H", "1 час", "1 hour", "Час", "Hour", 60 * 60_000L, 4 * 3_600_000L),
+    H4("4H", "4 часа", "4 hours", "4 часа", "4 hours", 4 * 3_600_000L, 10 * 3_600_000L),
     D1("1D", "1 день", "1 day", "День", "Day", 24 * 3_600_000L, 10 * 86_400_000L),
     W1("1W", "1 неделя", "1 week", "Неделя", "Week", 7 * 86_400_000L, 30 * 86_400_000L);
 
@@ -82,7 +82,13 @@ internal data class ScanHit(
     /** The forecast is removed from the list at this moment. */
     val expiresAt: Long = 0L,
     /** 0-100 reliability score (agreement of independent evidence), see [ReliabilityEngine]. */
-    val reliability: Int = 0
+    val reliability: Int = 0,
+    val tp3: Double = 0.0,
+    /** Estimated probabilities of reaching TP1 / TP2 / TP3 and of being stopped out. */
+    val tp1p: Double = 0.0,
+    val tp2p: Double = 0.0,
+    val tp3p: Double = 0.0,
+    val stopProb: Double = 0.0
 ) {
     val horizon: ScanHorizon get() = ScanHorizon.of(timeframe)
 }
@@ -139,7 +145,12 @@ internal object ScannerStore {
                     prevSignal = o.optString("prevSignal"),
                     timeframe = tf,
                     expiresAt = expires,
-                    reliability = o.optInt("reliability", 0)
+                    reliability = o.optInt("reliability", 0),
+                    tp3 = o.optDouble("tp3", 0.0),
+                    tp1p = o.optDouble("tp1p", 0.0),
+                    tp2p = o.optDouble("tp2p", 0.0),
+                    tp3p = o.optDouble("tp3p", 0.0),
+                    stopProb = o.optDouble("stopProb", 0.0)
                 )
             )
         }
@@ -174,6 +185,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb))
                 }
             )
         }
@@ -213,7 +225,7 @@ internal object ScanCore {
     const val NO_SIGNAL = 3
     const val HIT = 4
 
-    class Outcome(val status: Int, val hit: ScanHit?)
+    class Outcome(val status: Int, val hit: ScanHit?, val lastTime: Long = 0L)
 
     private fun minBars(h: ScanHorizon): Int = if (h == ScanHorizon.W1) 40 else 60
 
@@ -236,7 +248,7 @@ internal object ScanCore {
         val last = candles.last()
         if (last.close <= 0.0) return Outcome(ILLIQUID, null)
         val now = System.currentTimeMillis()
-        if (now - last.time > h.staleMs) return Outcome(STALE, null)
+        if (now - last.time > h.staleMs) return Outcome(STALE, null, last.time)
         if (!isFx(item.type) && candles.takeLast(10).sumOf { it.volume } <= 0.0) return Outcome(ILLIQUID, null)
         val f = try {
             AnalyticsEngine.analyze(candles, null)
@@ -266,9 +278,14 @@ internal object ScanCore {
             prevSignal = previousSignal,
             timeframe = h.tf,
             expiresAt = now + h.validMs,
-            reliability = ReliabilityEngine.score(f, candles.size)
+            reliability = ReliabilityEngine.score(f, candles.size),
+            tp3 = f.tp3,
+            tp1p = f.tp1Probability,
+            tp2p = f.tp2Probability,
+            tp3p = f.tp3Probability,
+            stopProb = f.stopProbability
         )
-        return Outcome(HIT, hit)
+        return Outcome(HIT, hit, last.time)
     }
 
     /** Full-market scopes need the whole BCS catalogue, the main board and favourites do not. */
@@ -494,6 +511,8 @@ internal class ScannerController(
         var stale = 0
         var answered = 0
         var abort = false
+        var latestCandle = 0L
+        var completed = false
         val gate = Semaphore(PARALLEL)
 
         fun publish() {
@@ -513,6 +532,7 @@ internal class ScannerController(
         }
 
         fun record(item: SearchResult, r: ScanCore.Outcome) {
+            if (r.lastTime > latestCandle) latestCandle = r.lastTime
             when (r.status) {
                 ScanCore.FAILED -> failedItems.add(item)
                 ScanCore.ILLIQUID -> { illiquid += 1; scanned.add(item.symbol) }
@@ -534,12 +554,14 @@ internal class ScannerController(
                             done += 1
                             if (r.status != ScanCore.FAILED) answered += 1
                             // Intraday horizon while the exchange is closed: nothing has a fresh candle, stop wasting requests.
-                            if (h.intraday && answered >= 24 && stale * 10 >= answered * 9) abort = true
+                            if (h.intraday && answered >= minOf(24, maxOf(6, total / 3)) && stale * 10 >= answered * 9) abort = true
                             if (r.status == ScanCore.HIT || done % 10 == 0) publish()
                         }
                     }
                 }.awaitAll()
             }
+            // Small scopes (currencies) never reach the early check above: judge them once the pass is over.
+            if (!abort && h.intraday && answered > 0 && stale * 10 >= answered * 9) abort = true
             // 3. Everything that lost a rate-limit race or hit a network error gets up to three more passes.
             var pass = 0
             while (!abort && failedItems.isNotEmpty() && pass < 3) {
@@ -563,23 +585,26 @@ internal class ScannerController(
                 publish()
             }
             message = null
+            completed = true
         } finally {
             publish()
             if (scanned.isNotEmpty() && !abort) {
                 val now = System.currentTimeMillis()
-                finishedAt = finishedAt + (tf to now)
+                // A scan the user stopped half-way is saved, but it does not count as "this horizon was scanned".
+                if (completed) finishedAt = finishedAt + (tf to now)
                 val newHits = found.values.toList()
                 val scannedCopy = HashSet(scanned)
                 withContext(NonCancellable + Dispatchers.IO) {
-                    ScannerStore.saveRun(appContext, tf, selected.name, now, scannedCopy, newHits)
+                    ScannerStore.saveRun(appContext, tf, selected.name, now, scannedCopy, newHits, markFinished = completed)
                 }
             }
         }
 
         if (abort) {
+            val clock = if (latestCandle > 0L) java.text.SimpleDateFormat("EEE HH:mm", java.util.Locale.getDefault()).format(java.util.Date(latestCandle)) else "—"
             message = tr(
-                "Торги на сроке «${h.label(true)}» сейчас закрыты: у большинства инструментов нет свежих свечей. Выберите «1 день» или «1 неделя» либо запустите сканер во время торгов.",
-                "The market is closed for the \"${h.label(false)}\" horizon: most instruments have no fresh candles. Pick 1 day or 1 week, or scan during trading hours."
+                "Торги сейчас закрыты (выходной или ночь): последняя свеча БКС от $clock. Прогноз на «${h.label(true)}» строится только во время торгов, поэтому сигналов нет. Выберите «1 день» или «1 неделя» либо запустите сканер в торговые часы.",
+                "Trading is closed right now (weekend or night): the last BCS candle is from $clock. A \"${h.label(false)}\" forecast is only built during trading hours, so there are no signals. Pick 1 day or 1 week, or scan in trading hours."
             )
             return
         }

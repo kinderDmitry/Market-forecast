@@ -99,7 +99,7 @@ internal fun ScannerScreen(
     c: ScannerController,
     favorites: Set<String>,
     ru: Boolean,
-    onOpen: (String) -> Unit,
+    onOpen: (String, String) -> Unit,
     onToggleFavorite: (String) -> Unit,
     onStart: () -> Unit
 ) {
@@ -307,7 +307,7 @@ internal fun ScannerScreen(
                     fav = favorites.any { it.equals(h.symbol, ignoreCase = true) },
                     ru = ru,
                     now = now,
-                    onOpen = { onOpen(h.symbol) },
+                    onOpen = { onOpen(h.symbol, h.timeframe) },
                     onFav = { onToggleFavorite(h.symbol) }
                 )
             }
@@ -359,27 +359,48 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
         val left = (h.expiresAt - now).coerceAtLeast(0L)
         val remaining = (left.toFloat() / lifetime.toFloat()).coerceIn(0f, 1f)
         val urgent = remaining < 0.2f
-        val grade = ReliabilityEngine.gradeOf(h.reliability)
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Tag("⏱ ${h.horizon.label(ru)}", Accent)
-            Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
+        val timeColor = if (urgent) Warning else color
+        // The countdown owns a full-width line: it can no longer be squeezed out by the tags next to it.
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
-                (if (ru) "до " else "until ") + untilText(h.expiresAt) + " • " + leftText(left, ru),
-                fontSize = 11.sp,
-                color = if (urgent) Warning else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                "⏱ " + (if (ru) "Осталось " else "Left ") + durationText(left, ru),
+                fontSize = 14.sp, fontWeight = FontWeight.Black, color = timeColor, modifier = Modifier.weight(1f)
             )
+            Text((if (ru) "до " else "until ") + untilText(h.expiresAt), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Box(Modifier.fillMaxWidth().padding(top = 6.dp).height(3.dp).clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.14f))) {
-            Box(Modifier.fillMaxHeight().fillMaxWidth(remaining).clip(RoundedCornerShape(50)).background(if (urgent) Warning else color))
+        Box(Modifier.fillMaxWidth().padding(top = 6.dp).height(5.dp).clip(RoundedCornerShape(50)).background(timeColor.copy(alpha = 0.16f))) {
+            Box(Modifier.fillMaxHeight().fillMaxWidth(remaining).clip(RoundedCornerShape(50)).background(timeColor))
+        }
+        val grade = ReliabilityEngine.gradeOf(h.reliability)
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Tag("🕒 ${h.horizon.label(ru)}", Accent)
+            Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
+        }
+        // All three targets with their distance and chance, not only the smallest one.
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            LevelMetric(if (ru) "Стоп" else "Stop", h.stop, h.price, h.stopProb, Negative, Modifier.weight(1f))
+            LevelMetric("TP1", h.tp1, h.price, h.tp1p, Positive, Modifier.weight(1f))
+            LevelMetric("TP2", h.tp2, h.price, h.tp2p, Positive, Modifier.weight(1f))
+            if (h.tp3 > 0.0) LevelMetric("TP3", h.tp3, h.price, h.tp3p, Positive, Modifier.weight(1f))
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Metric(if (ru) "Цена" else "Price", fmt(h.price), MaterialTheme.colorScheme.onSurface)
-            Metric(if (ru) "День" else "Day", String.format(Locale.US, "%+.2f%%", h.changePct), if (h.changePct >= 0) Positive else Negative)
-            Metric(if (ru) "Стоп" else "Stop", fmt(h.stop), Negative)
-            Metric("TP1", fmt(h.tp1), Positive)
-            Metric("R:R", String.format(Locale.US, "%.1f", h.rr), MaterialTheme.colorScheme.onSurface)
+            Metric(h.horizon.moveLabel(ru), String.format(Locale.US, "%+.2f%%", h.changePct), if (h.changePct >= 0) Positive else Negative)
+            Metric(if (ru) "R:R до TP2" else "R:R to TP2", String.format(Locale.US, "%.1f", h.rr), MaterialTheme.colorScheme.onSurface)
         }
+    }
+}
+
+@Composable
+private fun LevelMetric(label: String, level: Double, price: Double, prob: Double, color: Color, modifier: Modifier) {
+    val pct = if (price > 0.0 && level > 0.0) (level - price) / price * 100.0 else 0.0
+    Column(modifier) {
+        Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(fmt(level), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = color, maxLines = 1)
+        Text(
+            String.format(Locale.US, "%+.2f%%", pct) + (if (prob > 0.0) " · ${(prob * 100).toInt()}%" else ""),
+            fontSize = 11.sp, color = color.copy(alpha = 0.85f), maxLines = 1
+        )
     }
 }
 
@@ -410,6 +431,8 @@ private fun Metric(label: String, value: String, color: Color) {
 @Composable
 internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> Unit, onStart: () -> Unit) {
     if (c == null) return
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) { while (true) { delay(15_000L); now = System.currentTimeMillis() } }
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(28.dp).pulse(c.running))
@@ -436,10 +459,16 @@ internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> 
         }
         val top = c.current.take(3)
         if (top.isNotEmpty()) {
-            Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth().padding(top = 10.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 top.forEach { h ->
                     Tag("${h.symbol.removeSuffix(".ME")} ${h.signal} ${h.confidence}%", signalColor(h.signal))
                 }
+            }
+            c.current.minOfOrNull { it.expiresAt }?.let { soonest ->
+                Text(
+                    "⏱ " + (if (ru) "Ближайший прогноз истекает через " else "The next forecast expires in ") + durationText((soonest - now).coerceAtLeast(0L), ru),
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
+                )
             }
         }
         c.message?.takeIf { !c.running }?.let {
@@ -480,6 +509,16 @@ private fun untilText(ms: Long): String {
     val day = SimpleDateFormat("yyyyDDD", Locale.US)
     val sameDay = day.format(Date(ms)) == day.format(Date())
     return SimpleDateFormat(if (sameDay) "HH:mm" else "dd.MM HH:mm", Locale.getDefault()).format(Date(ms))
+}
+
+private fun durationText(ms: Long, ru: Boolean): String {
+    val min = ms / 60_000L
+    return when {
+        min < 1L -> if (ru) "меньше минуты" else "under a minute"
+        min < 60L -> if (ru) "$min мин" else "$min min"
+        min < 1440L -> if (ru) "${min / 60} ч ${min % 60} мин" else "${min / 60} h ${min % 60} min"
+        else -> if (ru) "${min / 1440} д ${(min % 1440) / 60} ч" else "${min / 1440} d ${(min % 1440) / 60} h"
+    }
 }
 
 private fun leftText(ms: Long, ru: Boolean): String {

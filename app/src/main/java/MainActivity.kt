@@ -626,7 +626,7 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
                         Screen.SETTINGS -> Settings(ru, notifications, interval, prefs, refreshValue, refreshUnit, displayCurrency, { ru = !ru }, ::toggleNotifications, { interval = it; prefs.edit().putInt("notify_interval", it).apply(); schedule(); runMonitorNow() }, { refreshValue = it }, { refreshUnit = it }, { displayCurrency = it; prefs.edit().putString("display_currency", it).apply(); scope.launch(Dispatchers.IO) { repo.refreshDisplayCurrencyRates() } }, { history = emptyList(); tracked = emptyList(); prefs.edit().remove("forecast_history").remove("tracked").remove("history_stats").apply(); message = if (ru) "История и статистика очищены" else "History and statistics cleared" }, ::runMonitorNow, repo, { tokenVersion++ })
                         Screen.SCANNER -> ScannerScreen(
-                            scanner, favorites, ru, { load(it) },
+                            scanner, favorites, ru, { sym, frame -> load(sym, frame) },
                             { sym -> if (favorites.any { it.equals(sym, true) }) saveFav(favorites.filterNot { it.equals(sym, true) }.toSet()) else saveFav(favorites + sym) },
                             { startScanner() }
                         )
