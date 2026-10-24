@@ -14,6 +14,8 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED && intent?.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
         val p = context.getSharedPreferences("mfprefs", Context.MODE_PRIVATE)
+        ScanScheduler.apply(context, p)
+        if (!p.getBoolean("notifications_enabled", false)) return
         val interval = p.getInt("notify_interval", 15).coerceAtLeast(15)
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(

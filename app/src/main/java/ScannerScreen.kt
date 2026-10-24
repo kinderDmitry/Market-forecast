@@ -4,6 +4,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -103,21 +106,36 @@ internal fun ScannerScreen(
     var signalFilter by remember { mutableStateOf("ALL") }
     var onlyNew by remember { mutableStateOf(false) }
     var minConf by remember { mutableIntStateOf(0) }
-    var sort by remember { mutableStateOf("CONF") }
+    var goodOnly by remember { mutableStateOf(false) }
+    var sort by remember { mutableStateOf("REL") }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(c.running) {
-        while (c.running) {
+    // One clock for the progress estimate and the countdowns; expired forecasts leave the list on their own.
+    LaunchedEffect(Unit) {
+        while (true) {
             now = System.currentTimeMillis()
-            delay(1000)
+            c.pruneExpired(now)
+            delay(if (c.running) 1000L else 15_000L)
         }
     }
 
-    val visible = remember(c.hits, signalFilter, onlyNew, minConf, sort) {
-        val base = c.hits
+    // Picking another horizon starts a fresh search for it when the last result of that horizon is stale.
+    var firstHorizon by remember { mutableStateOf(true) }
+    LaunchedEffect(c.horizon) {
+        if (firstHorizon) { firstHorizon = false; return@LaunchedEffect }
+        if (c.autoStart && !c.running) {
+            c.restore()
+            if (System.currentTimeMillis() - c.lastFinishedAt > c.refreshAfterMs()) onStart()
+        }
+    }
+
+    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, minConf, sort) {
+        val base = c.current
             .filter { signalFilter == "ALL" || it.signal.contains(signalFilter, ignoreCase = true) }
             .filter { !onlyNew || it.isNew }
+            .filter { !goodOnly || it.reliability >= 60 }
             .filter { it.confidence >= minConf }
         when (sort) {
+            "REL" -> base.sortedWith(compareByDescending<ScanHit> { it.reliability }.thenByDescending { it.confidence })
             "NEW" -> base.sortedWith(compareByDescending<ScanHit> { it.isNew }.thenByDescending { it.confidence })
             "CHANGE" -> base.sortedByDescending { abs(it.changePct) }
             "RR" -> base.sortedByDescending { it.rr }
@@ -145,8 +163,8 @@ internal fun ScannerScreen(
                     }
                 }
                 Text(
-                    if (ru) "Проходит по всему каталогу и показывает инструменты с активным сигналом LONG или SHORT. Новые прогнозы отмечаются сравнением с прошлым запуском."
-                    else "Walks the whole catalogue and lists instruments with an active LONG or SHORT signal. New forecasts are flagged against the previous run.",
+                    if (ru) "Проверяет каждый инструмент выбранной области и показывает активные сигналы LONG и SHORT на выбранный срок. Прогноз действует ${c.horizon.label(true)} и затем исчезает из списка; новые прогнозы отмечаются сравнением с прошлым запуском."
+                    else "Checks every instrument of the chosen scope and lists active LONG and SHORT signals for the chosen horizon. A forecast holds for ${c.horizon.label(false)} and then leaves the list; new forecasts are flagged against the previous run.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
                 )
                 Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -159,13 +177,27 @@ internal fun ScannerScreen(
                         )
                     }
                 }
+                Text(
+                    if (ru) "На какой срок нужен прогноз" else "How long should the forecast hold",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp)
+                )
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ScanHorizon.values().forEach { hz ->
+                        FilterChip(
+                            selected = c.horizon == hz,
+                            enabled = !c.running,
+                            onClick = { c.updateHorizon(hz) },
+                            label = { Text(hz.label(ru), fontSize = 12.sp) }
+                        )
+                    }
+                }
                 if (c.running) {
                     val fraction = if (c.total > 0) c.done.toFloat() / c.total.toFloat() else 0f
                     GlowProgressBar(fraction, Modifier.fillMaxWidth().padding(top = 12.dp))
                     val elapsed = ((now - c.startedAt) / 1000).coerceAtLeast(1)
                     val eta = if (c.done >= 12 && c.total > c.done) (elapsed * (c.total - c.done) / c.done) else -1L
                     Text(
-                        (if (ru) "Проверено ${c.done} из ${c.total} • сигналов: ${c.hits.size}" else "Checked ${c.done} of ${c.total} • signals: ${c.hits.size}") +
+                        (if (ru) "Проверено ${c.done} из ${c.total} • сигналов: ${c.current.size}" else "Checked ${c.done} of ${c.total} • signals: ${c.current.size}") +
                             (if (eta >= 0) (if (ru) " • осталось ~${etaText(eta, ru)}" else " • ~${etaText(eta, ru)} left") else ""),
                         fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)
                     )
@@ -212,10 +244,14 @@ internal fun ScannerScreen(
             }
         }
 
-        if (c.hits.isNotEmpty()) {
+        c.coverage?.takeIf { !c.running }?.let { cov ->
+            item { CoverageCard(cov, c.horizon, ru) }
+        }
+
+        if (c.current.isNotEmpty()) {
             item {
                 SectionHeader(
-                    if (ru) "Результаты: ${visible.size} из ${c.hits.size}" else "Results: ${visible.size} of ${c.hits.size}",
+                    if (ru) "Результаты: ${visible.size} из ${c.current.size}" else "Results: ${visible.size} of ${c.current.size}",
                     if (ru) "Новых: ${c.newCount}" else "New: ${c.newCount}"
                 )
             }
@@ -233,11 +269,17 @@ internal fun ScannerScreen(
                         onClick = { onlyNew = !onlyNew },
                         label = { Text(if (ru) "Только новые" else "New only", fontSize = 12.sp) }
                     )
+                    FilterChip(
+                        selected = goodOnly,
+                        onClick = { goodOnly = !goodOnly },
+                        label = { Text(if (ru) "Надёжность B и выше" else "Reliability B+", fontSize = 12.sp) }
+                    )
                 }
             }
             item {
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(
+                        "REL" to (if (ru) "По надёжности" else "Reliability"),
                         "CONF" to (if (ru) "По уверенности" else "Confidence"),
                         "NEW" to (if (ru) "Сначала новые" else "New first"),
                         "CHANGE" to (if (ru) "По движению за день" else "Daily move"),
@@ -264,14 +306,15 @@ internal fun ScannerScreen(
                     h = h,
                     fav = favorites.any { it.equals(h.symbol, ignoreCase = true) },
                     ru = ru,
+                    now = now,
                     onOpen = { onOpen(h.symbol) },
                     onFav = { onToggleFavorite(h.symbol) }
                 )
             }
             item {
                 Text(
-                    if (ru) "Прогнозы строятся по дневным свечам и цене закрытия последней сессии. Это статистическая оценка, а не инвестиционная рекомендация. Откройте инструмент, чтобы увидеть полный анализ с живой ценой."
-                    else "Forecasts use daily candles and the last session close. They are statistical estimates, not investment advice. Open an instrument for the full analysis with the live price.",
+                    if (ru) "Прогноз строится по свечам выбранного срока и действует ровно этот срок, потом карточка исчезает. Это статистическая оценка, а не инвестиционная рекомендация. Откройте инструмент, чтобы увидеть полный анализ с живой ценой и проверкой надёжности."
+                    else "A forecast is built on candles of the chosen horizon and holds for exactly that long, then the card disappears. It is a statistical estimate, not investment advice. Open an instrument for the full analysis with the live price and the reliability check.",
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
                 )
             }
@@ -287,7 +330,7 @@ internal fun ScannerScreen(
 }
 
 @Composable
-private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, onOpen: () -> Unit, onFav: () -> Unit) {
+private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: () -> Unit, onFav: () -> Unit) {
     val color = signalColor(h.signal)
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -312,7 +355,25 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, onOpen: () -> Unit, o
                 Icon(if (fav) Icons.Default.Star else Icons.Default.StarBorder, if (ru) "Избранное" else "Favorite", tint = Warning)
             }
         }
-        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        val lifetime = (h.expiresAt - h.scannedAt).coerceAtLeast(1L)
+        val left = (h.expiresAt - now).coerceAtLeast(0L)
+        val remaining = (left.toFloat() / lifetime.toFloat()).coerceIn(0f, 1f)
+        val urgent = remaining < 0.2f
+        val grade = ReliabilityEngine.gradeOf(h.reliability)
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Tag("⏱ ${h.horizon.label(ru)}", Accent)
+            Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
+            Text(
+                (if (ru) "до " else "until ") + untilText(h.expiresAt) + " • " + leftText(left, ru),
+                fontSize = 11.sp,
+                color = if (urgent) Warning else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+            )
+        }
+        Box(Modifier.fillMaxWidth().padding(top = 6.dp).height(3.dp).clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.14f))) {
+            Box(Modifier.fillMaxHeight().fillMaxWidth(remaining).clip(RoundedCornerShape(50)).background(if (urgent) Warning else color))
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Metric(if (ru) "Цена" else "Price", fmt(h.price), MaterialTheme.colorScheme.onSurface)
             Metric(if (ru) "День" else "Day", String.format(Locale.US, "%+.2f%%", h.changePct), if (h.changePct >= 0) Positive else Negative)
             Metric(if (ru) "Стоп" else "Stop", fmt(h.stop), Negative)
@@ -353,11 +414,11 @@ internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.AutoGraph, null, tint = Accent, modifier = Modifier.size(28.dp).pulse(c.running))
             Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                Text(if (ru) "Сканер рынка" else "Market scanner", fontWeight = FontWeight.Black, fontSize = 15.sp)
+                Text(if (ru) "Сканер рынка · ${c.horizon.label(true)}" else "Market scanner · ${c.horizon.label(false)}", fontWeight = FontWeight.Black, fontSize = 15.sp)
                 val status = when {
-                    c.running -> if (ru) "Проверено ${c.done} из ${c.total} • сигналов: ${c.hits.size}" else "Checked ${c.done} of ${c.total} • signals: ${c.hits.size}"
+                    c.running -> if (ru) "Проверено ${c.done} из ${c.total} • сигналов: ${c.current.size}" else "Checked ${c.done} of ${c.total} • signals: ${c.current.size}"
                     c.lastFinishedAt > 0L -> (if (ru) "Обновлено " else "Updated ") + agoText(c.lastFinishedAt, ru) +
-                        (if (ru) " • сигналов: ${c.hits.size} • новых: ${c.newCount}" else " • signals: ${c.hits.size} • new: ${c.newCount}")
+                        (if (ru) " • сигналов: ${c.current.size} • новых: ${c.newCount}" else " • signals: ${c.current.size} • new: ${c.newCount}")
                     else -> if (ru) "Найдёт прогнозы по всему каталогу БКС" else "Finds forecasts across the whole BCS catalogue"
                 }
                 Text(status, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -373,7 +434,7 @@ internal fun ScannerEntryCard(c: ScannerController?, ru: Boolean, onOpen: () -> 
         if (c.running && c.total > 0) {
             GlowProgressBar(c.done.toFloat() / c.total.toFloat(), Modifier.fillMaxWidth().padding(top = 10.dp))
         }
-        val top = c.hits.take(3)
+        val top = c.current.take(3)
         if (top.isNotEmpty()) {
             Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 top.forEach { h ->
@@ -412,5 +473,44 @@ internal fun CatalogStatusLine(ru: Boolean, hasToken: Boolean, onRetry: () -> Un
         if (hasToken && !CatalogStatus.syncing && (CatalogStatus.failed || CatalogStatus.error != null)) {
             IconButton(onClick = onRetry) { Icon(Icons.Default.Refresh, if (ru) "Повторить" else "Retry") }
         }
+    }
+}
+
+private fun untilText(ms: Long): String {
+    val day = SimpleDateFormat("yyyyDDD", Locale.US)
+    val sameDay = day.format(Date(ms)) == day.format(Date())
+    return SimpleDateFormat(if (sameDay) "HH:mm" else "dd.MM HH:mm", Locale.getDefault()).format(Date(ms))
+}
+
+private fun leftText(ms: Long, ru: Boolean): String {
+    val min = ms / 60_000L
+    return when {
+        ms <= 0L -> if (ru) "истёк" else "expired"
+        min < 1L -> if (ru) "меньше минуты" else "under a minute"
+        min < 60L -> if (ru) "ещё $min мин" else "$min min left"
+        min < 1440L -> if (ru) "ещё ${min / 60} ч ${min % 60} мин" else "${min / 60} h ${min % 60} min left"
+        else -> if (ru) "ещё ${min / 1440} д ${(min % 1440) / 60} ч" else "${min / 1440} d ${(min % 1440) / 60} h left"
+    }
+}
+
+/** What the last scan really covered, so "the whole market" is a number and not a promise. */
+@Composable
+private fun CoverageCard(cov: ScanCoverage, h: ScanHorizon, ru: Boolean) {
+    GradientCard(Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (ru) "Охват рынка" else "Market coverage", fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            Text("${cov.percent}%", fontWeight = FontWeight.Black, fontSize = 18.sp, color = if (cov.failed == 0) Positive else Warning)
+        }
+        Text(
+            if (ru) "Проверено ${cov.checked} из ${cov.total} инструментов на срок «${h.label(true)}»"
+            else "Checked ${cov.checked} of ${cov.total} instruments for the \"${h.label(false)}\" horizon",
+            fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            (if (ru) "Сигналов ${cov.hits} • без сигнала ${cov.noSignal} • неликвидные ${cov.illiquid} • нет торгов ${cov.stale}"
+            else "Signals ${cov.hits} • no signal ${cov.noSignal} • illiquid ${cov.illiquid} • not trading ${cov.stale}") +
+                (if (cov.failed > 0) (if (ru) " • не проверено ${cov.failed}" else " • not checked ${cov.failed}") else ""),
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
+        )
     }
 }

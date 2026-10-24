@@ -18,6 +18,7 @@ object NotificationHelper {
     const val CHANNEL_TRACKING = "mfp_tracking"
     const val CHANNEL_MARKET = "mfp_market"
     const val CHANNEL_SYSTEM = "mfp_system"
+    const val CHANNEL_SCANNER = "mfp_scanner"
 
     private const val PREFS = "mfprefs"
     private const val SENT_EVENTS = "alerted_events"
@@ -25,8 +26,8 @@ object NotificationHelper {
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < 26) return
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        fun make(id: String, name: String, description: String) = NotificationChannel(
-            id, name, NotificationManager.IMPORTANCE_HIGH
+        fun make(id: String, name: String, description: String, importance: Int = NotificationManager.IMPORTANCE_HIGH) = NotificationChannel(
+            id, name, importance
         ).apply {
             this.description = description
             enableVibration(true)
@@ -35,6 +36,7 @@ object NotificationHelper {
             lightColor = when (id) {
                 CHANNEL_TRACKING -> 0xFF00D084.toInt()
                 CHANNEL_MARKET -> 0xFF00A8FF.toInt()
+                CHANNEL_SCANNER -> 0xFF4DA3FF.toInt()
                 else -> 0xFF0066D6.toInt()
             }
             setShowBadge(true)
@@ -42,15 +44,19 @@ object NotificationHelper {
         nm.createNotificationChannel(make(CHANNEL_TRACKING, "Отслеживание прогнозов", "TP1, TP2, TP3, Stop Loss и итоговые результаты"))
         nm.createNotificationChannel(make(CHANNEL_MARKET, "Рынок и новости", "Сигналы, новости и рыночные события"))
         nm.createNotificationChannel(make(CHANNEL_SYSTEM, "Системные уведомления", "Состояние приложения и служебные события"))
+        nm.createNotificationChannel(make(CHANNEL_SCANNER, "Сканер прогнозов", "Новые прогнозы, найденные сканером рынка", NotificationManager.IMPORTANCE_DEFAULT))
     }
 
-    fun canNotify(context: Context): Boolean {
+    /** Every kind of notification checks ITS OWN channel: a muted channel must not swallow (and "consume") an event. */
+    fun canNotify(context: Context, channelId: String = CHANNEL_TRACKING): Boolean {
+        // The in-app switch is the master switch: the background workers keep running for tracking, but stay silent.
+        if (!context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("notifications_enabled", false)) return false
         if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
         ensureChannels(context)
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = nm.getNotificationChannel(CHANNEL_TRACKING)
+            val channel = nm.getNotificationChannel(channelId)
             if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) return false
         }
         return true
@@ -58,9 +64,9 @@ object NotificationHelper {
 
     /** Returns true only when this logical event was actually posted. */
     fun notifyTracking(context: Context, eventKey: String, ru: Boolean, title: String, body: String, symbol: String? = null): Boolean {
-        if (!canNotify(context)) return false
+        if (!canNotify(context, CHANNEL_TRACKING)) return false
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val sent = prefs.getStringSet(SENT_EVENTS, emptySet()).orEmpty().toMutableSet()
+        val sent = OrderedKeyStore.load(prefs, SENT_EVENTS)
         if (eventKey in sent) return false
         val intent = Intent(context, MainActivity::class.java).apply {
             putExtra("mfp_target", "TRACKING")
@@ -70,14 +76,14 @@ object NotificationHelper {
         return runCatching {
             post(context, CHANNEL_TRACKING, eventKey, title, body, intent)
             sent.add(eventKey)
-            trimAndSave(prefs, sent)
+            OrderedKeyStore.save(prefs, SENT_EVENTS, sent)
             true
         }.getOrDefault(false)
     }
 
     /** Posts a direct notification. No event is marked as sent unless posting succeeds. */
     fun notifyDirect(context: Context, channel: String, title: String, body: String, target: String = "HOME", symbol: String? = null, url: String? = null, id: Int = 0): Boolean {
-        if (!canNotify(context)) return false
+        if (!canNotify(context, channel)) return false
         val intent = Intent(context, MainActivity::class.java).apply {
             putExtra("mfp_target", target)
             putExtra("mfp_from_notification", true)
@@ -91,9 +97,9 @@ object NotificationHelper {
     }
 
     fun notifyMarket(context: Context, eventKey: String, title: String, body: String, target: String = "HOME", symbol: String? = null, url: String? = null): Boolean {
-        if (!canNotify(context)) return false
+        if (!canNotify(context, CHANNEL_MARKET)) return false
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val sent = prefs.getStringSet(SENT_EVENTS, emptySet()).orEmpty().toMutableSet()
+        val sent = OrderedKeyStore.load(prefs, SENT_EVENTS)
         if (eventKey in sent) return false
         val intent = Intent(context, MainActivity::class.java).apply {
             putExtra("mfp_target", target)
@@ -104,13 +110,32 @@ object NotificationHelper {
         return runCatching {
             post(context, CHANNEL_MARKET, eventKey, title, body, intent)
             sent.add(eventKey)
-            trimAndSave(prefs, sent)
+            OrderedKeyStore.save(prefs, SENT_EVENTS, sent)
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Scanner results: a separate channel, so they can be muted without touching TP/SL alerts. */
+    fun notifyScanner(context: Context, eventKey: String, title: String, body: String, symbol: String? = null): Boolean {
+        if (!canNotify(context, CHANNEL_SCANNER)) return false
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val sent = OrderedKeyStore.load(prefs, SENT_EVENTS)
+        if (eventKey in sent) return false
+        val intent = Intent(context, MainActivity::class.java).apply {
+            putExtra("mfp_target", if (symbol.isNullOrBlank()) "SCANNER" else "ANALYSIS")
+            putExtra("mfp_from_notification", true)
+            if (!symbol.isNullOrBlank()) putExtra("mfp_symbol", symbol)
+        }
+        return runCatching {
+            post(context, CHANNEL_SCANNER, eventKey, title, body, intent)
+            sent.add(eventKey)
+            OrderedKeyStore.save(prefs, SENT_EVENTS, sent)
             true
         }.getOrDefault(false)
     }
 
     fun sendTest(context: Context, ru: Boolean) {
-        if (!canNotify(context)) return
+        if (!canNotify(context, CHANNEL_SYSTEM)) return
         val intent = Intent(context, MainActivity::class.java)
         post(
             context, CHANNEL_SYSTEM, "test", "Market Forecast",
@@ -175,6 +200,7 @@ object NotificationHelper {
     private fun notificationSubText(channel: String): String = when (channel) {
         CHANNEL_TRACKING -> "MFP • Отслеживание"
         CHANNEL_MARKET -> "MFP • Рынок"
+        CHANNEL_SCANNER -> "MFP • Сканер"
         else -> "MFP • Система"
     }
 
@@ -187,8 +213,4 @@ object NotificationHelper {
         }
     }
 
-    private fun trimAndSave(prefs: android.content.SharedPreferences, values: MutableSet<String>) {
-        val keep = values.toList().takeLast(400).toSet()
-        prefs.edit().putStringSet(SENT_EVENTS, keep).apply()
-    }
 }

@@ -116,6 +116,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent { MarketForecastApp(this) }
     }
+
+    /** A notification tapped while the app is already open: hand the target to the UI instead of ignoring it. */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        NotificationRoute.push(intent)
+    }
+}
+
+internal object NotificationRoute {
+    var pending by mutableStateOf<android.content.Intent?>(null)
+    fun push(intent: android.content.Intent) {
+        if (intent.getBooleanExtra("mfp_from_notification", false)) pending = intent
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -148,6 +162,8 @@ fun MarketForecastApp(ctx: Context) {
     var tf by remember { mutableStateOf(launchIntent?.getStringExtra("mfp_timeframe") ?: "1D") }
     var screen by remember { mutableStateOf(when(launchTarget){"NEWS"->Screen.NEWS;"NEWS_DETAIL"->Screen.NEWS_DETAIL;"TRACKING"->Screen.HISTORY;"HISTORY"->Screen.HISTORY;"DIVIDENDS"->Screen.DIVIDENDS;"ANALYSIS"->Screen.ANALYSIS;"SCANNER"->Screen.SCANNER;else->Screen.HOME}) }
     var query by remember { mutableStateOf("") }
+    // Opening a screen is the only moment its cards play the fade-in; scrolling a list never does.
+    remember(screen) { UiPrefs.entranceUntil = System.currentTimeMillis() + 900L; true }
     var results by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
     var searchFilter by remember { mutableStateOf(prefs.getString("search_filter", "ALL") ?: "ALL") }
@@ -185,6 +201,10 @@ fun MarketForecastApp(ctx: Context) {
             "market_monitor", ExistingPeriodicWorkPolicy.UPDATE,
             PeriodicWorkRequestBuilder<MarketMonitorWorker>(interval.toLong().coerceAtLeast(15), TimeUnit.MINUTES).setConstraints(constraints).build()
         )
+    }
+    fun stopBackground() {
+        WorkManager.getInstance(ctx).cancelUniqueWork("market_monitor")
+        ScanScheduler.apply(ctx.applicationContext, prefs)
     }
     fun runMonitorNow() {
         message = if (ru) "Проверка уведомлений запущена…" else "Notification check started…"
@@ -313,11 +333,27 @@ fun MarketForecastApp(ctx: Context) {
             }
         }
     }
+    // A notification tapped while the app is open: go straight to the right screen.
+    val routed = NotificationRoute.pending
+    LaunchedEffect(routed) {
+        val target = routed ?: return@LaunchedEffect
+        NotificationRoute.pending = null
+        target.getStringExtra("mfp_news_url")?.takeIf { it.isNotBlank() }?.let { newsDetailUrl = it }
+        val symbol = target.getStringExtra("mfp_symbol")?.takeIf { it.isNotBlank() }
+        when (target.getStringExtra("mfp_target")) {
+            "NEWS" -> { screen = Screen.NEWS }
+            "NEWS_DETAIL" -> { screen = Screen.NEWS_DETAIL }
+            "TRACKING", "HISTORY" -> { screen = Screen.HISTORY }
+            "DIVIDENDS" -> { screen = Screen.DIVIDENDS }
+            "SCANNER" -> { screen = Screen.SCANNER }
+            else -> { if (symbol != null) load(symbol) else screen = Screen.HOME }
+        }
+    }
     // Opening the scanner looks for new forecasts straight away when the last run is older than 30 minutes.
     LaunchedEffect(screen) {
         if (screen == Screen.SCANNER && scanner.autoStart && !scanner.running && repo.isBcsConfigured()) {
             if (!scanner.hasBaseline) scanner.restore()
-            val stale = System.currentTimeMillis() - scanner.lastFinishedAt > ScannerController.AUTO_START_AFTER_MS
+            val stale = System.currentTimeMillis() - scanner.lastFinishedAt > scanner.refreshAfterMs()
             if (stale) scanner.start(scope, favorites)
         }
     }
@@ -507,17 +543,18 @@ fun MarketForecastApp(ctx: Context) {
 
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         notifications = ok; prefs.edit().putBoolean("notifications_enabled", ok).apply()
-        if (ok) { createNotificationChannel(ctx); showPopupPermissionPrompt = !prefs.getBoolean("popup_prompt_done", false); schedule(); runMonitorNow(); sendTestNotification(ctx, ru) }
+        if (ok) { createNotificationChannel(ctx); showPopupPermissionPrompt = !prefs.getBoolean("popup_prompt_done", false); schedule(); ScanScheduler.apply(ctx.applicationContext, prefs); runMonitorNow(); sendTestNotification(ctx, ru) } else stopBackground()
     }
     fun toggleNotifications(enable: Boolean) {
         if (enable && Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) permission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        else { notifications = enable; prefs.edit().putBoolean("notifications_enabled", enable).apply(); if (enable) { createNotificationChannel(ctx); schedule(); runMonitorNow(); sendTestNotification(ctx, ru) } }
+        else { notifications = enable; prefs.edit().putBoolean("notifications_enabled", enable).apply(); if (enable) { createNotificationChannel(ctx); schedule(); ScanScheduler.apply(ctx.applicationContext, prefs); runMonitorNow(); sendTestNotification(ctx, ru) } else stopBackground() }
     }
     fun requestStartupNotifications() {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) permission.launch(Manifest.permission.POST_NOTIFICATIONS)
         else { notifications = true; prefs.edit().putBoolean("notifications_enabled", true).apply(); createNotificationChannel(ctx); if (!prefs.getBoolean("popup_prompt_done", false)) showPopupPermissionPrompt = true }
     }
     LaunchedEffect(Unit) { requestStartupNotifications() }
+    LaunchedEffect(tokenVersion) { ScanScheduler.apply(ctx.applicationContext, prefs) }
 
     val scheme = darkColorScheme(
         primary = Accent,
@@ -642,12 +679,7 @@ private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
 @Composable
 private fun BrandWordmark(subtitle: String = "") {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Image(
-            painter = painterResource(R.drawable.mfp_icon),
-            contentDescription = "App logo",
-            modifier = Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)),
-            contentScale = ContentScale.Crop
-        )
+        MfpLogo(Modifier.size(34.dp), animate = false, corner = 10.dp)
         if (subtitle.isNotBlank()) {
             Text(
                 subtitle,
@@ -667,12 +699,7 @@ private fun BrandHero(ru: Boolean) {
     // Minimal home header: logo only, on a breathing halo.
     Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
         GlowHalo(Modifier.size(170.dp))
-        Image(
-            painter = painterResource(R.drawable.mfp_icon),
-            contentDescription = "App logo",
-            modifier = Modifier.size(86.dp).entrance().clip(RoundedCornerShape(24.dp)),
-            contentScale = ContentScale.Crop
-        )
+        MfpLogo(Modifier.size(92.dp), animate = true, corner = 26.dp)
     }
 }
 
@@ -953,7 +980,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 "FINANCE" -> { item { ProfitCalculatorInline(f, ru, prefs) }; item { RiskCard(f, ru, prefs) } }
                 else -> {
                     item { Button({ track() }, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(17.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(8.dp)); Text(if (ru) "Отслеживать прогноз" else "Track forecast", fontWeight = FontWeight.Black) } }
-                    item { Levels(f, ru, prefs, state.meta.currency) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { AccuracyCard(state.candles, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
+                    item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
                 }
             }
         } else item { ErrorCard(state.error ?: "Нет данных", ru) }
@@ -1512,7 +1539,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()}}}
-        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)}
+        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}

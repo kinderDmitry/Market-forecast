@@ -59,8 +59,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathMeasure
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -83,6 +90,9 @@ import kotlinx.coroutines.delay
  */
 internal object UiPrefs {
     var animations by mutableStateOf(true)
+
+    /** Cards fade in only while a screen is opening (set on every screen change), never while a list scrolls. */
+    var entranceUntil: Long = 0L
 }
 
 internal val MfpTypography = Typography(
@@ -137,7 +147,7 @@ internal fun Modifier.tapCard(onClick: () -> Unit): Modifier = this.pressScale()
 /** Soft fade + rise the first time a block appears on screen. */
 @Composable
 internal fun Modifier.entrance(delayMs: Int = 0): Modifier {
-    val enabled = UiPrefs.animations
+    val enabled = UiPrefs.animations && System.currentTimeMillis() < UiPrefs.entranceUntil
     val p = remember { Animatable(if (enabled) 0f else 1f) }
     LaunchedEffect(Unit) {
         if (enabled) {
@@ -485,4 +495,66 @@ internal fun screenTransition(forward: Boolean): ContentTransform {
     return (fadeIn(tween(280, delayMillis = 70, easing = FastOutSlowInEasing)) +
         slideInHorizontally(tween(340, easing = FastOutSlowInEasing)) { full -> dir * full / 12 }) togetherWith
         (fadeOut(tween(140)) + slideOutHorizontally(tween(220, easing = FastOutSlowInEasing)) { full -> -dir * full / 16 })
+}
+
+// ------------------------------------------------------------------ logo
+
+/**
+ * The app mark drawn in code (same geometry as the launcher icon): a rising line that ends in a glowing
+ * "forecast" node and an arrow. On first appearance the line draws itself, then the node and arrow pop in.
+ */
+@Composable
+internal fun MfpLogo(modifier: Modifier = Modifier, animate: Boolean = true, corner: Dp = 24.dp) {
+    val intro = remember { Animatable(if (animate && UiPrefs.animations) 0f else 1f) }
+    LaunchedEffect(Unit) { if (intro.value < 1f) intro.animateTo(1f, tween(1200, easing = FastOutSlowInEasing)) }
+    Canvas(modifier.clip(RoundedCornerShape(corner))) {
+        val p = intro.value
+        val k = this.size.minDimension / 108f
+        val z = 1.3f
+        fun pt(x: Float, y: Float) = Offset((54f + (x - 54f) * z) * k, (54f + (y - 54f) * z) * k)
+        drawRect(
+            Brush.radialGradient(
+                listOf(Color(0xFF0B2A5C), Color(0xFF040E22), Color(0xFF010309)),
+                center = Offset(this.size.width / 2f, this.size.height / 2f),
+                radius = this.size.minDimension * 0.72f
+            )
+        )
+        val barsA = (p / 0.35f).coerceIn(0f, 1f)
+        for ((x, top) in listOf(28f to 78f, 41f to 72f, 54f to 76f, 67f to 66f)) {
+            val a = pt(x, top)
+            val b = pt(x + 6f, 84f)
+            drawRect(BrightAccent.copy(alpha = 0.24f * barsA), topLeft = a, size = Size(b.x - a.x, b.y - a.y))
+        }
+        val nodeP = ((p - 0.55f) / 0.25f).coerceIn(0f, 1f)
+        val arrowP = ((p - 0.75f) / 0.25f).coerceIn(0f, 1f)
+        val a0 = pt(27f, 76f)
+        val b0 = pt(39f, 50f)
+        val c0 = pt(52f, 68f)
+        val d0 = pt(64f, 42f)
+        val glowR = 17f * z * k
+        drawCircle(
+            Brush.radialGradient(listOf(BrightAccent.copy(alpha = 0.5f * nodeP), Color.Transparent), center = d0, radius = glowR),
+            radius = glowR, center = d0
+        )
+        val path = Path().apply { moveTo(a0.x, a0.y); lineTo(b0.x, b0.y); lineTo(c0.x, c0.y); lineTo(d0.x, d0.y) }
+        val measure = PathMeasure()
+        measure.setPath(path, false)
+        val seg = Path()
+        measure.getSegment(0f, measure.length * (p / 0.6f).coerceIn(0f, 1f), seg, true)
+        drawPath(
+            seg,
+            Brush.linearGradient(listOf(Accent, BrightAccent), start = a0, end = d0),
+            style = Stroke(width = 7.5f * z * k, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        )
+        drawLine(BrightAccent.copy(alpha = 0.7f * arrowP), d0, pt(71.12f, 35.43f), strokeWidth = 3.6f * z * k, cap = StrokeCap.Round)
+        val head = Path().apply {
+            val e = pt(77f, 30f)
+            val h1 = pt(74.51f, 39.1f)
+            val h2 = pt(67.73f, 31.75f)
+            moveTo(e.x, e.y); lineTo(h1.x, h1.y); lineTo(h2.x, h2.y); close()
+        }
+        drawPath(head, Color(0xFF9CCBFF).copy(alpha = arrowP))
+        drawCircle(BrightAccent.copy(alpha = 0.5f * nodeP), radius = 6.6f * z * k, center = d0, style = Stroke(width = 1.6f * z * k))
+        drawCircle(Color.White.copy(alpha = nodeP), radius = 4.2f * z * k * (0.6f + 0.4f * nodeP), center = d0)
+    }
 }

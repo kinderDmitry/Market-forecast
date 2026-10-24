@@ -424,15 +424,23 @@ class MarketRepository(
      * One-request daily history (about 14 months) for the market scanner and index widgets.
      * The board comes from the catalogue, so no extra instrument lookup is needed.
      */
-    fun loadScanCandles(symbol: String, classCode: String): List<Candle> {
+    fun loadScanCandles(symbol: String, classCode: String, timeframe: String = "1D"): List<Candle> {
         if (!isBcsConfigured()) throw IllegalStateException("БКС не подключен")
         backgroundHttp.set(true)
         try {
             val ticker = canonicalSymbol(symbol).substringBefore("@")
             val board = classCode.ifBlank { bcsInstrument(ticker).second }
+            // One response holds at most 1440 bars: the look-back is sized so every horizon is a single request.
+            val (tf, days) = when (timeframe.uppercase(Locale.US)) {
+                "15M" -> "M15" to 20
+                "1H" -> "H1" to 100
+                "4H" -> "H4" to 400
+                "1W" -> "W" to 2600
+                else -> "D" to 430
+            }
             val end = System.currentTimeMillis()
-            val start = end - 430L * 86_400_000L
-            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(board)}&timeFrame=D&startDate=${enc(isoUtc(start))}&endDate=${enc(isoUtc(end))}"
+            val start = end - days * 86_400_000L
+            val url = "https://be.broker.ru/trade-api-market-data-connector/api/v1/candles-chart?ticker=${enc(ticker)}&classCode=${enc(board)}&timeFrame=$tf&startDate=${enc(isoUtc(start))}&endDate=${enc(isoUtc(end))}"
             val root = JSONObject(getTextAuth(url, 15000, bcsHeaders()))
             val raw = parseBcsCandles(root).distinctBy { it.time }.sortedBy { it.time }
             return normalizeInterval(raw, "1d")
