@@ -107,6 +107,7 @@ internal fun ScannerScreen(
     var onlyNew by remember { mutableStateOf(false) }
     var minConf by remember { mutableIntStateOf(0) }
     var goodOnly by remember { mutableStateOf(false) }
+    var minAlign by remember { mutableIntStateOf(0) }
     var sort by remember { mutableStateOf("REL") }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     // One clock for the progress estimate and the countdowns; expired forecasts leave the list on their own.
@@ -128,14 +129,16 @@ internal fun ScannerScreen(
         }
     }
 
-    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, minConf, sort) {
+    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, minAlign, minConf, sort) {
         val base = c.current
             .filter { signalFilter == "ALL" || it.signal.contains(signalFilter, ignoreCase = true) }
             .filter { !onlyNew || it.isNew }
             .filter { !goodOnly || it.reliability >= 60 }
+            .filter { minAlign == 0 || it.alignedAgree >= minAlign }
             .filter { it.confidence >= minConf }
         when (sort) {
             "REL" -> base.sortedWith(compareByDescending<ScanHit> { it.reliability }.thenByDescending { it.confidence })
+            "ALIGN" -> base.sortedWith(compareByDescending<ScanHit> { it.alignedAgree }.thenByDescending { it.reliability })
             "NEW" -> base.sortedWith(compareByDescending<ScanHit> { it.isNew }.thenByDescending { it.confidence })
             "CHANGE" -> base.sortedByDescending { abs(it.changePct) }
             "RR" -> base.sortedByDescending { it.rr }
@@ -230,6 +233,13 @@ internal fun ScannerScreen(
                     )
                     Switch(checked = c.autoStart, onCheckedChange = { c.changeAutoStart(it) })
                 }
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (ru) "Проверять совпадение сроков у найденных прогнозов" else "Check timeframe agreement for found forecasts",
+                        fontSize = 12.sp, modifier = Modifier.weight(1f)
+                    )
+                    Switch(checked = c.confluence, enabled = !c.running, onCheckedChange = { c.changeConfluence(it) })
+                }
             }
         }
 
@@ -274,12 +284,22 @@ internal fun ScannerScreen(
                         onClick = { goodOnly = !goodOnly },
                         label = { Text(if (ru) "Надёжность B и выше" else "Reliability B+", fontSize = 12.sp) }
                     )
+                    if (c.confluence) {
+                        listOf(0 to (if (ru) "Любое совпадение" else "Any agreement"), 2 to "2+", 3 to "3+", 4 to "4+", 5 to (if (ru) "Все 5" else "All 5")).forEach { (value, label) ->
+                            FilterChip(
+                                selected = minAlign == value,
+                                onClick = { minAlign = value },
+                                label = { Text(if (value == 0) label else (if (ru) "Сроки $label" else "Horizons $label"), fontSize = 12.sp) }
+                            )
+                        }
+                    }
                 }
             }
             item {
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(
                         "REL" to (if (ru) "По надёжности" else "Reliability"),
+                        "ALIGN" to (if (ru) "По совпадению сроков" else "Timeframe agreement"),
                         "CONF" to (if (ru) "По уверенности" else "Confidence"),
                         "NEW" to (if (ru) "Сначала новые" else "New first"),
                         "CHANGE" to (if (ru) "По движению за день" else "Daily move"),
@@ -375,6 +395,16 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Tag("🕒 ${h.horizon.label(ru)}", Accent)
             Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
+        }
+        if (h.aligned.isNotBlank()) {
+            val known = Confluence.decode(h.aligned).values.count { it != null }
+            AlignCells(h.alignedDirections(), h.timeframe, Modifier.padding(top = 8.dp))
+            Text(
+                if (ru) "Совпадение сроков: ${h.alignedAgree} из $known" else "Timeframe agreement: ${h.alignedAgree} of $known",
+                fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                color = if (h.alignedAgree >= 3) Positive else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp)
+            )
         }
         // All three targets with their distance and chance, not only the smallest one.
         Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {

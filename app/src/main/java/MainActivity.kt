@@ -109,7 +109,7 @@ private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
 internal val DarkMuted = Color(0xFF8FA7B8)
 
-private enum class Screen { HOME, SEARCH, SCANNER, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
+private enum class Screen { HOME, SEARCH, SCANNER, HEATMAP, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -620,7 +620,7 @@ fun MarketForecastApp(ctx: Context) {
                 Box(Modifier.fillMaxSize()) {
                 AnimatedContent(targetState = screen, transitionSpec = { screenTransition(targetState.ordinal >= initialState.ordinal) }, label = "screen") { s ->
                     when (s) {
-                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
+                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { screen = Screen.HEATMAP }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav, { tokenVersion++ }) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
@@ -630,6 +630,7 @@ fun MarketForecastApp(ctx: Context) {
                             { sym -> if (favorites.any { it.equals(sym, true) }) saveFav(favorites.filterNot { it.equals(sym, true) }.toSet()) else saveFav(favorites + sym) },
                             { startScanner() }
                         )
+                        Screen.HEATMAP -> HeatmapScreen(repo, favorites, ru) { load(it) }
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
@@ -673,7 +674,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; Screen.SCANNER -> if (ru) "📡 Сканер прогнозов" else "📡 Forecast scanner"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; Screen.SCANNER -> if (ru) "📡 Сканер прогнозов" else "📡 Forecast scanner"; Screen.HEATMAP -> if (ru) "🗺 Карта рынка" else "🗺 Market map"; else -> "Market Forecast"
 }
 
 @Composable
@@ -704,11 +705,12 @@ private fun BrandHero(ru: Boolean) {
 }
 
 @Composable
-private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, scanner: ScannerController, openScanner: () -> Unit, startScan: () -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
+private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, scanner: ScannerController, openScanner: () -> Unit, startScan: () -> Unit, openHeatmap: () -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
         item { BrandHero(ru) }
         item { SearchLauncher(ru, search) }
         item { ScannerEntryCard(scanner, ru, openScanner, startScan) }
+        item { HeatmapEntryCard(ru, openHeatmap) }
         item {
             SectionHeader(
                 if (ru) "АНАЛИТИЧЕСКИЙ ЦЕНТР" else "ANALYTICS CENTER",
@@ -973,14 +975,15 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 FilterChip(selected = tf == timeframe, onClick = { onTf(timeframe) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = tc.copy(alpha = .18f), selectedLabelColor = tc, containerColor = Color.Transparent, labelColor = tc.copy(alpha = .82f), disabledContainerColor = Color.Transparent), label = { Text(label, fontSize = 11.sp, fontWeight = FontWeight.Black) })
             }
         } }
+        if (state.candles.size >= 5) item { PriceChartCard(state.candles, state.forecast, tf, ru) }
         if (state.loading) item { Loading(ru) } else if (state.forecast != null) {
             val f = state.forecast
             when (tab) {
-                "OVERVIEW" -> { item { ForecastSummary(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { DataQuality(f, ru) }; item { Explanation(f, ru) }; item { IndicatorCoverage(f, ru) } }
+                "OVERVIEW" -> { item { ForecastSummary(f, ru) }; item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { DataQuality(f, ru) }; item { Explanation(f, ru) }; item { IndicatorCoverage(f, ru) } }
                 "FINANCE" -> { item { ProfitCalculatorInline(f, ru, prefs) }; item { RiskCard(f, ru, prefs) } }
                 else -> {
                     item { Button({ track() }, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(17.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(8.dp)); Text(if (ru) "Отслеживать прогноз" else "Track forecast", fontWeight = FontWeight.Black) } }
-                    item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
+                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
                 }
             }
         } else item { ErrorCard(state.error ?: "Нет данных", ru) }

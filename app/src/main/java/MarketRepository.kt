@@ -262,6 +262,52 @@ class MarketRepository(
         return searchEngine.size()
     }
 
+    /**
+     * Market map data: the whole main board (or the currency board) in ONE request to the public MOEX ISS.
+     * Columns are read by name, so a missing column degrades one value instead of shifting every row.
+     */
+    internal fun heatmapSnapshot(currency: Boolean): List<HeatTile> {
+        val url = if (currency) {
+            "https://iss.moex.com/iss/engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=securities,marketdata&securities.columns=SECID,SHORTNAME,PREVPRICE&marketdata.columns=SECID,LAST,VALTODAY"
+        } else {
+            "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off&iss.only=securities,marketdata&securities.columns=SECID,SHORTNAME,PREVPRICE,ISSUESIZE&marketdata.columns=SECID,LAST,VALTODAY,ISSUECAPITALIZATION"
+        }
+        val root = JSONObject(getText(url, 12000))
+        fun table(block: String, expected: List<String>): List<Map<String, Any?>> {
+            val t = root.optJSONObject(block) ?: return emptyList()
+            val data = t.optJSONArray("data") ?: return emptyList()
+            val cols = t.optJSONArray("columns")
+            val names = if (cols != null) (0 until cols.length()).map { cols.optString(it) } else expected
+            val out = ArrayList<Map<String, Any?>>(data.length())
+            for (i in 0 until data.length()) {
+                val row = data.optJSONArray(i) ?: continue
+                out.add(names.indices.associate { j -> names[j] to (if (row.isNull(j)) null else row.opt(j)) })
+            }
+            return out
+        }
+        fun num(v: Any?): Double = (v as? Number)?.toDouble() ?: 0.0
+        val securities = table("securities", if (currency) listOf("SECID", "SHORTNAME", "PREVPRICE") else listOf("SECID", "SHORTNAME", "PREVPRICE", "ISSUESIZE"))
+        val market = table("marketdata", if (currency) listOf("SECID", "LAST", "VALTODAY") else listOf("SECID", "LAST", "VALTODAY", "ISSUECAPITALIZATION"))
+        val info = HashMap<String, Map<String, Any?>>()
+        for (row in securities) {
+            val id = row["SECID"]?.toString().orEmpty()
+            if (id.isNotBlank()) info[id] = row
+        }
+        val out = ArrayList<HeatTile>()
+        for (m in market) {
+            val id = m["SECID"]?.toString().orEmpty()
+            val s = info[id] ?: continue
+            val last = num(m["LAST"])
+            val prev = num(s["PREVPRICE"])
+            if (last <= 0.0 || prev <= 0.0) continue
+            var cap = num(m["ISSUECAPITALIZATION"])
+            if (cap <= 0.0) cap = last * num(s["ISSUESIZE"])
+            out.add(HeatTile(id, s["SHORTNAME"]?.toString().orEmpty().ifBlank { id }, last, (last / prev - 1.0) * 100.0, cap, num(m["VALTODAY"])))
+        }
+        if (out.isEmpty()) throw IllegalStateException("Московская биржа не вернула котировки (возможно, торги ещё не начались)")
+        return out
+    }
+
     /** Big pages are 10x fewer requests. Probed once; the verdict is remembered. */
     private fun choosePageSize(): Int {
         val saved = prefs?.getInt(CATALOG_PAGE_SIZE_PREF, 0) ?: 0

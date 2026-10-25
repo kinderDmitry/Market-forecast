@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -88,8 +89,13 @@ internal data class ScanHit(
     val tp1p: Double = 0.0,
     val tp2p: Double = 0.0,
     val tp3p: Double = 0.0,
-    val stopProb: Double = 0.0
+    val stopProb: Double = 0.0,
+    /** Direction of the same instrument on every horizon, see [Confluence.encode]. Empty until the second phase checked it. */
+    val aligned: String = ""
 ) {
+    /** How many horizons (this one included) point the same way as the forecast; 0 while unchecked. */
+    val alignedAgree: Int get() = if (aligned.isBlank()) 0 else Confluence.summarize(if (signal == "LONG") 1 else -1, Confluence.decode(aligned)).agree
+    fun alignedDirections(): Map<String, Int?> = Confluence.decode(aligned)
     val horizon: ScanHorizon get() = ScanHorizon.of(timeframe)
 }
 
@@ -150,7 +156,8 @@ internal object ScannerStore {
                     tp1p = o.optDouble("tp1p", 0.0),
                     tp2p = o.optDouble("tp2p", 0.0),
                     tp3p = o.optDouble("tp3p", 0.0),
-                    stopProb = o.optDouble("stopProb", 0.0)
+                    stopProb = o.optDouble("stopProb", 0.0),
+                    aligned = o.optString("aligned", "")
                 )
             )
         }
@@ -185,7 +192,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
-                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb))
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned)
                 }
             )
         }
@@ -288,6 +295,29 @@ internal object ScanCore {
         return Outcome(HIT, hit, last.time)
     }
 
+    /**
+     * Direction of one instrument on every horizon: one candle request per other horizon. Only done for instruments
+     * that already have a forecast, so a few dozen of them, not the whole market.
+     */
+    fun confluence(repo: MarketRepository, symbol: String, classCode: String, own: ScanHorizon, ownDir: Int): String {
+        val dirs = HashMap<String, Int?>()
+        val now = System.currentTimeMillis()
+        for (hz in ScanHorizon.values()) {
+            if (hz == own) {
+                dirs[hz.tf] = ownDir
+                continue
+            }
+            dirs[hz.tf] = try {
+                val c = repo.loadScanCandles(symbol, classCode, hz.tf)
+                if (c.size < minBars(hz) || c.last().close <= 0.0 || now - c.last().time > hz.staleMs) null
+                else Confluence.direction(AnalyticsEngine.analyze(c, null))
+            } catch (t: Throwable) {
+                null
+            }
+        }
+        return Confluence.encode(dirs)
+    }
+
     /** Full-market scopes need the whole BCS catalogue, the main board and favourites do not. */
     fun needsFullCatalog(scope: ScanScope): Boolean = scope != ScanScope.MAIN && scope != ScanScope.FAVORITES
 
@@ -374,6 +404,8 @@ internal class ScannerController(
 
     var scope by mutableStateOf(loadScope())
     var horizon by mutableStateOf(loadHorizon())
+    var confluence by mutableStateOf(prefs.getBoolean(PREF_CONF, true))
+        private set
     var autoStart by mutableStateOf(prefs.getBoolean(PREF_AUTO, true))
         private set
 
@@ -395,6 +427,11 @@ internal class ScannerController(
     val current: List<ScanHit> get() = hits.filter { it.timeframe == horizon.tf }
 
     val newCount: Int get() = current.count { it.isNew }
+
+    fun changeConfluence(value: Boolean) {
+        confluence = value
+        prefs.edit().putBoolean(PREF_CONF, value).apply()
+    }
 
     fun changeAutoStart(value: Boolean) {
         autoStart = value
@@ -584,6 +621,29 @@ internal class ScannerController(
                 }
                 publish()
             }
+            // 4. Second phase: for the forecasts that were found, look at the other horizons of the same instrument.
+            if (confluence && !abort && found.isNotEmpty()) {
+                message = tr("Проверяю совпадение сроков у ${found.size} прогнозов…", "Checking timeframe agreement for ${found.size} forecasts…")
+                val targets = found.values.sortedByDescending { it.reliability }
+                var checkedAlign = 0
+                withTimeoutOrNull(150_000L) {
+                    coroutineScope {
+                        targets.map { hit ->
+                            async {
+                                gate.withPermit {
+                                    val enc = withContext(Dispatchers.IO) {
+                                        ScanCore.confluence(repo, hit.symbol, hit.classCode, h, if (hit.signal == "LONG") 1 else -1)
+                                    }
+                                    found[hit.symbol] = hit.copy(aligned = enc)
+                                    checkedAlign += 1
+                                    if (checkedAlign % 4 == 0) publish()
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+                publish()
+            }
             message = null
             completed = true
         } finally {
@@ -645,6 +705,7 @@ internal class ScannerController(
         private const val PREF_SCOPE = "scanner_scope"
         private const val PREF_HORIZON = "scanner_horizon"
         private const val PREF_AUTO = "scanner_auto"
+        private const val PREF_CONF = "scanner_confluence"
         private const val PARALLEL = 6
 
         /** Auto-start when the scanner opens only if the previous scan of that horizon is older than this. */
