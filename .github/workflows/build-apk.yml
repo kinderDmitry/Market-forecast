@@ -106,6 +106,10 @@ jobs:
           test -f app/src/main/java/CandleChart.kt
           test -f app/src/main/java/Heatmap.kt
           test -f app/src/main/java/Confluence.kt
+          test -f app/src/main/java/InstrumentIcon.kt
+          test -f app/src/main/java/TechnicalSignals.kt
+          test -f app/src/main/java/ExitPlanner.kt
+          test -f app/src/main/java/TradePlanCard.kt
           test -f app/src/main/java/ReliabilityEngine.kt
           # The refresh token must only ever be touched through SecureTokenStore.
           ! grep -n 'bcs_refresh_token' app/src/main/java/MainActivity.kt app/src/main/java/MarketMonitorWorker.kt
@@ -115,6 +119,11 @@ jobs:
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dkotlin.daemon.jvm.options=-Xmx3g"
         run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      # Unit tests of the pure logic (maps, indicators, agreement). They report, but never block publishing the APK.
+      - name: Unit tests
+        continue-on-error: true
+        run: gradle --no-daemon :app:testDebugUnitTest
 
       # The optimised build (R8): noticeably faster and smaller. If it ever fails, the debug APK is published instead.
       - name: Build release APK
