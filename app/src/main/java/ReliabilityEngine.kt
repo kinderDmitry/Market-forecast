@@ -61,7 +61,7 @@ internal object ReliabilityEngine {
         agreement(f),
         unit(f.confirmation / 5.0),
         unit((f.rr - 0.8) / 1.7),
-        unit(f.expectedValueR / 0.6),
+        unit(f.expectedValueR / 0.25),
         unit(0.5 + 0.5 * unit(f.mtfAgreement) - 0.5 * unit(f.mtfConflict)),
         unit(f.signalStability),
         unit(f.calibrationQuality) * unit(f.sampleSize / 200.0),

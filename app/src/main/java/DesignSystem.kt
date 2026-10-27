@@ -90,6 +90,7 @@ import kotlinx.coroutines.delay
  */
 internal object UiPrefs {
     var animations by mutableStateOf(true)
+    var logos by mutableStateOf(true)
 
     /** Cards fade in only while a screen is opening (set on every screen change), never while a list scrolls. */
     var entranceUntil: Long = 0L

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -91,24 +92,34 @@ private fun chartWindow(n: Int, visibleF: Float, offsetF: Float): IntArray {
 
 /** Chart card for the analysis screen: candles, volume, EMA 20 / 50 and the levels of the forecast. */
 @Composable
-internal fun PriceChartCard(candles: List<Candle>, f: Forecast?, timeframe: String, ru: Boolean) {
+internal fun PriceChartCard(candles: List<Candle>, f: Forecast?, timeframe: String, ru: Boolean, loading: Boolean = false, error: String? = null, onRetry: (() -> Unit)? = null) {
     GradientCard(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(if (ru) "График и уровни" else "Chart and levels", fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.weight(1f))
             Text(timeframe, fontSize = 12.sp, fontWeight = FontWeight.Black, color = Accent)
         }
         if (candles.size < 5) {
-            Text(
-                if (ru) "Для графика пока мало свечей" else "Not enough candles to draw the chart yet",
-                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
-            )
+            if (loading) {
+                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    PulseDot(Accent, 8.dp)
+                    Text(if (ru) "Загружаю свечи БКС…" else "Loading BCS candles…", Modifier.padding(start = 10.dp), fontSize = 12.sp)
+                }
+                SkeletonLine(0.95f, 170.dp)
+            } else {
+                Text(
+                    if (ru) "График появится, когда БКС отдаст свечи." else "The chart appears as soon as BCS returns the candles.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
+                )
+                if (!error.isNullOrBlank()) Text(error, fontSize = 11.sp, color = Warning, modifier = Modifier.padding(top = 4.dp))
+                if (onRetry != null) Button(onClick = onRetry, modifier = Modifier.padding(top = 10.dp)) { Text(if (ru) "Загрузить снова" else "Load again") }
+            }
         } else {
             CandleChart(candles, f, timeframe, ru, Modifier.fillMaxWidth().height(340.dp).padding(top = 8.dp))
             Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
                 Text("━ EMA 20", fontSize = 11.sp, color = Ema20Color, fontWeight = FontWeight.Bold)
                 Text("  ━ EMA 50", fontSize = 11.sp, color = Ema50Color, fontWeight = FontWeight.Bold)
                 Text(
-                    if (ru) "  ▮ объём" else "  ▮ volume", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    if (ru) "  ▮ объём  •  свечи БКС" else "  ▮ volume  •  BCS candles", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             Text(

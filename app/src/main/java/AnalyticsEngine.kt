@@ -64,7 +64,11 @@ object AnalyticsEngine {
         val tp3: Double,
         val sl: Double,
         val avgMfeR: Double,
-        val avgMaeR: Double
+        val avgMaeR: Double,
+        /** Stop distance (ATR) and target scale the history preferred, and what that plan earned per trade in R. */
+        val stopMult: Double = 1.25,
+        val scale: Double = 1.0,
+        val planEv: Double = 0.0
     )
 
     private data class Evidence(
@@ -344,9 +348,11 @@ object AnalyticsEngine {
     private fun sigmoid(x: Double): Double = 1.0 / (1.0 + exp(-x.coerceIn(-8.0, 8.0)))
 
     private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, horizon: Int = 8): Historical {
-        if (c.size < 150) return Historical(.5, 0, .5, .5, .5, .5, 1.0, 1.0)
+        val fallback = Historical(.5, 0, .45, .28, .15, .38, 1.0, 1.0, stopMult, 1.0, 0.0)
+        if (c.size < 150) return fallback
         val end = c.lastIndex - 2
-        var samples = 0; var tp1 = 0; var tp2 = 0; var tp3 = 0; var sl = 0
+        val strict = ArrayList<ExitPlanner.Sample>()
+        val loose = ArrayList<ExitPlanner.Sample>()
         var mfe = 0.0; var mae = 0.0
         val step = max(1, min(4, c.size / 250))
         for (i in 90..end step step) {
@@ -359,28 +365,29 @@ object AnalyticsEngine {
             if (dirEvidence < -.15 && same == 0.0) continue
             val future = c.subList(i + 1, min(c.size, i + 1 + horizon))
             if (future.isEmpty()) continue
-            // The same ladder the forecast really uses: stop = stopMult ATR, TP1 = 1R, TP2 = 2R, TP3 = 2.8R.
-            val r1 = stopMult; val r2 = stopMult * 2.0; val r3 = stopMult * 2.8
-            var hit1 = false; var hit2 = false; var hit3 = false; var stopped = false
+            val sample = ExitPlanner.Sample(i, p, a)
+            loose.add(sample)
+            // "Similar" in the strict sense: same regime and the structure does not argue with the trade.
+            if (same == 1.0 && dirEvidence >= 0.0) strict.add(sample)
             var localMfe = 0.0; var localMae = 0.0
             for (f in future) {
                 val favorable = if (direction > 0) (f.high - p) / a else (p - f.low) / a
                 val adverse = if (direction > 0) (p - f.low) / a else (f.high - p) / a
                 localMfe = max(localMfe, favorable); localMae = max(localMae, adverse)
-                if (adverse >= stopMult) stopped = true
-                if (favorable >= r1) hit1 = true
-                if (favorable >= r2) hit2 = true
-                if (favorable >= r3) hit3 = true
             }
-            samples++; if (hit1) tp1++; if (hit2) tp2++; if (hit3) tp3++; if (stopped) sl++
             mfe += localMfe; mae += localMae
         }
-        if (samples == 0) return Historical(.5, 0, .5, .5, .5, .5, 1.0, 1.0)
-        fun smooth(hits: Int, base: Double): Double = ((hits + base * 12.0) / (samples + 12.0)).coerceIn(.01, .99)
+        if (loose.isEmpty()) return fallback
+        val used = if (strict.size >= 40) strict else loose
+        // The stop and the height of the targets are chosen on those situations, and every plan is measured as it is traded.
+        val plan = ExitPlanner.choose(c, used, direction, stopMult, horizon)
+        val n = used.size.toDouble()
+        fun smooth(frequency: Double, prior: Double): Double = ((frequency * n + prior * 12.0) / (n + 12.0)).coerceIn(.01, .99)
         return Historical(
-            smooth(tp1, .5), samples,
-            smooth(tp1, .5), smooth(tp2, .38), smooth(tp3, .24), smooth(sl, .32),
-            mfe / samples, mae / samples
+            smooth(plan.p1, .45), used.size,
+            smooth(plan.p1, .45), smooth(plan.p2, .28), smooth(plan.p3, .15), smooth(plan.pStop, .38),
+            mfe / loose.size, mae / loose.size,
+            plan.stopMult, plan.scale, plan.ev
         )
     }
 
@@ -426,6 +433,13 @@ object AnalyticsEngine {
         if (reg.impulse > .65) both(if (x.last() >= x[x.lastIndex - 5]) .45 else -.45, "Импульс")
         if (reg.fatigue > .5) both(if (s.score > 0) -.55 else .55, "Истощение движения")
         if (l.sweep != 0.0) both(l.sweep * .85, "Снятие ликвидности")
+        // Four extra, independent pieces of evidence (each is its own group, so none of them can be counted twice).
+        TechnicalSignals.candlePattern(c)?.let { both(it.value * .75, it.name) }
+        TechnicalSignals.divergence(c)?.let { both(it.value * .85, it.name) }
+        val flow = (TechnicalSignals.moneyFlow(c) * 2.0).coerceIn(-1.0, 1.0)
+        if (abs(flow) > .15) both(flow * .55, if (flow > 0) "Денежный поток CMF: приток покупателей" else "Денежный поток CMF: отток, давят продавцы")
+        val trendLine = TechnicalSignals.supertrend(c)
+        if (trendLine.first != 0) both(trendLine.first * (if (trendLine.second <= 3) .8 else .5), if (trendLine.first > 0) "Supertrend: восходящий тренд" else "Supertrend: нисходящий тренд")
         val nearSupport = abs(p - lv.support1) <= a * .45
         val nearResistance = abs(p - lv.resistance1) <= a * .45
         if (nearSupport) longParts += .65 to "Цена у поддержки"
@@ -436,8 +450,8 @@ object AnalyticsEngine {
         if (r < 24 && reg.name != "TREND_DOWN" && reg.name != "IMPULSE_DOWN") longParts += .55 to "Перепроданность RSI вне импульсного тренда"
         val independentLong = longParts.groupBy { it.second.substringBefore(' ') }.values.sumOf { it.maxOfOrNull { x -> x.first } ?: 0.0 }
         val independentShort = shortParts.groupBy { it.second.substringBefore(' ') }.values.sumOf { it.maxOfOrNull { x -> x.first } ?: 0.0 }
-        val long = (independentLong / 7.0).coerceIn(0.0, 1.0)
-        val short = (independentShort / 7.0).coerceIn(0.0, 1.0)
+        val long = (independentLong / 8.0).coerceIn(0.0, 1.0)
+        val short = (independentShort / 8.0).coerceIn(0.0, 1.0)
         val risks = mutableListOf<String>()
         if (abs(long - short) < .12) risks += "Стороны рынка близки: направленное преимущество слабое"
         if (reg.confidence < .55) risks += "Режим рынка определён неуверенно"
@@ -452,10 +466,6 @@ object AnalyticsEngine {
         val raw = sigmoid((score - .5) * 5.2)
         val blended = raw * .45 + historical.edge * .30 + calibration * .15 + stability * .10
         return blended.coerceIn(.03, .97)
-    }
-
-    private fun expectedValue(tp1: Double, tp2: Double, tp3: Double, sl: Double): Double {
-        return tp1 * .8 + tp2 * 1.5 + tp3 * 2.2 - sl * 1.0
     }
 
     private fun cacheKey(c: List<Candle>, entry: Double?): String {
@@ -541,27 +551,34 @@ object AnalyticsEngine {
         val entryZoneLow: Double; val entryZoneHigh: Double
         if (dominant > 0) { entryZoneLow = max(lv.support1, price - a*.55); entryZoneHigh = min(price + a*.20, lv.resistance1) }
         else { entryZoneLow = max(lv.support1, price - a*.20); entryZoneHigh = min(lv.resistance1, price + a*.55) }
+        val hist = if (dominant > 0) longHist else shortHist
         // Volatility decides the stop. The floor only guards against costs and data glitches (it used to be a flat 0.4%,
         // which pushed every intraday stop and target several ATR away and made short horizons look tiny and unreachable).
-        val stopDistance = (a * stopMult).coerceAtLeast(price*.0015)
+        val stopDistance = (a * hist.stopMult).coerceAtLeast(price*.0015)
         val stop = if (dominant > 0) min(lv.support1 - a*.12, price-stopDistance) else max(lv.resistance1+a*.12, price+stopDistance)
         val risk = abs(price-stop).coerceAtLeast(a*.65)
-        // Targets: 1R / 2R / 2.8R of the risk (before: 0.9R / 1.8R / up to 3.8R, so TP1 was always smaller than the stop).
-        val tp1R = 1.0; val tp2R = 2.0; val tp3R = 2.8
+        // Targets: 1R / 2R / 2.8R of the risk times the scale the history preferred (higher where the instrument keeps
+        // trending, lower where it keeps reversing).
+        val tp1R = hist.scale * ExitPlanner.K1; val tp2R = hist.scale * ExitPlanner.K2; val tp3R = hist.scale * ExitPlanner.K3
         val tp1 = if (dominant > 0) price+risk*tp1R else price-risk*tp1R
         val tp2 = if (dominant > 0) price+risk*tp2R else price-risk*tp2R
         val tp3 = if (dominant > 0) price+risk*tp3R else price-risk*tp3R
-        val hist = if (dominant > 0) longHist else shortHist
-        val feasibility = (1.0 - max(0.0, (risk / a - 2.0) * .12)).coerceIn(.55,1.0)
-        val tp1p = (hist.tp1 * .65 + longDirection.coerceAtLeast(shortDirection)*.35).coerceIn(.05,.95) * feasibility
-        val tp2p = min(tp1p * .88, (hist.tp2*.72 + longDirection.coerceAtLeast(shortDirection)*.28).coerceIn(.03,.90))
-        val tp3p = min(tp2p * .82, (hist.tp3*.78 + longDirection.coerceAtLeast(shortDirection)*.22).coerceIn(.02,.80))
-        val slp = (hist.sl*.55 + (1.0-longDirection.coerceAtLeast(shortDirection))*.45 + reg.fatigue*.12 + conflict*.15).coerceIn(.03,.92)
-        val evR = expectedValue(tp1p,tp2p,tp3p,slp)
+        val pDir = max(longDirection, shortDirection)
+        // A strong, well-confirmed direction lifts the historical odds a little, a doubtful one lowers them.
+        val tilt = (pDir / 0.60).pow(0.7).coerceIn(0.7, 1.3)
+        // The structural stop can sit further away than the one the statistics were measured with.
+        val feasibility = (stopDistance / risk).pow(0.8).coerceIn(.4, 1.0)
+        val tp1p = (hist.tp1 * tilt * feasibility).coerceIn(.02, .92)
+        val tp2p = min(tp1p * .95, (hist.tp2 * tilt * feasibility).coerceIn(.01, .85))
+        val tp3p = min(tp2p * .95, (hist.tp3 * tilt * feasibility).coerceIn(.005, .70))
+        val slp = min((hist.sl / tilt.pow(0.7) + reg.fatigue * .06 + conflict * .08).coerceIn(.03, .92), (1.0 - tp1p).coerceAtLeast(.05))
+        // Honest expectation of the plan that is shown: a third at each target, break-even after TP1, costs paid.
+        val costR = price * ExitPlanner.COST_FRACTION / risk
+        val evR = ExitPlanner.expectedValue(tp1p, tp2p, tp3p, slp, tp1R, tp2R, tp3R, costR)
         val srPenalty = if (dominant > 0) (1.0 / (1.0 + nearResistance)).coerceIn(0.0,1.0)*2.8 else (1.0/(1.0+nearSupport)).coerceIn(0.0,1.0)*2.8
         val calibrationQuality = ((min(longHist.sample,shortHist.sample) / 250.0).coerceIn(0.0,1.0)*.65 + reg.confidence*.35)
         val dataQuality = (55 + min(35, c.size/8) + if (c.all { it.close > 0 && it.high >= it.low }) 10 else 0).coerceIn(0,100)
-        val gate = directionalGap >= .10 && entryQuality >= .35 && evR >= .05 && stability >= .35 && dataQuality >= 70 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
+        val gate = directionalGap >= .10 && entryQuality >= .35 && evR >= .03 && stability >= .35 && dataQuality >= 70 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
         val confidence = ((40 + directionalGap*65 + reg.confidence*22 + stability*10 + calibrationQuality*8 - conflict*18 - srPenalty*2).coerceIn(0.0,100.0)).roundToInt()
         val bull = (longDirection*100).roundToInt().coerceIn(0,100)
@@ -577,7 +594,9 @@ object AnalyticsEngine {
             add("Setup: $setupType. Структура %.0f%%, импульс %.0f%%, истощение %.0f%%.".format(Locale.US,abs(s.score)*100,reg.impulse*100,reg.fatigue*100))
             add("LONG %.0f%% / SHORT %.0f%%; разрыв %.1f п.п.; стабильность %.0f%%.".format(Locale.US,longDirection*100,shortDirection*100,directionalGap*100,stability*100))
             add("Историческая выборка: LONG ${longHist.sample}, SHORT ${shortHist.sample}; качество калибровки %.0f%%.".format(Locale.US,calibrationQuality*100))
-            add("TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%% / SL %.0f%%; EV %.2fR.".format(Locale.US,tp1p*100,tp2p*100,tp3p*100,slp*100,evR))
+            add("План выхода: стоп %.2f ATR, цели ×%.1f от риска%s. Треть позиции на каждой цели, после TP1 стоп в безубыток, после TP2 на TP1.".format(Locale.US, hist.stopMult, hist.scale,
+                if (hist.scale >= 1.5) " (инструмент показывал продолжение движения, цели подняты)" else if (hist.scale < 0.95) " (движения в этом режиме короткие, цели снижены)" else ""))
+            add("Итоговые шансы: TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%% / стоп первым %.0f%%; ожидание %+.2fR на сделку после издержек.".format(Locale.US,tp1p*100,tp2p*100,tp3p*100,slp*100,evR))
             if (ev.longReasons.isNotEmpty()) add("LONG: ${ev.longReasons.joinToString("; ")}.")
             if (ev.shortReasons.isNotEmpty()) add("SHORT: ${ev.shortReasons.joinToString("; ")}.")
             if (ev.risks.isNotEmpty()) add("Риски: ${ev.risks.joinToString("; ")}.")
@@ -591,7 +610,7 @@ object AnalyticsEngine {
             bull,base,bear,price,stop, if (dominant>0) price-a else price+a, stop, if (dominant>0) price-risk*1.35 else price+risk*1.35,
             tp1,tp2,tp3,rr,projected,lv.support1,lv.support2,lv.resistance1,lv.resistance2,explanation,dataQuality,reg.name,
             expectedProfitPct,expectedLossPct,hist.edge,max(longDirection,shortDirection)-.5, (directionalGap*100).roundToInt(),
-            (ev.long-ev.short)*10, signal!="NO TRADE" && evR>.20, (s.score*10), emptyList(),
+            (ev.long-ev.short)*10, signal!="NO TRADE" && evR>.12, (s.score*10), emptyList(),
             tp1p,tp2p,tp3p,slp,evR,hist.edge,abs(s.score),liq.score,srPenalty,entryQuality,entryZoneLow,entryZoneHigh,
             longScore,shortScore,reg.confidence,abs(s.score),conflict,reg.impulse,reg.acceleration,reg.fatigue,stability,hist.sample,calibrationQuality,setupType,
             reg.continuation,reg.reversal,ev.longReasons,ev.shortReasons,ev.risks
@@ -608,21 +627,10 @@ object AnalyticsEngine {
             val f = runCatching { analyzeInternal(prefix, null) }.getOrNull()
             if (f != null && f.signal != "NO TRADE") {
                 val dir = if (f.signal == "LONG") 1 else -1
-                val horizon = c.subList(i, min(i+8,c.size))
-                // Walk the horizon bar by bar so the ORDER of events matters: a stop touched first is a loss,
-                // TP1 touched first is a win. A bar touching both is resolved as STOP, exactly like TrackingEngine.
-                var outcome = 0
-                for (bar in horizon) {
-                    val stopHit = if (dir > 0) bar.low <= f.stop else bar.high >= f.stop
-                    val tpHit = if (dir > 0) bar.high >= f.tp1 else bar.low <= f.tp1
-                    if (stopHit) { outcome = -1; break }
-                    if (tpHit) { outcome = 1; break }
-                }
-                if (outcome == 0) {
-                    val end = horizon.last().close
-                    if ((dir > 0 && end > f.entry) || (dir < 0 && end < f.entry)) outcome = 1
-                }
-                if (outcome == 1) wins++
+                // The whole plan is played on the candles that follow: a third at every target, stop to break-even, costs paid.
+                val bars = c.subList(i, min(i + 8, c.size))
+                val r = ExitPlanner.simulateLevels(bars, dir, f.entry, f.stop, f.tp1, f.tp2, f.tp3)
+                if (r.r > 0.0) wins++
                 total++
             }
             i += 8

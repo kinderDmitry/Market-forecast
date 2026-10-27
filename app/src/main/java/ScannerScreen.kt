@@ -354,9 +354,11 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
     val color = signalColor(h.signal)
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            InstrumentIcon(h.symbol, h.name, h.classCode, 42.dp)
+            Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
+                    Text(fxPairLabel(h.symbol) ?: h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
                     if (h.isNew) {
                         Spacer(Modifier.width(8.dp))
                         Tag(if (h.prevSignal.isBlank()) "NEW" else (if (ru) "СМЕНА" else "FLIP"), Accent, pulse = true)

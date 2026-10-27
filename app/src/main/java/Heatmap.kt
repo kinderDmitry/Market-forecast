@@ -279,20 +279,21 @@ internal fun HeatmapScreen(repo: MarketRepository, favorites: Set<String>, ru: B
                 }
             }
             item { SectionHeader(if (ru) "Лидеры роста" else "Top gainers", "") }
-            items(gainers, key = { "g" + it.symbol }) { t -> HeatRow(t, ru, onOpen) }
+            items(gainers, key = { "g" + it.symbol }) { t -> HeatRow(t, ru, currency, onOpen) }
             item { SectionHeader(if (ru) "Лидеры падения" else "Top losers", "") }
-            items(losers, key = { "l" + it.symbol }) { t -> HeatRow(t, ru, onOpen) }
+            items(losers, key = { "l" + it.symbol }) { t -> HeatRow(t, ru, currency, onOpen) }
         }
     }
 }
 
 @Composable
-private fun HeatRow(t: HeatTile, ru: Boolean, onOpen: (String) -> Unit) {
+private fun HeatRow(t: HeatTile, ru: Boolean, currency: Boolean, onOpen: (String) -> Unit) {
     val color = if (t.change >= 0.0) Positive else Negative
     GradientCard(Modifier.fillMaxWidth().tapCard { onOpen(t.symbol) }) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(t.symbol, fontWeight = FontWeight.Black, fontSize = 15.sp)
+            InstrumentIcon(t.symbol, t.name, if (currency) "CURRENCY" else "", 38.dp)
+            Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                Text(fxPairLabel(t.symbol) ?: t.symbol, fontWeight = FontWeight.Black, fontSize = 15.sp)
                 Text(t.name, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
             }
             Column(horizontalAlignment = Alignment.End) {
@@ -339,7 +340,7 @@ private fun HeatCanvas(tiles: List<HeatTile>, sizeBy: String, currency: Boolean,
                 if (minSide < 24.dp.toPx() || w < 34.dp.toPx()) continue
                 val fontSize = (minSide / 4.3f).coerceIn(9.dp.toPx(), 20.dp.toPx())
                 val tone = heatTextColor(r.tile.change)
-                val main = textMeasurer.measure(r.tile.symbol, TextStyle(fontSize = fontSize.toSp(), fontWeight = FontWeight.Black, color = tone))
+                val main = textMeasurer.measure(fxPairLabel(r.tile.symbol) ?: r.tile.symbol, TextStyle(fontSize = fontSize.toSp(), fontWeight = FontWeight.Black, color = tone))
                 if (main.size.width > w - 2.dp.toPx()) continue
                 val showChange = h >= main.size.height * 2.1f && w >= 44.dp.toPx()
                 val second = if (showChange) {

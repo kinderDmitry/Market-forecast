@@ -110,6 +110,9 @@ class MarketRepository(
         private const val INDEX_LIST_TTL_MS = 6 * 60 * 60_000L
         private const val PREV_CLOSE_TTL_MS = 30 * 60_000L
         private val searchEngine = InstrumentSearchEngine()
+
+        /** Russian display name from the broker catalogue (empty while the catalogue does not know the ticker). */
+        fun lookupName(symbol: String): String = searchEngine.find(symbol)?.name.orEmpty()
         @Volatile private var catalogLoaded = false
         private val catalogLock = Any()
         private val catalogSyncLock = Any()
@@ -266,6 +269,9 @@ class MarketRepository(
      * Market map data: the whole main board (or the currency board) in ONE request to the public MOEX ISS.
      * Columns are read by name, so a missing column degrades one value instead of shifting every row.
      */
+    /** Russian display name of an instrument as the broker lists it (empty while the catalogue does not know it). */
+    fun nameOf(symbol: String): String = searchEngine.find(symbol)?.name.orEmpty()
+
     internal fun heatmapSnapshot(currency: Boolean): List<HeatTile> {
         val url = if (currency) {
             "https://iss.moex.com/iss/engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=securities,marketdata&securities.columns=SECID,SHORTNAME,PREVPRICE&marketdata.columns=SECID,LAST,VALTODAY"

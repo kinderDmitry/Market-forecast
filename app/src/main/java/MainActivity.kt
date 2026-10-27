@@ -136,7 +136,7 @@ internal object NotificationRoute {
 @Composable
 fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
-    remember(prefs) { UiPrefs.animations = prefs.getBoolean("ui_animations", true); true }
+    remember(prefs) { UiPrefs.animations = prefs.getBoolean("ui_animations", true); UiPrefs.logos = prefs.getBoolean("ui_logos", true); true }
     val scope = rememberCoroutineScope()
     var tokenVersion by remember { mutableIntStateOf(0) }
     val bcsToken = remember(tokenVersion) { SecureTokenStore.get(prefs) }
@@ -819,10 +819,13 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
     val changePct = if (previous > 0.0 && price > 0.0) (price - previous) / previous * 100.0 else 0.0
     val metaName = remember(symbol) { symbol.removeSuffix(".ME").removeSuffix("=X") }
     GradientCard(Modifier.width(326.dp)) {
+        val titleName = remember(symbol, CatalogStatus.size) { repo.nameOf(symbol) }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            InstrumentIcon(symbol, titleName, "", 40.dp)
+            Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(metaName, fontSize = 17.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.onSurface)
-                Text(symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                Text(titleName.ifBlank { fxPairLabel(symbol) ?: metaName }, fontSize = 16.sp, fontWeight = FontWeight.Black, maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                Text(fxPairLabel(symbol)?.let { "$it • $symbol" } ?: symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold, maxLines = 1)
             }
             Column(horizontalAlignment = Alignment.End) {
                 FlashPrice(price, if (price > 0) fmt(price) else "—", Accent, 18.sp)
@@ -894,10 +897,12 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
     val f = state.forecast
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            InstrumentIcon(state.symbol, state.meta.shortName, "", 46.dp)
+            Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(if (ru) "АНАЛИТИЧЕСКИЙ ЦЕНТР" else "ANALYTICS CENTER", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Accent, letterSpacing = 1.4.sp)
                 Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 19.sp, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 3.dp))
-                Text(state.symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(fxPairLabel(state.symbol) ?: state.symbol, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 SourceBadge(state.dataSource.ifBlank { "БКС • единственный источник" }, state.dataSource.startsWith("БКС •"))
             }
             if (f != null) {
@@ -960,7 +965,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
         }
     }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(11.dp), contentPadding = PaddingValues(bottom = 30.dp)) {
-        item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 22.sp, fontWeight = FontWeight.Black); Text("${state.symbol} • ${state.meta.currency}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) CurrencyDisplay.format(state.livePrice, state.meta.currency, prefs) else "—", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Accent); SourceBadge(state.dataSource.ifBlank { "БКС • единственный источник" }, state.dataSource.startsWith("БКС •")) }; IconButton({ save(if (favorite) favs - state.symbol else favs + state.symbol) }) { Icon(if (favorite) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }; IconButton(refresh) { Icon(Icons.Default.Refresh, null, tint = Accent) } } }
+        item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { InstrumentIcon(state.symbol, state.meta.shortName, "", 50.dp); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 22.sp, fontWeight = FontWeight.Black); Text("${fxPairLabel(state.symbol) ?: state.symbol} • ${state.meta.currency}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) CurrencyDisplay.format(state.livePrice, state.meta.currency, prefs) else "—", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Accent); SourceBadge(state.dataSource.ifBlank { "БКС • единственный источник" }, state.dataSource.startsWith("БКС •")) }; IconButton({ save(if (favorite) favs - state.symbol else favs + state.symbol) }) { Icon(if (favorite) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }; IconButton(refresh) { Icon(Icons.Default.Refresh, null, tint = Accent) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("OVERVIEW", "FORECAST", "FINANCE").forEach { FilterChip(selected = tab == it, onClick = { tab = it }, label = { Text(if (ru) when (it) { "OVERVIEW" -> "Обзор"; "FORECAST" -> "Прогноз"; else -> "Финансы" } else it, fontSize = 11.sp) }) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf("15M", "1H", "4H", "1D", "1W").forEach { timeframe ->
@@ -975,7 +980,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 FilterChip(selected = tf == timeframe, onClick = { onTf(timeframe) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = tc.copy(alpha = .18f), selectedLabelColor = tc, containerColor = Color.Transparent, labelColor = tc.copy(alpha = .82f), disabledContainerColor = Color.Transparent), label = { Text(label, fontSize = 11.sp, fontWeight = FontWeight.Black) })
             }
         } }
-        if (state.candles.size >= 5) item { PriceChartCard(state.candles, state.forecast, tf, ru) }
+        item { PriceChartCard(state.candles, state.forecast, tf, ru, state.loading, state.error, refresh) }
         if (state.loading) item { Loading(ru) } else if (state.forecast != null) {
             val f = state.forecast
             when (tab) {
@@ -983,7 +988,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 "FINANCE" -> { item { ProfitCalculatorInline(f, ru, prefs) }; item { RiskCard(f, ru, prefs) } }
                 else -> {
                     item { Button({ track() }, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(17.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(8.dp)); Text(if (ru) "Отслеживать прогноз" else "Track forecast", fontWeight = FontWeight.Black) } }
-                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
+                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { TradePlanCard(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
                 }
             }
         } else item { ErrorCard(state.error ?: "Нет данных", ru) }
@@ -1088,7 +1093,7 @@ private fun regimeRu(regime: String): String = when (regime) {
 @Composable private fun Explanation(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Почему такой прогноз" else "Why this forecast", if (ru) "EMA • RSI • MACD • ATR • ADX • Стохастик • Объём • Структура • Таймфреймы" else "EMA • RSI • MACD • ATR • ADX • Stochastic • Volume • Structure • MTF"); f.explanation.forEach { Text("• $it", fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)) } } }
 @Composable private fun DataQuality(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { Text(if (ru) "Качество данных" else "Data quality", fontWeight = FontWeight.Black); LinearProgressIndicator(progress = { f.dataQuality / 100f }, modifier = Modifier.fillMaxWidth().padding(top = 9.dp), color = Positive); Text("${f.dataQuality}/100", fontWeight = FontWeight.Black, color = Positive, modifier = Modifier.padding(top = 5.dp)) } }
 @Composable private fun AccuracyCard(c: List<Candle>, ru: Boolean) { var r by remember(c) { mutableStateOf<Pair<Int, Int>?>(null) }; LaunchedEffect(c) { r = withContext(Dispatchers.Default) { AnalyticsEngine.backtest(c) } }; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Backtest" else "Backtest", if (ru) "Только на доступной фактической истории" else "Only on available market history"); r?.let { Text(if (it.second == 0) "—" else "${it.first * 100 / it.second}%", fontSize = 28.sp, fontWeight = FontWeight.Black, color = Accent); Text("${it.first} / ${it.second}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } } }
-@Composable private fun IndicatorCoverage(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Состав модели" else "Model coverage", if (ru) "Ансамбль + адаптивные веса" else "Ensemble + adaptive weights"); Text("EMA20/50/200 • RSI • MACD • ATR • ADX/DMI • Stochastic • Stoch RSI • Momentum • ROC • Bollinger • VWAP • Volume • OBV • MFI • CMF • CCI • Williams %%R • Ichimoku • Donchian • Volatility • Price Structure • Multi-TF • Walk-forward Edge • Regime", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant);
+@Composable private fun IndicatorCoverage(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Состав модели" else "Model coverage", if (ru) "Ансамбль + адаптивные веса" else "Ensemble + adaptive weights"); Text("EMA 20/50/200 • RSI и его наклон • дивергенции RSI • MACD • ATR • ADX/DMI (режим рынка) • Stochastic • Bollinger • VWAP • объём и давление свечи • денежный поток CMF • Supertrend • свечные паттерны • структура HH/HL/BOS • уровни • снятие ликвидности • многотаймфреймное согласование • walk-forward статистика", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant);
         Text("${if (ru) "Адаптивный режим" else "Adaptive regime"}: ${f.regime} • Edge ${String.format(Locale.US, "%.0f", f.historicalEdge * 100)}% • Gap ${String.format(Locale.US, "%.1f", f.edgeGap * 100)} п.п. • Confirm ${f.confirmation}/5", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (f.highConviction) Positive else Warning, modifier = Modifier.padding(top = 5.dp)) } }
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
 @Composable private fun TrackedForSymbol(tracked: List<TrackedForecast>, symbol: String, ru: Boolean) { val items = tracked.filter { it.symbol == symbol }.take(6); if (items.isEmpty()) return; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Отслеживание" else "Monitoring", "${items.size} • ${if (ru) "без дублей по TF" else "unique by timeframe"}"); items.forEach { t -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("${t.signal} • ${t.timeframe}", fontWeight = FontWeight.Bold, fontSize = 12.sp); Text(if (ru) "Вход ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}" else "Entry ${fmt(t.entry)} • SL ${fmt(t.stop)} • TP1 ${fmt(t.tp1)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(t.result, fontWeight = FontWeight.Black, fontSize = 11.sp, color = when(t.result){"PENDING"->Warning;"FLAT"->Warning;"FAIL"->Negative;else->Positive}) } } } }
@@ -1157,13 +1162,10 @@ private fun regimeRu(regime: String): String = when (regime) {
             val isFav = favs.contains(r.symbol)
             GradientCard(Modifier.fillMaxWidth().tapCard { searchHistory = saveSearchHistory(prefs, prefix); pick(r) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(signalColor(if (r.type.contains("CURRENCY", true)) "LONG" else "NO TRADE").copy(alpha=.12f)),
-                        contentAlignment = Alignment.Center
-                    ) { Text(if (r.type.contains("CURRENCY", true)) "₽" else "▣", color = Accent, fontWeight = FontWeight.Black, fontSize = 16.sp) }
+                    InstrumentIcon(r.symbol, r.name, r.type, 42.dp)
                     Column(Modifier.weight(1f).padding(start = 10.dp)) {
-                        Text(r.name, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                        Text(r.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 12.sp, color = Accent)
+                        Text(r.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text(fxPairLabel(r.symbol)?.let { "$it • ${r.symbol}" } ?: r.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 12.sp, color = Accent)
                         Text("${typeLabel(r.type, ru)} • ${r.classCode.ifBlank { r.exchange }}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     IconButton({ if (isFav) save(favs - r.symbol) else save(favs + r.symbol) }) { Icon(if (isFav) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }
@@ -1194,7 +1196,9 @@ private fun regimeRu(regime: String): String = when (regime) {
         items(sorted, key={it.symbol}) { r ->
             GradientCard(Modifier.fillMaxWidth().tapCard { load(r.symbol) }) {
                 Row(verticalAlignment=Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text(r.symbol.removeSuffix(".ME"), fontWeight=FontWeight.Black, fontSize=16.sp); Text(if(ru) "Live цена • уверенность ${r.confidence}%" else "Live price • confidence ${r.confidence}%", fontSize=11.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
+                    InstrumentIcon(r.symbol, "", "", 40.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) { Text(MarketRepository.lookupName(r.symbol).ifBlank { fxPairLabel(r.symbol) ?: r.symbol.removeSuffix(".ME") }, fontWeight=FontWeight.Black, fontSize=16.sp, maxLines=1); Text("${fxPairLabel(r.symbol) ?: r.symbol.removeSuffix(".ME")} • " + (if(ru) "Live цена • уверенность ${r.confidence}%" else "Live price • confidence ${r.confidence}%"), fontSize=11.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
                     Text(r.price?.let(::fmt) ?: "—", fontSize=18.sp, fontWeight=FontWeight.Black, color=Accent, modifier=Modifier.padding(end=6.dp))
                     IconButton({ save(favs.toSet()-r.symbol) }) { Icon(Icons.Default.Delete,null,tint=Negative) }
                 }
@@ -1267,8 +1271,11 @@ private fun regimeRu(regime: String): String = when (regime) {
     }
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = open)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            InstrumentIcon(t.symbol, "", "", 40.dp)
+            Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(t.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
+                Text(MarketRepository.lookupName(t.symbol).ifBlank { fxPairLabel(t.symbol) ?: t.symbol.removeSuffix(".ME") }, fontWeight = FontWeight.Black, fontSize = 16.sp, maxLines = 1)
+                Text(fxPairLabel(t.symbol) ?: t.symbol.removeSuffix(".ME"), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                 Text("${t.signal} • ${t.confidence}% • ${t.timeframe}", fontSize = 11.sp, color = signalColor(t.signal))
                 Text(if (ru) "Добавлено: ${dateTime(t.createdAt)}" else "Added: ${dateTime(t.createdAt)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
@@ -1363,8 +1370,11 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     val elapsed = (elapsedEnd - h.time).coerceAtLeast(0L)
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = open)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            InstrumentIcon(h.symbol, "", "", 40.dp)
+            Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(h.symbol.removeSuffix(".ME"), fontWeight = FontWeight.Black, fontSize = 16.sp)
+                Text(MarketRepository.lookupName(h.symbol).ifBlank { fxPairLabel(h.symbol) ?: h.symbol.removeSuffix(".ME") }, fontWeight = FontWeight.Black, fontSize = 16.sp, maxLines = 1)
+                Text(fxPairLabel(h.symbol) ?: h.symbol.removeSuffix(".ME"), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                 Text(SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(h.time)), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("${h.signal} • ${h.confidence}% • ${if (ru) "Цена при добавлении" else "Added price"}: ${fmt(h.price)} • ${h.timeframe}", fontSize = 11.sp)
                 val close = h.closingPrice.takeIf { it > 0.0 }
@@ -1541,7 +1551,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     var alertSignal by remember{mutableStateOf(prefs.getBoolean("alert_signal",true))}; var alertNews by remember{mutableStateOf(prefs.getBoolean("alert_news",true))}; var alertDividends by remember{mutableStateOf(prefs.getBoolean("alert_dividends",true))}; var alertResult by remember{mutableStateOf(prefs.getBoolean("alert_result",true))}; var alertTp1 by remember{mutableStateOf(prefs.getBoolean("alert_tp1",true))}; var alertTp2 by remember{mutableStateOf(prefs.getBoolean("alert_tp2",true))}; var alertTp3 by remember{mutableStateOf(prefs.getBoolean("alert_tp3",true))}; var alertSl by remember{mutableStateOf(prefs.getBoolean("alert_sl",true))}; var alertPrice by remember{mutableStateOf(prefs.getBoolean("alert_price",false))}
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
-        item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()}}}
+        item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()};AlertToggle(if(ru)"Логотипы компаний (из интернета)" else "Company logos (from the internet)",UiPrefs.logos){UiPrefs.logos=it;prefs.edit().putBoolean("ui_logos",it).apply()};LogoDiagnosticsRow(ru)}}
         item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
