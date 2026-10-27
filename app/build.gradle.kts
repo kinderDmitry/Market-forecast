@@ -11,8 +11,8 @@ android {
         applicationId = "com.marketforecast.prox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 173
-        versionName = "4.14.0"
+        versionCode = 176
+        versionName = "4.16.1"
     }
     buildFeatures { compose = true }
 
@@ -69,4 +69,6 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.3")
     implementation("androidx.core:core-ktx:1.15.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
 }
