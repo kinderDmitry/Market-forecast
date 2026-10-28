@@ -136,7 +136,7 @@ internal object NotificationRoute {
 @Composable
 fun MarketForecastApp(ctx: Context) {
     val prefs = remember { ctx.getSharedPreferences("mfprefs", Context.MODE_PRIVATE) }
-    remember(prefs) { UiPrefs.animations = prefs.getBoolean("ui_animations", true); UiPrefs.logos = prefs.getBoolean("ui_logos", true); true }
+    remember(prefs) { UiPrefs.animations = prefs.getBoolean("ui_animations", true); UiPrefs.logos = prefs.getBoolean("ui_logos", true); CostModel.load(prefs); true }
     val scope = rememberCoroutineScope()
     var tokenVersion by remember { mutableIntStateOf(0) }
     val bcsToken = remember(tokenVersion) { SecureTokenStore.get(prefs) }
@@ -248,7 +248,7 @@ fun MarketForecastApp(ctx: Context) {
                 val requests = listOf("15M" to ("60d" to "15m"), "1H" to ("2y" to "1h"), "4H" to ("2y" to "4h"), "1D" to ("5y" to "1d"), "1W" to ("10y" to "1wk"))
                 coroutineScope { requests.map { (name, pair) -> async { name to runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) } }.awaitAll().toMap().filterValues { it.size >= 40 } }
             }
-            val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live, mtfContexts) }.getOrNull() } else null
+            val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live, mtfContexts, fx = fxPairLabel(selected) != null) }.getOrNull() } else null
             state = MarketState(selected, candles, f, false, if (f != null) null else when {
                 candles.isEmpty() -> if (ru) "Не удалось получить свечи БКС${loadError?.let { ": " + it.take(140) }.orEmpty()}. Данные запрашиваются повторно." else "Could not get BCS candles${loadError?.let { ": " + it.take(140) }.orEmpty()}. Retrying."
                 live <= 0.0 -> if (ru) "БКС не вернул актуальную цену инструмента. Возможно, торги закрыты." else "BCS returned no live price. Trading may be closed."
@@ -437,7 +437,7 @@ fun MarketForecastApp(ctx: Context) {
                     canonicalQuotes[selected] = live
                     val reconciled = reconcileLivePrice(selected, state.candles, live)
                     val merged = mergeRealtimeCandle(state.candles, reconciled, tf, now, selected)
-                    val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled) }.getOrNull() } else state.forecast
+                    val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled, fx = fxPairLabel(selected) != null) }.getOrNull() } else state.forecast
                     state = state.copy(candles = merged, forecast = refreshed, livePrice = reconciled, updated = now)
                 }
             }
@@ -776,7 +776,7 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
                     val live = quote?.takeIf { it.isFinite() && it > 0.0 } ?: raw.lastOrNull()?.close ?: 0.0
                     val merged = mergeRealtimeCandle(raw, live, timeframe, now, symbol)
                     val forecast = if (merged.size >= 30 && live > 0.0) {
-                        runCatching { withContext(Dispatchers.Default) { AnalyticsEngine.analyze(merged, live) } }.getOrNull()
+                        runCatching { withContext(Dispatchers.Default) { AnalyticsEngine.analyze(merged, live, fx = fxPairLabel(symbol) != null) } }.getOrNull()
                     } else null
                     timeframe to FavoriteTfResult(forecast, merged)
                 }
@@ -959,7 +959,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 val c = runCatching { tfRepo.load(state.symbol, pair.first, pair.second) }.getOrNull()
                 val live = currentLive ?: c?.lastOrNull()?.close
                 val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, timeframe, System.currentTimeMillis(), state.symbol) else c.orEmpty()
-                val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live) }.getOrNull() else null
+                val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live, fx = fxPairLabel(state.symbol) != null) }.getOrNull() else null
                 timeframe to f
             }.toMap()
         }
@@ -987,8 +987,9 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 "OVERVIEW" -> { item { ForecastSummary(f, ru) }; item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { DataQuality(f, ru) }; item { Explanation(f, ru) }; item { IndicatorCoverage(f, ru) } }
                 "FINANCE" -> { item { ProfitCalculatorInline(f, ru, prefs) }; item { RiskCard(f, ru, prefs) } }
                 else -> {
+                    if (f.signal == "NO TRADE") item { LeanCard(f, ru) }
                     item { Button({ track() }, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(17.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(8.dp)); Text(if (ru) "Отслеживать прогноз" else "Track forecast", fontWeight = FontWeight.Black) } }
-                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { TradePlanCard(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
+                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru, fxPairLabel(state.symbol) != null) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { EdgeCard(f, ru) }; item { TradePlanCard(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
                 }
             }
         } else item { ErrorCard(state.error ?: "Нет данных", ru) }
@@ -1184,7 +1185,7 @@ private fun regimeRu(regime: String): String = when (regime) {
             val c = runCatching { repo.load(r.symbol, "5y", "1d") }.getOrNull()
             val live = r.price ?: c?.lastOrNull()?.close
             val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, "1D", System.currentTimeMillis(), r.symbol) else c
-            val conf = if (merged != null && merged.size >= 30 && live != null && live > 0.0) runCatching { AnalyticsEngine.analyze(merged, live).confidence }.getOrDefault(0) else 0
+            val conf = if (merged != null && merged.size >= 30 && live != null && live > 0.0) runCatching { AnalyticsEngine.analyze(merged, live, fx = fxPairLabel(r.symbol) != null).confidence }.getOrDefault(0) else 0
             r.copy(price = live, confidence = conf)
         }
     }
@@ -1552,7 +1553,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()};AlertToggle(if(ru)"Логотипы компаний (из интернета)" else "Company logos (from the internet)",UiPrefs.logos){UiPrefs.logos=it;prefs.edit().putBoolean("ui_logos",it).apply()};LogoDiagnosticsRow(ru)}}
-        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)}
+        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)};item{CostSettings(ru,prefs)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}

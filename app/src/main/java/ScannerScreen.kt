@@ -107,6 +107,7 @@ internal fun ScannerScreen(
     var onlyNew by remember { mutableStateOf(false) }
     var minConf by remember { mutableIntStateOf(0) }
     var goodOnly by remember { mutableStateOf(false) }
+    var tradableOnly by remember { mutableStateOf(false) }
     var minAlign by remember { mutableIntStateOf(0) }
     var sort by remember { mutableStateOf("REL") }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -129,11 +130,12 @@ internal fun ScannerScreen(
         }
     }
 
-    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, minAlign, minConf, sort) {
+    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, tradableOnly, minAlign, minConf, sort) {
         val base = c.current
             .filter { signalFilter == "ALL" || it.signal.contains(signalFilter, ignoreCase = true) }
             .filter { !onlyNew || it.isNew }
             .filter { !goodOnly || it.reliability >= 60 }
+            .filter { !tradableOnly || !it.watch }
             .filter { minAlign == 0 || it.alignedAgree >= minAlign }
             .filter { it.confidence >= minConf }
         when (sort) {
@@ -284,6 +286,11 @@ internal fun ScannerScreen(
                         onClick = { goodOnly = !goodOnly },
                         label = { Text(if (ru) "Надёжность B и выше" else "Reliability B+", fontSize = 12.sp) }
                     )
+                    FilterChip(
+                        selected = tradableOnly,
+                        onClick = { tradableOnly = !tradableOnly },
+                        label = { Text(if (ru) "Только с выгодой после издержек" else "Only profitable after costs", fontSize = 12.sp) }
+                    )
                     if (c.confluence) {
                         listOf(0 to (if (ru) "Любое совпадение" else "Any agreement"), 2 to "2+", 3 to "3+", 4 to "4+", 5 to (if (ru) "Все 5" else "All 5")).forEach { (value, label) ->
                             FilterChip(
@@ -397,6 +404,14 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Tag("🕒 ${h.horizon.label(ru)}", Accent)
             Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
+            if (h.watch) Tag(if (ru) "Только направление" else "Direction only", Warning)
+        }
+        if (h.watch) {
+            Text(
+                if (ru) "После издержек торговой выгоды нет: это ориентир по направлению, а не сигнал на вход."
+                else "No edge after costs: a view on direction, not an entry signal.",
+                fontSize = 11.sp, color = Warning, modifier = Modifier.padding(top = 4.dp)
+            )
         }
         if (h.aligned.isNotBlank()) {
             val known = Confluence.decode(h.aligned).values.count { it != null }

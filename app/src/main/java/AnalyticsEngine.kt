@@ -68,7 +68,10 @@ object AnalyticsEngine {
         /** Stop distance (ATR) and target scale the history preferred, and what that plan earned per trade in R. */
         val stopMult: Double = 1.25,
         val scale: Double = 1.0,
-        val planEv: Double = 0.0
+        val planEv: Double = 0.0,
+        /** Random-walk baseline of the same plan, and how many standard errors the history beats it by. */
+        val nullEv: Double = 0.0,
+        val edgeZ: Double = 0.0
     )
 
     private data class Evidence(
@@ -381,13 +384,21 @@ object AnalyticsEngine {
         val used = if (strict.size >= 40) strict else loose
         // The stop and the height of the targets are chosen on those situations, and every plan is measured as it is traded.
         val plan = ExitPlanner.choose(c, used, direction, stopMult, horizon)
-        val n = used.size.toDouble()
-        fun smooth(frequency: Double, prior: Double): Double = ((frequency * n + prior * 12.0) / (n + 12.0)).coerceIn(.01, .99)
+        // Placebo: the same plan on a random walk with this instrument's volatility. Thin evidence is pulled towards THAT,
+        // not towards invented constants, and the plan is credited only with the edge it has beyond it.
+        val nullPlan = ExitPlanner.nullPlan(c, direction, plan.stopMult, plan.scale, atr(c), horizon)
+        val nEff = max(1.0, used.size * min(step, horizon).toDouble() / horizon)
+        fun smooth(frequency: Double, prior: Double, fallback: Double): Double {
+            val p = if (nullPlan.samples > 0) prior else fallback
+            return ((frequency * nEff + p * 8.0) / (nEff + 8.0)).coerceIn(.01, .99)
+        }
+        val se = plan.sd / kotlin.math.sqrt(nEff)
+        val z = if (se > 1e-9) ((plan.ev - nullPlan.ev) / se).coerceIn(-6.0, 6.0) else 0.0
         return Historical(
-            smooth(plan.p1, .45), used.size,
-            smooth(plan.p1, .45), smooth(plan.p2, .28), smooth(plan.p3, .15), smooth(plan.pStop, .38),
+            smooth(plan.p1, nullPlan.p1, .45), used.size,
+            smooth(plan.p1, nullPlan.p1, .45), smooth(plan.p2, nullPlan.p2, .28), smooth(plan.p3, nullPlan.p3, .15), smooth(plan.pStop, nullPlan.pStop, .38),
             mfe / loose.size, mae / loose.size,
-            plan.stopMult, plan.scale, plan.ev
+            plan.stopMult, plan.scale, plan.ev, nullPlan.ev, z
         )
     }
 
@@ -472,25 +483,31 @@ object AnalyticsEngine {
         var h = 17L
         val points = intArrayOf(0, c.size / 3, c.size * 2 / 3, c.lastIndex).distinct().filter { it in c.indices }
         for (i in points) { val x = c[i]; h = h * 31 + x.time; h = h * 31 + java.lang.Double.doubleToLongBits(x.close) }
-        return "${c.size}:$h:${entry ?: Double.NaN}"
+        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}"
     }
 
     /** Analyze one timeframe. All probabilities are empirical/model estimates, never guarantees. */
-    fun analyze(c: List<Candle>, entryOverride: Double? = null): Forecast {
+    fun analyze(c: List<Candle>, entryOverride: Double? = null, fx: Boolean = false): Forecast {
         require(c.size >= 30) { "Недостаточно исторических данных" }
-        val key = cacheKey(c, entryOverride)
-        synchronized(cache) { cache[key]?.let { return it } }
-        val result = analyzeInternal(c, entryOverride)
-        synchronized(cache) {
-            cache[key] = result
-            while (cache.size > CACHE_MAX) cache.remove(cache.entries.first().key)
+        return ExitPlanner.withCost(CostModel.fraction(fx)) {
+            val key = cacheKey(c, entryOverride)
+            val cached = synchronized(cache) { cache[key] }
+            if (cached != null) {
+                cached
+            } else {
+                val result = analyzeInternal(c, entryOverride)
+                synchronized(cache) {
+                    cache[key] = result
+                    while (cache.size > CACHE_MAX) cache.remove(cache.entries.first().key)
+                }
+                result
+            }
         }
-        return result
     }
 
     /** Optional real-MTF entry point. Contexts are expected to contain actual BCS candles per TF. */
-    fun analyze(c: List<Candle>, entryOverride: Double?, mtfContexts: Map<String, List<Candle>>): Forecast {
-        val base = analyze(c, entryOverride)
+    fun analyze(c: List<Candle>, entryOverride: Double?, mtfContexts: Map<String, List<Candle>>, fx: Boolean = false): Forecast {
+        val base = analyze(c, entryOverride, fx)
         if (mtfContexts.isEmpty()) return base
         val local = mtfContexts.mapNotNull { (tf, candles) ->
             if (candles.size < 40) null else tf to directionalRaw(candles, candles.lastOrNull()?.close)
@@ -573,13 +590,16 @@ object AnalyticsEngine {
         val tp3p = min(tp2p * .95, (hist.tp3 * tilt * feasibility).coerceIn(.005, .70))
         val slp = min((hist.sl / tilt.pow(0.7) + reg.fatigue * .06 + conflict * .08).coerceIn(.03, .92), (1.0 - tp1p).coerceAtLeast(.05))
         // Honest expectation of the plan that is shown: a third at each target, break-even after TP1, costs paid.
-        val costR = price * ExitPlanner.COST_FRACTION / risk
+        val costR = price * ExitPlanner.currentCost() / risk
         val evR = ExitPlanner.expectedValue(tp1p, tp2p, tp3p, slp, tp1R, tp2R, tp3R, costR)
         val srPenalty = if (dominant > 0) (1.0 / (1.0 + nearResistance)).coerceIn(0.0,1.0)*2.8 else (1.0/(1.0+nearSupport)).coerceIn(0.0,1.0)*2.8
         val calibrationQuality = ((min(longHist.sample,shortHist.sample) / 250.0).coerceIn(0.0,1.0)*.65 + reg.confidence*.35)
         val dataQuality = (55 + min(35, c.size/8) + if (c.all { it.close > 0 && it.high >= it.low }) 10 else 0).coerceIn(0,100)
-        val gate = directionalGap >= .10 && entryQuality >= .35 && evR >= .03 && stability >= .35 && dataQuality >= 70 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
+        val directionOk = directionalGap >= .10 && entryQuality >= .35 && stability >= .35 && dataQuality >= 70
+        val gate = directionOk && evR >= .03 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
+        // A lean is NOT a signal: the direction is visible, but after costs the plan does not pay (or the market is squeezing).
+        val lean = if (signal == "NO TRADE" && directionOk && reg.name !in setOf("UNCERTAIN", "TRANSITION")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
         val confidence = ((40 + directionalGap*65 + reg.confidence*22 + stability*10 + calibrationQuality*8 - conflict*18 - srPenalty*2).coerceIn(0.0,100.0)).roundToInt()
         val bull = (longDirection*100).roundToInt().coerceIn(0,100)
         val bear = (shortDirection*100).roundToInt().coerceIn(0,100)
@@ -596,6 +616,7 @@ object AnalyticsEngine {
             add("Историческая выборка: LONG ${longHist.sample}, SHORT ${shortHist.sample}; качество калибровки %.0f%%.".format(Locale.US,calibrationQuality*100))
             add("План выхода: стоп %.2f ATR, цели ×%.1f от риска%s. Треть позиции на каждой цели, после TP1 стоп в безубыток, после TP2 на TP1.".format(Locale.US, hist.stopMult, hist.scale,
                 if (hist.scale >= 1.5) " (инструмент показывал продолжение движения, цели подняты)" else if (hist.scale < 0.95) " (движения в этом режиме короткие, цели снижены)" else ""))
+            if (hist.sample >= ExitPlanner.MIN_SAMPLES) add("Проверка на случайность: план на истории %+.2fR, случайное блуждание с теми же целями %+.2fR, z = %.1f.".format(Locale.US, hist.planEv, hist.nullEv, hist.edgeZ))
             add("Итоговые шансы: TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%% / стоп первым %.0f%%; ожидание %+.2fR на сделку после издержек.".format(Locale.US,tp1p*100,tp2p*100,tp3p*100,slp*100,evR))
             if (ev.longReasons.isNotEmpty()) add("LONG: ${ev.longReasons.joinToString("; ")}.")
             if (ev.shortReasons.isNotEmpty()) add("SHORT: ${ev.shortReasons.joinToString("; ")}.")
@@ -614,11 +635,14 @@ object AnalyticsEngine {
             tp1p,tp2p,tp3p,slp,evR,hist.edge,abs(s.score),liq.score,srPenalty,entryQuality,entryZoneLow,entryZoneHigh,
             longScore,shortScore,reg.confidence,abs(s.score),conflict,reg.impulse,reg.acceleration,reg.fatigue,stability,hist.sample,calibrationQuality,setupType,
             reg.continuation,reg.reversal,ev.longReasons,ev.shortReasons,ev.risks
-        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct()) }
+        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct(), lean = lean, edgeZ = hist.edgeZ, nullEv = hist.nullEv, planEv = hist.planEv) }
     }
 
     /** Walk-forward validation: every decision sees only the candles before it. */
-    fun backtest(c: List<Candle>): Pair<Int, Int> {
+    fun backtest(c: List<Candle>, fx: Boolean = false): Pair<Int, Int> =
+        ExitPlanner.withCost(CostModel.fraction(fx)) { backtestInternal(c) }
+
+    private fun backtestInternal(c: List<Candle>): Pair<Int, Int> {
         if (c.size < 180) return 0 to 0
         var wins = 0; var total = 0
         var i = 120

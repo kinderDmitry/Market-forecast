@@ -51,12 +51,12 @@ internal fun gradeColor(grade: String): Color = when (grade) {
  * forecast, what speaks against it, and the instrument's own walk-forward record with a safety margin.
  */
 @Composable
-internal fun ReliabilityCard(f: Forecast, candles: List<Candle>, ru: Boolean) {
+internal fun ReliabilityCard(f: Forecast, candles: List<Candle>, ru: Boolean, fx: Boolean = false) {
     val key = candles.size to candles.lastOrNull()?.time
     var backtest by remember(key) { mutableStateOf<Pair<Int, Int>?>(null) }
     var checked by remember(key) { mutableStateOf(false) }
     LaunchedEffect(key) {
-        backtest = withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.backtest(candles) }.getOrNull() }
+        backtest = withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.backtest(candles, fx) }.getOrNull() }
         checked = true
     }
     val rel = remember(f, backtest, candles.size, ru) { ReliabilityEngine.assess(f, candles.size, backtest, ru) }

@@ -44,7 +44,7 @@ import java.util.concurrent.TimeUnit
 internal object ScanNotify {
     fun post(context: Context, h: ScanHorizon, fresh: List<ScanHit>, ru: Boolean, minConf: Int) {
         val good = fresh
-            .filter { it.confidence >= minConf }
+            .filter { it.confidence >= minConf && !it.watch }
             .sortedWith(compareByDescending<ScanHit> { it.reliability }.thenByDescending { it.confidence })
         if (good.isEmpty()) return
         val top = good.take(3).joinToString("  •  ") {
@@ -111,6 +111,7 @@ class ScanWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         if (!p.getBoolean("scanner_bg", true) || !p.getBoolean("notifications_enabled", false)) return Result.success()
         val token = SecureTokenStore.get(p)
         if (token.isBlank()) return Result.success()
+        CostModel.load(p)
         return try {
             scan(p, token)
             Result.success()

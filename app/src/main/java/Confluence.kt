@@ -28,11 +28,14 @@ internal object Confluence {
     val FRAMES = listOf("15M", "1H", "4H", "1D", "1W")
 
     /** +1 long, -1 short, 0 no trade on that frame, null = no usable data for it. */
-    fun direction(f: Forecast?): Int? = when (f?.signal) {
-        null -> null
-        "LONG" -> 1
-        "SHORT" -> -1
-        else -> 0
+    fun direction(f: Forecast?): Int? {
+        if (f == null) return null
+        val side = if (f.signal == "NO TRADE") f.lean else f.signal
+        return when (side) {
+            "LONG" -> 1
+            "SHORT" -> -1
+            else -> 0
+        }
     }
 
     fun encode(dirs: Map<String, Int?>): String = FRAMES.joinToString(";") { frame -> frame + "=" + (dirs[frame]?.toString() ?: "?") }

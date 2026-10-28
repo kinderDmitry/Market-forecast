@@ -110,7 +110,15 @@ data class Forecast(
     val reversalProbability: Double = 0.0,
     val bullishEvidence: List<String> = emptyList(),
     val bearishEvidence: List<String> = emptyList(),
-    val risks: List<String> = emptyList()
+    val risks: List<String> = emptyList(),
+    /** Direction the model leans to when there is no tradeable signal (costs eat the edge, or the market is compressing). */
+    val lean: String = "",
+    /** How far the plan beat a random walk with the same targets and volatility, in standard errors. */
+    val edgeZ: Double = 0.0,
+    /** Expected result per trade of that random-walk baseline, in R. */
+    val nullEv: Double = 0.0,
+    /** What the chosen plan earned per trade on similar historical situations, in R. */
+    val planEv: Double = 0.0
 )
 data class MarketState(
     val symbol: String,

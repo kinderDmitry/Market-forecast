@@ -69,3 +69,59 @@ private fun PlanRow(label: String, level: Double, move: Double, r: Double, proba
         Text(String.format(Locale.US, "%.0f%%", probability * 100.0), Modifier.weight(0.8f), fontSize = 12.sp, fontWeight = FontWeight.Bold)
     }
 }
+
+/** Shown instead of a plan when the model has no entry signal; says what it does see and why it is not a trade. */
+@Composable
+internal fun LeanCard(f: Forecast, ru: Boolean) {
+    GradientCard(Modifier.fillMaxWidth()) {
+        SectionHeader(if (ru) "Сейчас нет сигнала на вход" else "No entry signal right now", "")
+        if (f.lean.isNotEmpty()) {
+            val tone = if (f.lean == "LONG") Positive else Negative
+            Text(
+                (if (ru) "Лёгкий перекос: " else "A lean towards: ") + f.lean,
+                color = tone, fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.padding(top = 8.dp)
+            )
+            Text(
+                if (ru) "Направление просматривается, но ожидание плана ${String.format(Locale.US, "%+.2f", f.expectedValueR)}R после издержек ниже порога +0,03R, либо рынок в сжатии. Это ориентир, а не сигнал: уровни ниже показаны для справки."
+                else "A direction is visible, but the plan's expectation of ${String.format(Locale.US, "%+.2f", f.expectedValueR)}R after costs is below the +0.03R bar, or the market is squeezing. A view, not a signal: the levels below are for reference.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
+            )
+        } else {
+            Text(
+                if (ru) "Подтверждённого направления нет: сигналы расходятся или рынок без режима. Лучше подождать."
+                else "There is no confirmed direction: the signals disagree or the market has no regime. Better to wait.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+}
+
+/** Placebo test: does the plan beat a random walk with the same volatility and the same targets? */
+@Composable
+internal fun EdgeCard(f: Forecast, ru: Boolean) {
+    if (f.sampleSize < ExitPlanner.MIN_SAMPLES) return
+    val z = f.edgeZ
+    val tone = if (z >= 1.5) Positive else if (z >= 0.5) Warning else Negative
+    GradientCard(Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (ru) "Проверка на случайность" else "Randomness check", fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.weight(1f))
+            Text("z = " + String.format(Locale.US, "%.1f", z), fontWeight = FontWeight.Black, fontSize = 18.sp, color = tone)
+        }
+        Text(
+            when {
+                z >= 1.5 -> if (ru) "План на истории заметно лучше случайного блуждания с теми же целями и волатильностью: преимущество не похоже на шум."
+                else "On history the plan is clearly better than a random walk with the same targets and volatility: the edge does not look like noise."
+                z >= 0.5 -> if (ru) "Преимущество над случайным блужданием слабое: возможно, это просто шум."
+                else "The edge over a random walk is weak: it may just be noise."
+                else -> if (ru) "На истории план не лучше случайного блуждания: сигнал может оказаться случайным."
+                else "On history the plan is no better than a random walk: the signal may be random."
+            },
+            fontSize = 12.sp, color = tone, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 6.dp)
+        )
+        Text(
+            (if (ru) "План на истории: " else "Plan on history: ") + String.format(Locale.US, "%+.2fR", f.planEv) +
+                (if (ru) " • случайное блуждание при тех же целях: " else " • random walk with the same targets: ") + String.format(Locale.US, "%+.2fR", f.nullEv),
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
+        )
+    }
+}

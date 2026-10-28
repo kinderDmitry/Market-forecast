@@ -65,7 +65,7 @@ internal object ReliabilityEngine {
         unit(0.5 + 0.5 * unit(f.mtfAgreement) - 0.5 * unit(f.mtfConflict)),
         unit(f.signalStability),
         unit(f.calibrationQuality) * unit(f.sampleSize / 200.0),
-        unit((f.historicalEdge - 0.45) / 0.25),
+        0.5 * unit((f.historicalEdge - 0.45) / 0.25) + 0.5 * unit(f.edgeZ / 2.5),
         unit(bars / 250.0) * unit(f.dataQuality / 100.0)
     )
 

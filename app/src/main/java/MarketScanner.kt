@@ -91,7 +91,9 @@ internal data class ScanHit(
     val tp3p: Double = 0.0,
     val stopProb: Double = 0.0,
     /** Direction of the same instrument on every horizon, see [Confluence.encode]. Empty until the second phase checked it. */
-    val aligned: String = ""
+    val aligned: String = "",
+    /** A lean without a tradeable plan: the direction is visible, but after costs the plan does not pay. */
+    val watch: Boolean = false
 ) {
     /** How many horizons (this one included) point the same way as the forecast; 0 while unchecked. */
     val alignedAgree: Int get() = if (aligned.isBlank()) 0 else Confluence.summarize(if (signal == "LONG") 1 else -1, Confluence.decode(aligned)).agree
@@ -157,7 +159,8 @@ internal object ScannerStore {
                     tp2p = o.optDouble("tp2p", 0.0),
                     tp3p = o.optDouble("tp3p", 0.0),
                     stopProb = o.optDouble("stopProb", 0.0),
-                    aligned = o.optString("aligned", "")
+                    aligned = o.optString("aligned", ""),
+                    watch = o.optBoolean("watch", false)
                 )
             )
         }
@@ -192,7 +195,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
-                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned)
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch)
                 }
             )
         }
@@ -258,11 +261,13 @@ internal object ScanCore {
         if (now - last.time > h.staleMs) return Outcome(STALE, null, last.time)
         if (!isFx(item.type) && candles.takeLast(10).sumOf { it.volume } <= 0.0) return Outcome(ILLIQUID, null)
         val f = try {
-            AnalyticsEngine.analyze(candles, null)
+            AnalyticsEngine.analyze(candles, null, fx = isFx(item.type) || item.classCode.equals("CETS", ignoreCase = true))
         } catch (t: Throwable) {
             return Outcome(ILLIQUID, null)
         }
-        if (f.signal == "NO TRADE") return Outcome(NO_SIGNAL, null)
+        if (f.signal == "NO TRADE" && f.lean.isEmpty()) return Outcome(NO_SIGNAL, null)
+        val watch = f.signal == "NO TRADE"
+        val view = if (watch) f.copy(signal = f.lean) else f
         val prevClose = candles[candles.size - 2].close
         val change = if (prevClose > 0.0) (last.close - prevClose) / prevClose * 100.0 else 0.0
         val hit = ScanHit(
@@ -270,7 +275,7 @@ internal object ScanCore {
             name = item.name,
             type = item.type,
             classCode = item.classCode,
-            signal = f.signal,
+            signal = view.signal,
             confidence = f.confidence,
             score = f.score,
             price = last.close,
@@ -281,16 +286,17 @@ internal object ScanCore {
             rr = f.rr,
             regime = f.regime,
             scannedAt = now,
-            isNew = baseline && previousSignal != f.signal,
+            isNew = baseline && previousSignal != view.signal,
             prevSignal = previousSignal,
             timeframe = h.tf,
             expiresAt = now + h.validMs,
-            reliability = ReliabilityEngine.score(f, candles.size),
+            reliability = ReliabilityEngine.score(view, candles.size).let { if (watch) minOf(it, 55) else it },
             tp3 = f.tp3,
             tp1p = f.tp1Probability,
             tp2p = f.tp2Probability,
             tp3p = f.tp3Probability,
-            stopProb = f.stopProbability
+            stopProb = f.stopProbability,
+            watch = watch
         )
         return Outcome(HIT, hit, last.time)
     }
@@ -310,7 +316,7 @@ internal object ScanCore {
             dirs[hz.tf] = try {
                 val c = repo.loadScanCandles(symbol, classCode, hz.tf)
                 if (c.size < minBars(hz) || c.last().close <= 0.0 || now - c.last().time > hz.staleMs) null
-                else Confluence.direction(AnalyticsEngine.analyze(c, null))
+                else Confluence.direction(AnalyticsEngine.analyze(c, null, fx = classCode.equals("CETS", ignoreCase = true) || currencyBase(symbol) != null))
             } catch (t: Throwable) {
                 null
             }
@@ -670,7 +676,7 @@ internal class ScannerController(
         }
 
         // 4. Report: what was covered, what is new.
-        val fresh = found.values.filter { it.isNew }
+        val fresh = found.values.filter { it.isNew && !it.watch }
         val newOnes = fresh.size
         if (baseline && newOnes > 0 && !isForeground() && prefs.getBoolean("alert_signal", true)) {
             ScanNotify.post(appContext, h, fresh, ru, prefs.getInt("alert_min_confidence", 60))

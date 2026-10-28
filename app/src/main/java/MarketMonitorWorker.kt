@@ -165,7 +165,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
                     val candles = runCatching { repo.load(symbol, "5y", "1d") }.getOrNull()
                     if (candles == null || candles.size < 30) return@withPermit null
                     val live = runCatching { repo.quote(symbol) }.getOrNull() ?: 0.0
-                    val f = runCatching { AnalyticsEngine.analyze(candles, live) }.getOrNull() ?: return@withPermit null
+                    val f = runCatching { AnalyticsEngine.analyze(candles, live, fx = fxPairLabel(symbol) != null) }.getOrNull() ?: return@withPermit null
                     FavoriteResult(symbol, f.signal, f.confidence, live)
                 }
             }

@@ -1,7 +1,9 @@
 package com.marketforecast.prox
 
+import android.content.SharedPreferences
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * Chooses the stop distance and the HEIGHT of the targets from what this instrument really did after similar setups,
@@ -45,12 +47,14 @@ internal object ExitPlanner {
         val ev: Double,
         val samples: Int,
         /** True when the geometry was changed from the default because the history clearly preferred another one. */
-        val optimized: Boolean
+        val optimized: Boolean,
+        /** Standard deviation of the result of one trade (R). */
+        val sd: Double = 0.0
     )
 
     /** One trade on explicit price levels. [bars] are the candles AFTER the entry, in order. */
     fun simulateLevels(
-        bars: List<Candle>, direction: Int, entry: Double, stop: Double, tp1: Double, tp2: Double, tp3: Double, costFraction: Double = COST_FRACTION
+        bars: List<Candle>, direction: Int, entry: Double, stop: Double, tp1: Double, tp2: Double, tp3: Double, costFraction: Double = currentCost()
     ): Result {
         val risk = kotlin.math.abs(entry - stop)
         if (!(risk > 0.0) || bars.isEmpty()) return Result(0.0, false, false, false, false)
@@ -116,6 +120,7 @@ internal object ExitPlanner {
 
     private fun evaluate(c: List<Candle>, samples: List<Sample>, direction: Int, stopMult: Double, scale: Double, horizon: Int): Plan {
         var sum = 0.0
+        var sumSq = 0.0
         var n1 = 0
         var n2 = 0
         var n3 = 0
@@ -123,13 +128,15 @@ internal object ExitPlanner {
         for (s in samples) {
             val r = simulate(c, s, direction, stopMult, scale, horizon)
             sum += r.r
+            sumSq += r.r * r.r
             if (r.reached1) n1 += 1
             if (r.reached2) n2 += 1
             if (r.reached3) n3 += 1
             if (r.stoppedFirst) stopped += 1
         }
         val n = max(samples.size, 1).toDouble()
-        return Plan(stopMult, scale, n1 / n, n2 / n, n3 / n, stopped / n, sum / n, samples.size, false)
+        val mean = sum / n
+        return Plan(stopMult, scale, n1 / n, n2 / n, n3 / n, stopped / n, mean, samples.size, false, sqrt(max(0.0, sumSq / n - mean * mean)))
     }
 
     /**
@@ -156,11 +163,106 @@ internal object ExitPlanner {
         return if (bestScore >= baseScore + MARGIN) best.copy(optimized = true) else base
     }
 
+    private val costContext = ThreadLocal<Double>()
+
+    /** Round-trip cost in force for the analysis running on this thread (stocks and currencies cost differently). */
+    fun currentCost(): Double = costContext.get() ?: COST_FRACTION
+
+    fun <T> withCost(fraction: Double, block: () -> T): T {
+        val previous = costContext.get()
+        costContext.set(fraction)
+        try {
+            return block()
+        } finally {
+            if (previous == null) costContext.remove() else costContext.set(previous)
+        }
+    }
+
+    /**
+     * The same plan played on a RANDOM WALK with this instrument's volatility: real candle shapes (range, wicks, body) in
+     * units of their own ATR, drawn at random with the drift removed. It answers "what would this plan earn if the past
+     * had no memory at all", so a plan is only credited with the edge it has beyond that.
+     */
+    fun nullPlan(c: List<Candle>, direction: Int, stopMult: Double, scale: Double, atrNow: Double, horizon: Int, paths: Int = 300): Plan {
+        val empty = Plan(stopMult, scale, 0.0, 0.0, 0.0, 0.0, 0.0, 0, false)
+        val window = min(c.size - 1, 300)
+        if (window < 40 || !(atrNow > 0.0)) return empty
+        val highs = DoubleArray(window)
+        val lows = DoubleArray(window)
+        val closes = DoubleArray(window)
+        var k = 0
+        for (j in c.size - window until c.size) {
+            if (j < 15) continue
+            var rangeSum = 0.0
+            for (q in j - 14 until j) rangeSum += c[q].high - c[q].low
+            val a = rangeSum / 14.0
+            if (!(a > 0.0)) continue
+            highs[k] = (c[j].high - c[j].open) / a
+            lows[k] = (c[j].low - c[j].open) / a
+            closes[k] = (c[j].close - c[j].open) / a
+            k += 1
+        }
+        if (k < 30) return empty
+        var drift = 0.0
+        for (i in 0 until k) drift += closes[i]
+        drift /= k
+        val random = java.util.Random(c.size * 31L + direction)
+        val start = c.last().close
+        val risk = stopMult * atrNow
+        val stop = start - direction * risk
+        val t1 = start + direction * scale * K1 * risk
+        val t2 = start + direction * scale * K2 * risk
+        val t3 = start + direction * scale * K3 * risk
+        val cost = currentCost()
+        var sum = 0.0
+        var sumSq = 0.0
+        var n1 = 0
+        var n2 = 0
+        var n3 = 0
+        var stopped = 0
+        repeat(paths) {
+            var price = start
+            val bars = ArrayList<Candle>(horizon)
+            repeat(horizon) {
+                val i = random.nextInt(k)
+                val open = price
+                val close = open + (closes[i] - drift) * atrNow
+                val high = max(open + (highs[i] - drift) * atrNow, max(open, close))
+                val low = min(open + (lows[i] - drift) * atrNow, min(open, close))
+                bars.add(Candle(0L, open, high, low, close, 0.0))
+                price = close
+            }
+            val r = simulateLevels(bars, direction, start, stop, t1, t2, t3, cost)
+            sum += r.r
+            sumSq += r.r * r.r
+            if (r.reached1) n1 += 1
+            if (r.reached2) n2 += 1
+            if (r.reached3) n3 += 1
+            if (r.stoppedFirst) stopped += 1
+        }
+        val n = paths.toDouble()
+        val mean = sum / n
+        return Plan(stopMult, scale, n1 / n, n2 / n, n3 / n, stopped / n, mean, paths, false, sqrt(max(0.0, sumSq / n - mean * mean)))
+    }
+
     /**
      * Expected result of the plan in R from the probabilities of reaching each target before the stop.
      * Matches [simulateLevels]: a third at each target, break-even after TP1, stop to TP1 after TP2.
      */
     fun expectedValue(p1: Double, p2: Double, p3: Double, pStop: Double, r1: Double, r2: Double, r3: Double, costR: Double): Double {
         return -pStop + (p1 - p2) * (r1 / 3.0) + (p2 - p3) * ((2.0 * r1 + r2) / 3.0) + p3 * ((r1 + r2 + r3) / 3.0) - costR
+    }
+}
+
+/** Round-trip trading cost as a share of the price, separately for shares and currency pairs; editable in Settings. */
+internal object CostModel {
+    @Volatile var stock: Double = 0.0008
+    @Volatile var fx: Double = 0.0004
+
+    fun fraction(isFx: Boolean): Double = if (isFx) fx else stock
+
+    fun load(prefs: SharedPreferences) {
+        stock = (prefs.getFloat("cost_stock_pct", 0.08f) / 100.0).coerceIn(0.0001, 0.01)
+        fx = (prefs.getFloat("cost_fx_pct", 0.04f) / 100.0).coerceIn(0.0001, 0.01)
     }
 }
