@@ -130,6 +130,31 @@ class PureLogicTest {
     }
 
     @Test
+    fun costContextIsScopedToTheAnalysis() {
+        assertEquals(ExitPlanner.COST_FRACTION, ExitPlanner.currentCost(), 0.0)
+        ExitPlanner.withCost(0.01) { assertEquals(0.01, ExitPlanner.currentCost(), 0.0) }
+        assertEquals(ExitPlanner.COST_FRACTION, ExitPlanner.currentCost(), 0.0)
+    }
+
+    @Test
+    fun randomWalkBaselineIsStableAndDoesNotReward() {
+        val random = java.util.Random(7)
+        val c = ArrayList<Candle>()
+        var p = 100.0
+        repeat(320) {
+            val n = p * (1.0 + random.nextGaussian() * 0.006)
+            c.add(Candle(0L, p, max(p, n) * 1.002, min(p, n) * 0.998, n, 1000.0))
+            p = n
+        }
+        val atr = c.takeLast(14).map { it.high - it.low }.average()
+        val a = ExitPlanner.nullPlan(c, 1, 1.25, 1.0, atr, 8)
+        val b = ExitPlanner.nullPlan(c, 1, 1.25, 1.0, atr, 8)
+        assertEquals(a.ev, b.ev, 0.0)
+        assertTrue(a.ev < 0.1)
+        assertTrue(a.p1 >= a.p2 && a.p2 >= a.p3)
+    }
+
+    @Test
     fun supertrendFollowsTheTrend() {
         val up = ArrayList<Candle>()
         var p = 100.0
