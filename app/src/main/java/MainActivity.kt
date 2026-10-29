@@ -284,6 +284,27 @@ fun MarketForecastApp(ctx: Context) {
         return true
     }
 
+    /** "Track" straight from a scanner card: the plan of the card (entry, stop, three targets) is what gets watched. */
+    fun trackScanHit(h: ScanHit): Boolean {
+        if (h.watch) { message = if (ru) "Это только направление без выгоды после издержек: такую сделку не отслеживаем." else "This is only a direction with no edge after costs: not tracked."; return false }
+        if (tracked.any { it.symbol.equals(h.symbol, ignoreCase = true) && it.timeframe == h.timeframe && it.result == "PENDING" }) {
+            message = if (ru) "Этот инструмент и срок уже отслеживаются." else "This instrument and horizon are already tracked."; return false
+        }
+        val now = System.currentTimeMillis()
+        val id = "${h.symbol}_${h.timeframe}_${now}_${java.util.UUID.randomUUID()}"
+        val t = TrackedForecast(id, h.symbol, h.signal, h.confidence, h.price, h.timeframe, now, now + tfMillis(h.timeframe), stop = h.stop, tp1 = h.tp1, tp2 = h.tp2, tp3 = h.tp3, lastLivePrice = h.price, lastUpdated = now)
+        saveTracked((listOf(t) + tracked).take(150))
+        val resultConstraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+        WorkManager.getInstance(ctx).enqueueUniqueWork("forecast_result_${t.id}", ExistingWorkPolicy.REPLACE, OneTimeWorkRequestBuilder<MarketMonitorWorker>()
+            .setConstraints(resultConstraints)
+            .setInitialDelay(tfMillis(h.timeframe), TimeUnit.MILLISECONDS)
+            .setBackoffCriteria(BackoffPolicy.LINEAR, 30, TimeUnit.SECONDS)
+            .build())
+        schedule()
+        message = if (ru) "Добавлено в отслеживание: ${t.symbol} • ${h.timeframe}" else "Added to monitoring: ${t.symbol} • ${h.timeframe}"
+        return true
+    }
+
     LaunchedEffect(Unit) {
         // Priority 0: selected instrument and Analytics Center data.
         // Priority 1: the first visible favorites (15M + 1H), which are the most
@@ -628,7 +649,9 @@ fun MarketForecastApp(ctx: Context) {
                         Screen.SCANNER -> ScannerScreen(
                             scanner, favorites, ru, { sym, frame -> load(sym, frame) },
                             { sym -> if (favorites.any { it.equals(sym, true) }) saveFav(favorites.filterNot { it.equals(sym, true) }.toSet()) else saveFav(favorites + sym) },
-                            { startScanner() }
+                            { startScanner() },
+                            tracked.filter { it.result == "PENDING" }.map { it.symbol.uppercase(java.util.Locale.US) + "|" + it.timeframe }.toSet(),
+                            { trackScanHit(it) }
                         )
                         Screen.HEATMAP -> HeatmapScreen(repo, favorites, ru) { load(it) }
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)

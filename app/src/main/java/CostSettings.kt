@@ -1,5 +1,11 @@
 package com.marketforecast.prox
 
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.material3.FilterChip
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.horizontalScroll
 import android.content.SharedPreferences
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -22,6 +28,7 @@ import java.util.Locale
 internal fun CostSettings(ru: Boolean, prefs: SharedPreferences) {
     var stock by remember { mutableFloatStateOf(prefs.getFloat("cost_stock_pct", 0.08f)) }
     var fx by remember { mutableFloatStateOf(prefs.getFloat("cost_fx_pct", 0.04f)) }
+    var style by remember { mutableIntStateOf(prefs.getInt("plan_style", 1)) }
     GradientCard(Modifier.fillMaxWidth()) {
         SectionHeader(
             if (ru) "Издержки сделки" else "Trading costs",
@@ -46,6 +53,24 @@ internal fun CostSettings(ru: Boolean, prefs: SharedPreferences) {
             onValueChange = { fx = it },
             onValueChangeFinished = { prefs.edit().putFloat("cost_fx_pct", fx).apply(); CostModel.load(prefs) },
             valueRange = 0.01f..0.15f
+        )
+        Text(
+            if (ru) "Стиль плана" else "Plan style",
+            fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp)
+        )
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(0 to (if (ru) "Надёжнее" else "Safer"), 1 to (if (ru) "Баланс" else "Balanced"), 2 to (if (ru) "Прибыльнее" else "More profit")).forEach { (value, label) ->
+                FilterChip(
+                    selected = style == value,
+                    onClick = { style = value; prefs.edit().putInt("plan_style", value).apply(); CostModel.load(prefs) },
+                    label = { Text(label, fontSize = 12.sp) }
+                )
+            }
+        }
+        Text(
+            if (ru) "«Надёжнее» ставит первую цель ближе: она достигается заметно чаще (на моделируемых рынках около 54% прибыльных сделок против 46% при «Балансе»), но каждая победа меньше, и среднее ожидание ниже. «Прибыльнее» наоборот. Повысить шанс бесплатно нельзя: за каждый процент вероятности платит размер результата."
+            else "\"Safer\" puts the first target closer: it is reached noticeably more often (on simulated markets about 54% winning trades against 46% for \"Balanced\"), but each win is smaller and the average expectation is lower. \"More profit\" is the opposite. A higher chance is never free: every point of probability is paid for with the size of the result.",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
         )
         Text(
             if (ru) "Чем выше издержки, тем меньше сигналов проходит порог выгоды. На коротких сроках и у спокойных инструментов (валюты) издержки могут съедать всё ожидаемое движение: такие случаи показываются как «Только направление»."

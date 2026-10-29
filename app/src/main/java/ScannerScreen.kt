@@ -1,5 +1,10 @@
 package com.marketforecast.prox
 
+import androidx.compose.material.icons.filled.NotificationsActive
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -101,13 +106,17 @@ internal fun ScannerScreen(
     ru: Boolean,
     onOpen: (String, String) -> Unit,
     onToggleFavorite: (String) -> Unit,
-    onStart: () -> Unit
+    onStart: () -> Unit,
+    trackedKeys: Set<String>,
+    onTrack: (ScanHit) -> Unit
 ) {
     var signalFilter by remember { mutableStateOf("ALL") }
     var onlyNew by remember { mutableStateOf(false) }
     var minConf by remember { mutableIntStateOf(0) }
     var goodOnly by remember { mutableStateOf(false) }
     var tradableOnly by remember { mutableStateOf(false) }
+    var topOnly by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var minAlign by remember { mutableIntStateOf(0) }
     var sort by remember { mutableStateOf("REL") }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -130,12 +139,13 @@ internal fun ScannerScreen(
         }
     }
 
-    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, tradableOnly, minAlign, minConf, sort) {
+    val visible = remember(c.hits, c.horizon, signalFilter, onlyNew, goodOnly, tradableOnly, topOnly, minAlign, minConf, sort) {
         val base = c.current
             .filter { signalFilter == "ALL" || it.signal.contains(signalFilter, ignoreCase = true) }
             .filter { !onlyNew || it.isNew }
             .filter { !goodOnly || it.reliability >= 60 }
             .filter { !tradableOnly || !it.watch }
+            .filter { !topOnly || it.isTop }
             .filter { minAlign == 0 || it.alignedAgree >= minAlign }
             .filter { it.confidence >= minConf }
         when (sort) {
@@ -260,6 +270,19 @@ internal fun ScannerScreen(
             item { CoverageCard(cov, c.horizon, ru) }
         }
 
+        if (c.current.isNotEmpty() && !c.running) {
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { scope.launch { c.clearOld() } }, modifier = Modifier.weight(1f)) {
+                        Text(if (ru) "Очистить старые" else "Clear old", fontSize = 12.sp)
+                    }
+                    OutlinedButton(onClick = { scope.launch { c.clearAll() } }, modifier = Modifier.weight(1f)) {
+                        Text(if (ru) "Очистить все" else "Clear all", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
         if (c.current.isNotEmpty()) {
             item {
                 SectionHeader(
@@ -285,6 +308,11 @@ internal fun ScannerScreen(
                         selected = goodOnly,
                         onClick = { goodOnly = !goodOnly },
                         label = { Text(if (ru) "Надёжность B и выше" else "Reliability B+", fontSize = 12.sp) }
+                    )
+                    FilterChip(
+                        selected = topOnly,
+                        onClick = { topOnly = !topOnly },
+                        label = { Text(if (ru) "★ Только топ-сигналы" else "★ Top signals only", fontSize = 12.sp) }
                     )
                     FilterChip(
                         selected = tradableOnly,
@@ -334,6 +362,8 @@ internal fun ScannerScreen(
                     fav = favorites.any { it.equals(h.symbol, ignoreCase = true) },
                     ru = ru,
                     now = now,
+                    isTracked = (h.symbol.uppercase(Locale.US) + "|" + h.timeframe) in trackedKeys,
+                    onTrack = { onTrack(h) },
                     onOpen = { onOpen(h.symbol, h.timeframe) },
                     onFav = { onToggleFavorite(h.symbol) }
                 )
@@ -357,7 +387,7 @@ internal fun ScannerScreen(
 }
 
 @Composable
-private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: () -> Unit, onFav: () -> Unit) {
+private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, isTracked: Boolean, onTrack: () -> Unit, onOpen: () -> Unit, onFav: () -> Unit) {
     val color = signalColor(h.signal)
     GradientCard(Modifier.fillMaxWidth().tapCard(onClick = onOpen)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -405,6 +435,7 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
             Tag("🕒 ${h.horizon.label(ru)}", Accent)
             Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
             if (h.watch) Tag(if (ru) "Только направление" else "Direction only", Warning)
+            if (h.isTop) Tag("★ ТОП", Positive)
         }
         if (h.watch) {
             Text(
@@ -434,6 +465,19 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, onOpen: ()
             Metric(if (ru) "Цена" else "Price", fmt(h.price), MaterialTheme.colorScheme.onSurface)
             Metric(h.horizon.moveLabel(ru), String.format(Locale.US, "%+.2f%%", h.changePct), if (h.changePct >= 0) Positive else Negative)
             Metric(if (ru) "R:R до TP2" else "R:R to TP2", String.format(Locale.US, "%.1f", h.rr), MaterialTheme.colorScheme.onSurface)
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (h.watch) {
+                OutlinedButton(onClick = onOpen, modifier = Modifier.weight(1f)) { Text(if (ru) "Открыть анализ" else "Open analysis", fontSize = 13.sp) }
+            } else if (isTracked) {
+                OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.weight(1f)) { Text(if (ru) "✓ Отслеживается" else "✓ Tracked", fontSize = 13.sp) }
+            } else {
+                Button(onClick = onTrack, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
+                    Icon(Icons.Default.NotificationsActive, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (ru) "Отслеживать" else "Track", fontWeight = FontWeight.Black, fontSize = 13.sp)
+                }
+            }
         }
     }
 }
@@ -598,5 +642,12 @@ private fun CoverageCard(cov: ScanCoverage, h: ScanHorizon, ru: Boolean) {
                 (if (cov.failed > 0) (if (ru) " • не проверено ${cov.failed}" else " • not checked ${cov.failed}") else ""),
             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
         )
+        if (cov.reasons.isNotEmpty()) {
+            Text(
+                (if (ru) "Почему у остальных нет сигнала: " else "Why the rest have no signal: ") +
+                    cov.reasons.entries.sortedByDescending { it.value }.take(4).joinToString(" • ") { whyLabel(it.key, ru) + " " + it.value },
+                fontSize = 11.sp, color = Warning, modifier = Modifier.padding(top = 4.dp)
+            )
+        }
     }
 }

@@ -28,6 +28,11 @@ internal object ExitPlanner {
 
     private val STOPS = doubleArrayOf(1.0, 1.25, 1.5, 1.8, 2.2)
     private val SCALES = doubleArrayOf(0.8, 1.0, 1.3, 1.7, 2.2)
+    /** The "safer" style may also pull TP1 closer than the risk: reached more often, but each win is smaller. */
+    private val SCALES_SAFE = doubleArrayOf(0.5, 0.65, 0.8, 1.0, 1.3, 1.7, 2.2)
+
+    /** 0 safer (more trades reach the first target), 1 balanced (best expected result), 2 more profit per winning trade. */
+    @Volatile var style: Int = 1
     private const val SHRINK = 15.0
     private const val MARGIN = 0.02
 
@@ -49,7 +54,9 @@ internal object ExitPlanner {
         /** True when the geometry was changed from the default because the history clearly preferred another one. */
         val optimized: Boolean,
         /** Standard deviation of the result of one trade (R). */
-        val sd: Double = 0.0
+        val sd: Double = 0.0,
+        /** Share of trades that ended in profit after costs. */
+        val win: Double = 0.0
     )
 
     /** One trade on explicit price levels. [bars] are the candles AFTER the entry, in order. */
@@ -125,6 +132,7 @@ internal object ExitPlanner {
         var n2 = 0
         var n3 = 0
         var stopped = 0
+        var wins = 0
         for (s in samples) {
             val r = simulate(c, s, direction, stopMult, scale, horizon)
             sum += r.r
@@ -133,10 +141,11 @@ internal object ExitPlanner {
             if (r.reached2) n2 += 1
             if (r.reached3) n3 += 1
             if (r.stoppedFirst) stopped += 1
+            if (r.r > 0.0) wins += 1
         }
         val n = max(samples.size, 1).toDouble()
         val mean = sum / n
-        return Plan(stopMult, scale, n1 / n, n2 / n, n3 / n, stopped / n, mean, samples.size, false, sqrt(max(0.0, sumSq / n - mean * mean)))
+        return Plan(stopMult, scale, n1 / n, n2 / n, n3 / n, stopped / n, mean, samples.size, false, sqrt(max(0.0, sumSq / n - mean * mean)), wins / n)
     }
 
     /**
@@ -147,13 +156,16 @@ internal object ExitPlanner {
         val base = evaluate(c, samples, direction, defaultStop, 1.0, horizon)
         if (samples.size < MIN_SAMPLES) return base
         val shrink = samples.size / (samples.size + SHRINK)
-        val baseScore = base.ev * shrink
+        // The chosen style leans the choice: "safer" pays for a higher share of winning trades with some expected result.
+        val lambda = when (style) { 0 -> 0.30; 2 -> -0.20; else -> 0.0 }
+        val scales = if (style == 0) SCALES_SAFE else SCALES
+        val baseScore = base.ev * shrink + lambda * base.win
         var best = base
         var bestScore = baseScore
         for (stop in STOPS) {
-            for (scale in SCALES) {
+            for (scale in scales) {
                 val plan = evaluate(c, samples, direction, stop, scale, horizon)
-                val score = plan.ev * shrink
+                val score = plan.ev * shrink + lambda * plan.win
                 if (score > bestScore) {
                     best = plan
                     bestScore = score
@@ -264,5 +276,6 @@ internal object CostModel {
     fun load(prefs: SharedPreferences) {
         stock = (prefs.getFloat("cost_stock_pct", 0.08f) / 100.0).coerceIn(0.0001, 0.01)
         fx = (prefs.getFloat("cost_fx_pct", 0.04f) / 100.0).coerceIn(0.0001, 0.01)
+        ExitPlanner.style = prefs.getInt("plan_style", 1).coerceIn(0, 2)
     }
 }

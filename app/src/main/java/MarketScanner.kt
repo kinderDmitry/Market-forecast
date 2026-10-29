@@ -93,8 +93,18 @@ internal data class ScanHit(
     /** Direction of the same instrument on every horizon, see [Confluence.encode]. Empty until the second phase checked it. */
     val aligned: String = "",
     /** A lean without a tradeable plan: the direction is visible, but after costs the plan does not pay. */
-    val watch: Boolean = false
+    val watch: Boolean = false,
+    /** How far the plan beat a random walk (standard errors) and its expected result per trade in R. */
+    val edgeZ: Double = 0.0,
+    val ev: Double = 0.0
 ) {
+    /**
+     * The best the engine can offer, nothing less: a real signal (not just a direction), reliability B or better, a plan that
+     * clearly beats a random walk, a positive expectation after costs, a decent chance of the first target and, when it was
+     * checked, agreement on at least three horizons. Still not a guarantee.
+     */
+    val isTop: Boolean get() = !watch && reliability >= 70 && edgeZ >= 1.0 && ev >= 0.08 && tp1p >= 0.40 && (aligned.isBlank() || alignedAgree >= 3)
+
     /** How many horizons (this one included) point the same way as the forecast; 0 while unchecked. */
     val alignedAgree: Int get() = if (aligned.isBlank()) 0 else Confluence.summarize(if (signal == "LONG") 1 else -1, Confluence.decode(aligned)).agree
     fun alignedDirections(): Map<String, Int?> = Confluence.decode(aligned)
@@ -108,7 +118,9 @@ internal class ScanCoverage(
     val noSignal: Int,
     val illiquid: Int,
     val stale: Int,
-    val failed: Int
+    val failed: Int,
+    /** Why instruments without a signal have none: reason code to count. */
+    val reasons: Map<String, Int> = emptyMap()
 ) {
     val checked: Int get() = hits + noSignal + illiquid + stale
     val percent: Int get() = if (total <= 0) 0 else (total - failed) * 100 / total
@@ -160,7 +172,9 @@ internal object ScannerStore {
                     tp3p = o.optDouble("tp3p", 0.0),
                     stopProb = o.optDouble("stopProb", 0.0),
                     aligned = o.optString("aligned", ""),
-                    watch = o.optBoolean("watch", false)
+                    watch = o.optBoolean("watch", false),
+                    edgeZ = o.optDouble("edgeZ", 0.0),
+                    ev = o.optDouble("ev", 0.0)
                 )
             )
         }
@@ -195,7 +209,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
-                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch)
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch); put("edgeZ", fin(h.edgeZ)); put("ev", fin(h.ev))
                 }
             )
         }
@@ -207,6 +221,15 @@ internal object ScannerStore {
         tmp.writeText(root.toString(), Charsets.UTF_8)
         if (file.exists()) file.delete()
         tmp.renameTo(file)
+    }
+
+    /** Rewrites the stored list of forecasts (used by the "clear" buttons); the scan timestamps stay. */
+    @Synchronized
+    fun replaceHits(ctx: Context, hits: List<ScanHit>) {
+        runCatching {
+            val current = load(ctx)
+            write(ctx, HashMap<String, Long>(current?.finished ?: emptyMap<String, Long>()), current?.scope ?: "MAIN", hits)
+        }
     }
 
     /**
@@ -235,7 +258,7 @@ internal object ScanCore {
     const val NO_SIGNAL = 3
     const val HIT = 4
 
-    class Outcome(val status: Int, val hit: ScanHit?, val lastTime: Long = 0L)
+    class Outcome(val status: Int, val hit: ScanHit?, val lastTime: Long = 0L, val why: String = "")
 
     private fun minBars(h: ScanHorizon): Int = if (h == ScanHorizon.W1) 40 else 60
 
@@ -265,7 +288,7 @@ internal object ScanCore {
         } catch (t: Throwable) {
             return Outcome(ILLIQUID, null)
         }
-        if (f.signal == "NO TRADE" && f.lean.isEmpty()) return Outcome(NO_SIGNAL, null)
+        if (f.signal == "NO TRADE" && f.lean.isEmpty()) return Outcome(NO_SIGNAL, null, last.time, f.why)
         val watch = f.signal == "NO TRADE"
         val view = if (watch) f.copy(signal = f.lean) else f
         val prevClose = candles[candles.size - 2].close
@@ -296,7 +319,9 @@ internal object ScanCore {
             tp2p = f.tp2Probability,
             tp3p = f.tp3Probability,
             stopProb = f.stopProbability,
-            watch = watch
+            watch = watch,
+            edgeZ = f.edgeZ,
+            ev = f.expectedValueR
         )
         return Outcome(HIT, hit, last.time)
     }
@@ -470,6 +495,23 @@ internal class ScannerController(
         if (kept.size != hits.size) hits = kept
     }
 
+    /** Old = more than half of the forecast's life is gone (or it is already over). Only the selected horizon is touched. */
+    suspend fun clearOld() {
+        val now = System.currentTimeMillis()
+        val tf = horizon.tf
+        hits = hits.filter { it.timeframe != tf || (it.expiresAt > now && now - it.scannedAt < (it.expiresAt - it.scannedAt) / 2L) }
+        val snapshot = hits
+        withContext(Dispatchers.IO) { ScannerStore.replaceHits(appContext, snapshot) }
+    }
+
+    /** Empties the list of the selected horizon; the next scan starts from a clean slate. */
+    suspend fun clearAll() {
+        val tf = horizon.tf
+        hits = hits.filter { it.timeframe != tf }
+        val snapshot = hits
+        withContext(Dispatchers.IO) { ScannerStore.replaceHits(appContext, snapshot) }
+    }
+
     /** Loads the previous scan from disk (also picks up what the background worker found). */
     suspend fun restore() {
         val snap = withContext(Dispatchers.IO) { ScannerStore.load(appContext) } ?: return
@@ -550,6 +592,7 @@ internal class ScannerController(
         val scanned = HashSet<String>()
         val failedItems = ArrayList<SearchResult>()
         var noSignal = 0
+        val reasons = HashMap<String, Int>()
         var illiquid = 0
         var stale = 0
         var answered = 0
@@ -571,7 +614,7 @@ internal class ScannerController(
             merged.sortWith(compareByDescending<ScanHit> { it.reliability }.thenByDescending { it.confidence })
             hits = merged
             failed = failedItems.size
-            coverage = ScanCoverage(total, found.size, noSignal, illiquid, stale, failedItems.size)
+            coverage = ScanCoverage(total, found.size, noSignal, illiquid, stale, failedItems.size, HashMap(reasons))
         }
 
         fun record(item: SearchResult, r: ScanCore.Outcome) {
@@ -580,7 +623,7 @@ internal class ScannerController(
                 ScanCore.FAILED -> failedItems.add(item)
                 ScanCore.ILLIQUID -> { illiquid += 1; scanned.add(item.symbol) }
                 ScanCore.STALE -> { stale += 1; scanned.add(item.symbol) }
-                ScanCore.NO_SIGNAL -> { noSignal += 1; scanned.add(item.symbol) }
+                ScanCore.NO_SIGNAL -> { noSignal += 1; reasons[r.why.ifBlank { "OTHER" }] = (reasons[r.why.ifBlank { "OTHER" }] ?: 0) + 1; scanned.add(item.symbol) }
                 ScanCore.HIT -> { r.hit?.let { found[item.symbol] = it }; scanned.add(item.symbol) }
             }
         }

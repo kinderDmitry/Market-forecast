@@ -75,6 +75,12 @@ private fun PlanRow(label: String, level: Double, move: Double, r: Double, proba
 internal fun LeanCard(f: Forecast, ru: Boolean) {
     GradientCard(Modifier.fillMaxWidth()) {
         SectionHeader(if (ru) "Сейчас нет сигнала на вход" else "No entry signal right now", "")
+        if (f.why.isNotBlank()) {
+            Text(
+                (if (ru) "Что мешает: " else "What stands in the way: ") + whyLabel(f.why, ru),
+                fontSize = 12.sp, color = Warning, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)
+            )
+        }
         if (f.lean.isNotEmpty()) {
             val tone = if (f.lean == "LONG") Positive else Negative
             Text(
@@ -124,4 +130,15 @@ internal fun EdgeCard(f: Forecast, ru: Boolean) {
             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
         )
     }
+}
+
+internal fun whyLabel(code: String, ru: Boolean): String = when (code) {
+    "REGIME" -> if (ru) "рынок без выраженного режима" else "no clear market regime"
+    "COMPRESSION" -> if (ru) "рынок в сжатии, ждём пробоя" else "the market is squeezing, waiting for a breakout"
+    "GAP" -> if (ru) "нет перевеса одного направления" else "no edge for one direction"
+    "ENTRY" -> if (ru) "неудачная точка входа" else "poor entry point"
+    "STABILITY" -> if (ru) "сигнал неустойчив" else "the signal is unstable"
+    "DATA" -> if (ru) "мало данных" else "not enough data"
+    "EV" -> if (ru) "после издержек нет выгоды" else "no edge after costs"
+    else -> if (ru) "прочее" else "other"
 }

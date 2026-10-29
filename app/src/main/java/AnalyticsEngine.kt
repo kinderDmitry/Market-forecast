@@ -483,7 +483,7 @@ object AnalyticsEngine {
         var h = 17L
         val points = intArrayOf(0, c.size / 3, c.size * 2 / 3, c.lastIndex).distinct().filter { it in c.indices }
         for (i in points) { val x = c[i]; h = h * 31 + x.time; h = h * 31 + java.lang.Double.doubleToLongBits(x.close) }
-        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}"
+        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}:${ExitPlanner.style}"
     }
 
     /** Analyze one timeframe. All probabilities are empirical/model estimates, never guarantees. */
@@ -599,7 +599,20 @@ object AnalyticsEngine {
         val gate = directionOk && evR >= .03 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
         // A lean is NOT a signal: the direction is visible, but after costs the plan does not pay (or the market is squeezing).
-        val lean = if (signal == "NO TRADE" && directionOk && reg.name !in setOf("UNCERTAIN", "TRANSITION")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
+        // The lean has softer entry conditions than a signal (it is only a direction, clearly labelled and never notified).
+        val leanOk = directionalGap >= .06 && entryQuality >= .25 && stability >= .25 && dataQuality >= 60
+        val lean = if (signal == "NO TRADE" && leanOk && reg.name != "UNCERTAIN") (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
+        // The first thing that stands between the market and a signal, in the order the gate checks it.
+        val why = when {
+            signal != "NO TRADE" -> ""
+            reg.name == "UNCERTAIN" || reg.name == "TRANSITION" -> "REGIME"
+            directionalGap < .10 -> "GAP"
+            entryQuality < .35 -> "ENTRY"
+            stability < .35 -> "STABILITY"
+            dataQuality < 70 -> "DATA"
+            evR < .03 -> "EV"
+            else -> "COMPRESSION"
+        }
         val confidence = ((40 + directionalGap*65 + reg.confidence*22 + stability*10 + calibrationQuality*8 - conflict*18 - srPenalty*2).coerceIn(0.0,100.0)).roundToInt()
         val bull = (longDirection*100).roundToInt().coerceIn(0,100)
         val bear = (shortDirection*100).roundToInt().coerceIn(0,100)
@@ -635,7 +648,7 @@ object AnalyticsEngine {
             tp1p,tp2p,tp3p,slp,evR,hist.edge,abs(s.score),liq.score,srPenalty,entryQuality,entryZoneLow,entryZoneHigh,
             longScore,shortScore,reg.confidence,abs(s.score),conflict,reg.impulse,reg.acceleration,reg.fatigue,stability,hist.sample,calibrationQuality,setupType,
             reg.continuation,reg.reversal,ev.longReasons,ev.shortReasons,ev.risks
-        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct(), lean = lean, edgeZ = hist.edgeZ, nullEv = hist.nullEv, planEv = hist.planEv) }
+        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct(), lean = lean, why = why, edgeZ = hist.edgeZ, nullEv = hist.nullEv, planEv = hist.planEv) }
     }
 
     /** Walk-forward validation: every decision sees only the candles before it. */

@@ -118,7 +118,9 @@ data class Forecast(
     /** Expected result per trade of that random-walk baseline, in R. */
     val nullEv: Double = 0.0,
     /** What the chosen plan earned per trade on similar historical situations, in R. */
-    val planEv: Double = 0.0
+    val planEv: Double = 0.0,
+    /** Why there is no signal: REGIME, COMPRESSION, GAP, ENTRY, STABILITY, DATA, EV (empty when there is one). */
+    val why: String = ""
 )
 data class MarketState(
     val symbol: String,
