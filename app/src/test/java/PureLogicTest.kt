@@ -155,6 +155,25 @@ class PureLogicTest {
     }
 
     @Test
+    fun rangeBreakoutIsRecognisedAsAConcreteMove() {
+        val flat = ArrayList<Candle>()
+        repeat(70) { i ->
+            val base = 100.0 + (i % 3 - 1) * 0.1
+            flat.add(Candle(0L, base, base + 0.3, base - 0.3, base + 0.05, 1000.0))
+        }
+        flat.add(Candle(0L, 100.0, 102.0, 99.9, 101.9, 3000.0))
+        val setup = SetupDetector.detect(SetupDetector.series(flat), flat.lastIndex)
+        assertNotNull(setup)
+        assertEquals(1, setup!!.direction)
+    }
+
+    @Test
+    fun aQuietMarketHasNoConcreteMove() {
+        val quiet = (0 until 80).map { Candle(0L, 100.0, 100.3, 99.7, 100.0, 1000.0) }
+        assertNull(SetupDetector.detect(SetupDetector.series(quiet), quiet.lastIndex))
+    }
+
+    @Test
     fun supertrendFollowsTheTrend() {
         val up = ArrayList<Candle>()
         var p = 100.0
