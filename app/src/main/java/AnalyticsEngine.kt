@@ -71,7 +71,9 @@ object AnalyticsEngine {
         val planEv: Double = 0.0,
         /** Random-walk baseline of the same plan, and how many standard errors the history beats it by. */
         val nullEv: Double = 0.0,
-        val edgeZ: Double = 0.0
+        val edgeZ: Double = 0.0,
+        /** How many past occurrences of the same concrete event the plan was judged on (0 = judged on look-alike regimes). */
+        val events: Int = 0
     )
 
     private data class Evidence(
@@ -350,7 +352,7 @@ object AnalyticsEngine {
 
     private fun sigmoid(x: Double): Double = 1.0 / (1.0 + exp(-x.coerceIn(-8.0, 8.0)))
 
-    private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, horizon: Int = 8): Historical {
+    private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, series: SetupDetector.Series, tactical: SetupDetector.Setup?, horizon: Int = 8): Historical {
         val fallback = Historical(.5, 0, .45, .28, .15, .38, 1.0, 1.0, stopMult, 1.0, 0.0)
         if (c.size < 150) return fallback
         val end = c.lastIndex - 2
@@ -381,7 +383,10 @@ object AnalyticsEngine {
             mfe += localMfe; mae += localMae
         }
         if (loose.isEmpty()) return fallback
-        val used = if (strict.size >= 40) strict else loose
+        val regimeSet = if (strict.size >= 40) strict else loose
+        // The plan of a concrete event is judged on that event: every earlier time THIS instrument showed the same setup.
+        val events = if (tactical != null && tactical.direction == direction) SetupDetector.events(series, tactical.type, direction, c.size, horizon) else emptyList()
+        val used = if (events.size >= 20) events else regimeSet
         // The stop and the height of the targets are chosen on those situations, and every plan is measured as it is traded.
         val plan = ExitPlanner.choose(c, used, direction, stopMult, horizon)
         // Placebo: the same plan on a random walk with this instrument's volatility. Thin evidence is pulled towards THAT,
@@ -398,7 +403,7 @@ object AnalyticsEngine {
             smooth(plan.p1, nullPlan.p1, .45), used.size,
             smooth(plan.p1, nullPlan.p1, .45), smooth(plan.p2, nullPlan.p2, .28), smooth(plan.p3, nullPlan.p3, .15), smooth(plan.pStop, nullPlan.pStop, .38),
             mfe / loose.size, mae / loose.size,
-            plan.stopMult, plan.scale, plan.ev, nullPlan.ev, z
+            plan.stopMult, plan.scale, plan.ev, nullPlan.ev, z, if (used === events) events.size else 0
         )
     }
 
@@ -422,7 +427,7 @@ object AnalyticsEngine {
         return (trend * .30 + s.score * .38 + mom * .22 + osc * .10 + (ad - 20.0) / 100.0).coerceIn(-3.0, 3.0)
     }
 
-    private fun evidence(c: List<Candle>, reg: RegimeResult, s: Structure, l: Liquidity, lv: Levels, a: Double): Evidence {
+    private fun evidence(c: List<Candle>, reg: RegimeResult, s: Structure, l: Liquidity, lv: Levels, a: Double, tactical: SetupDetector.Setup? = null): Evidence {
         val x = closes(c); val p = x.last()
         val e20 = ema(x, 20) ?: p; val e50 = ema(x, 50) ?: p; val e200 = ema(x, 200)
         val r = rsi(x); val rs = rsiSlope(x); val mh = macdHistogram(x)
@@ -444,6 +449,8 @@ object AnalyticsEngine {
         if (reg.impulse > .65) both(if (x.last() >= x[x.lastIndex - 5]) .45 else -.45, "Импульс")
         if (reg.fatigue > .5) both(if (s.score > 0) -.55 else .55, "Истощение движения")
         if (l.sweep != 0.0) both(l.sweep * .85, "Снятие ликвидности")
+        // A concrete event is the most specific evidence there is: it gets its own, strong vote.
+        if (tactical != null) both(tactical.direction * min(1.0, tactical.strength * 1.1), "Сетап: " + SetupDetector.label(tactical.type, tactical.direction, true))
         // Four extra, independent pieces of evidence (each is its own group, so none of them can be counted twice).
         TechnicalSignals.candlePattern(c)?.let { both(it.value * .75, it.name) }
         TechnicalSignals.divergence(c)?.let { both(it.value * .85, it.name) }
@@ -541,7 +548,9 @@ object AnalyticsEngine {
         val ad = adx(c); val bb = bollinger(x)
         val s = structure(c); val liq = liquidity(c,a); val lv = levels(c)
         val reg = regime(c,s,a,ad,bb.second)
-        val ev = evidence(c,reg,s,liq,lv,a)
+        val setupSeries = SetupDetector.series(c)
+        val tactical = SetupDetector.detect(setupSeries, c.lastIndex)
+        val ev = evidence(c,reg,s,liq,lv,a,tactical)
         val setupType = setup(reg,s,liq,price,lv,a)
         val stopMult = when {
             reg.name.contains("RANGE") -> 1.05
@@ -549,7 +558,7 @@ object AnalyticsEngine {
             reg.name.contains("HIGH_VOLATILITY") -> 1.75
             else -> 1.25
         }
-        val longHist = historical(c,1,reg.name,stopMult); val shortHist = historical(c,-1,reg.name,stopMult)
+        val longHist = historical(c,1,reg.name,stopMult,setupSeries,tactical); val shortHist = historical(c,-1,reg.name,stopMult,setupSeries,tactical)
         val stability = stableScore(c,entryOverride)
         val longDirection = directionProbability(ev.long,longHist,reg.confidence,stability)
         val shortDirection = directionProbability(ev.short,shortHist,reg.confidence,stability)
@@ -596,16 +605,18 @@ object AnalyticsEngine {
         val calibrationQuality = ((min(longHist.sample,shortHist.sample) / 250.0).coerceIn(0.0,1.0)*.65 + reg.confidence*.35)
         val dataQuality = (55 + min(35, c.size/8) + if (c.all { it.close > 0 && it.high >= it.low }) 10 else 0).coerceIn(0,100)
         val directionOk = directionalGap >= .10 && entryQuality >= .35 && stability >= .35 && dataQuality >= 70
-        val gate = directionOk && evR >= .03 && reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION")
+        // A quiet or transitional market is no reason to stay out when a concrete event points the same way as the evidence.
+        val tacticalAligned = tactical != null && tactical.strength >= .55 && (tactical.direction > 0) == (dominant > 0)
+        val gate = directionOk && evR >= .03 && (tacticalAligned || reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION"))
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
         // A lean is NOT a signal: the direction is visible, but after costs the plan does not pay (or the market is squeezing).
         // The lean has softer entry conditions than a signal (it is only a direction, clearly labelled and never notified).
         val leanOk = directionalGap >= .06 && entryQuality >= .25 && stability >= .25 && dataQuality >= 60
-        val lean = if (signal == "NO TRADE" && leanOk && reg.name != "UNCERTAIN") (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
+        val lean = if (signal == "NO TRADE" && leanOk && (tacticalAligned || reg.name != "UNCERTAIN")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
         // The first thing that stands between the market and a signal, in the order the gate checks it.
         val why = when {
             signal != "NO TRADE" -> ""
-            reg.name == "UNCERTAIN" || reg.name == "TRANSITION" -> "REGIME"
+            (reg.name == "UNCERTAIN" || reg.name == "TRANSITION") && !tacticalAligned -> "REGIME"
             directionalGap < .10 -> "GAP"
             entryQuality < .35 -> "ENTRY"
             stability < .35 -> "STABILITY"
@@ -630,6 +641,8 @@ object AnalyticsEngine {
             add("План выхода: стоп %.2f ATR, цели ×%.1f от риска%s. Треть позиции на каждой цели, после TP1 стоп в безубыток, после TP2 на TP1.".format(Locale.US, hist.stopMult, hist.scale,
                 if (hist.scale >= 1.5) " (инструмент показывал продолжение движения, цели подняты)" else if (hist.scale < 0.95) " (движения в этом режиме короткие, цели снижены)" else ""))
             if (hist.sample >= ExitPlanner.MIN_SAMPLES) add("Проверка на случайность: план на истории %+.2fR, случайное блуждание с теми же целями %+.2fR, z = %.1f.".format(Locale.US, hist.planEv, hist.nullEv, hist.edgeZ))
+            if (tactical != null) add("Конкретное движение: ${SetupDetector.label(tactical.type, tactical.direction, true)} (сила ${(tactical.strength * 100).roundToInt()}%)." +
+                (if (hist.events > 0) " План построен по ${hist.events} таким же событиям на истории этого инструмента." else " Похожих событий на истории мало, статистика взята по рынкам с тем же режимом."))
             add("Итоговые шансы: TP1 %.0f%% / TP2 %.0f%% / TP3 %.0f%% / стоп первым %.0f%%; ожидание %+.2fR на сделку после издержек.".format(Locale.US,tp1p*100,tp2p*100,tp3p*100,slp*100,evR))
             if (ev.longReasons.isNotEmpty()) add("LONG: ${ev.longReasons.joinToString("; ")}.")
             if (ev.shortReasons.isNotEmpty()) add("SHORT: ${ev.shortReasons.joinToString("; ")}.")
@@ -648,7 +661,7 @@ object AnalyticsEngine {
             tp1p,tp2p,tp3p,slp,evR,hist.edge,abs(s.score),liq.score,srPenalty,entryQuality,entryZoneLow,entryZoneHigh,
             longScore,shortScore,reg.confidence,abs(s.score),conflict,reg.impulse,reg.acceleration,reg.fatigue,stability,hist.sample,calibrationQuality,setupType,
             reg.continuation,reg.reversal,ev.longReasons,ev.shortReasons,ev.risks
-        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct(), lean = lean, why = why, edgeZ = hist.edgeZ, nullEv = hist.nullEv, planEv = hist.planEv) }
+        ).let { f -> f.copy(detectedPatterns = listOfNotNull(setupType.takeIf { it != "NO_CLEAR_SETUP" }, reg.name).distinct(), lean = lean, why = why, tacticalType = tactical?.type.orEmpty(), tacticalDir = tactical?.direction ?: 0, tacticalStrength = tactical?.strength ?: 0.0, tacticalEvents = hist.events, edgeZ = hist.edgeZ, nullEv = hist.nullEv, planEv = hist.planEv) }
     }
 
     /** Walk-forward validation: every decision sees only the candles before it. */

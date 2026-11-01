@@ -142,3 +142,24 @@ internal fun whyLabel(code: String, ru: Boolean): String = when (code) {
     "EV" -> if (ru) "после издержек нет выгоды" else "no edge after costs"
     else -> if (ru) "прочее" else "other"
 }
+
+/** The concrete event the forecast rests on, and how much history stands behind it. */
+@Composable
+internal fun SetupCard(f: Forecast, ru: Boolean) {
+    if (f.tacticalType.isEmpty()) return
+    val tone = if (f.tacticalDir > 0) Positive else Negative
+    GradientCard(Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (ru) "Конкретное движение" else "Concrete move", fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.weight(1f))
+            Text((f.tacticalStrength * 100).toInt().toString() + "%", fontWeight = FontWeight.Black, fontSize = 18.sp, color = tone)
+        }
+        Text(SetupDetector.label(f.tacticalType, f.tacticalDir, ru), color = tone, fontWeight = FontWeight.Bold, fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
+        Text(
+            if (f.tacticalEvents > 0) (if (ru) "План и шансы посчитаны по ${f.tacticalEvents} таким же событиям на истории этого инструмента."
+            else "The plan and the odds are based on ${f.tacticalEvents} identical events in this instrument's history.")
+            else (if (ru) "Таких событий на истории мало: статистика взята по рынкам с тем же режимом, доверять ей меньше."
+            else "There are few such events in the history: the statistics come from markets in the same regime, trust them less."),
+            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)
+        )
+    }
+}

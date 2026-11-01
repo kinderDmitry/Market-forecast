@@ -96,7 +96,9 @@ internal data class ScanHit(
     val watch: Boolean = false,
     /** How far the plan beat a random walk (standard errors) and its expected result per trade in R. */
     val edgeZ: Double = 0.0,
-    val ev: Double = 0.0
+    val ev: Double = 0.0,
+    /** Concrete event behind the forecast (SetupDetector type), empty when there is none. */
+    val setupType: String = ""
 ) {
     /**
      * The best the engine can offer, nothing less: a real signal (not just a direction), reliability B or better, a plan that
@@ -174,7 +176,8 @@ internal object ScannerStore {
                     aligned = o.optString("aligned", ""),
                     watch = o.optBoolean("watch", false),
                     edgeZ = o.optDouble("edgeZ", 0.0),
-                    ev = o.optDouble("ev", 0.0)
+                    ev = o.optDouble("ev", 0.0),
+                    setupType = o.optString("setupType", "")
                 )
             )
         }
@@ -209,7 +212,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
-                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch); put("edgeZ", fin(h.edgeZ)); put("ev", fin(h.ev))
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch); put("edgeZ", fin(h.edgeZ)); put("ev", fin(h.ev)); put("setupType", h.setupType)
                 }
             )
         }
@@ -321,7 +324,8 @@ internal object ScanCore {
             stopProb = f.stopProbability,
             watch = watch,
             edgeZ = f.edgeZ,
-            ev = f.expectedValueR
+            ev = f.expectedValueR,
+            setupType = f.tacticalType
         )
         return Outcome(HIT, hit, last.time)
     }
@@ -558,15 +562,17 @@ internal class ScannerController(
 
     private suspend fun runScan(selected: ScanScope, h: ScanHorizon, favorites: Set<String>) {
         // 1. Catalogue. Whole-market scopes must see the COMPLETE catalogue, otherwise "full coverage" would be a lie.
-        if (ScanCore.needsFullCatalog(selected)) {
+        if (ScanCore.needsFullCatalog(selected) && repo.catalogSyncedAt() == 0L) {
+            // Only a device that has never had the full catalogue has to wait for it; otherwise the stored one is used at once
+            // and the background refresh (CatalogWorker) carries on without holding the scan back.
             if (CatalogStatus.syncing) {
-                message = tr("Дожидаюсь полной загрузки каталога БКС, чтобы охватить весь рынок…", "Waiting for the full BCS catalogue so the whole market is covered…")
+                message = tr("Каталог инструментов ещё загружается, сканер начнёт сразу после него…", "The instrument catalogue is still downloading; the scan starts right after it…")
                 var waited = 0
-                while (CatalogStatus.syncing && waited < 240_000) { delay(500); waited += 500 }
+                while (CatalogStatus.syncing && waited < 240_000) { delay(400); waited += 400 }
                 message = null
             }
-            if (repo.catalogSyncedAt() == 0L || repo.lastCatalogError != null) {
-                message = tr("Догружаю каталог БКС…", "Completing the BCS catalogue…")
+            if (repo.catalogSyncedAt() == 0L) {
+                message = tr("Загружаю каталог инструментов БКС…", "Downloading the BCS instrument catalogue…")
                 withContext(Dispatchers.IO) { runCatching { repo.syncCatalog() } }
                 message = null
             }
@@ -758,6 +764,5 @@ internal class ScannerController(
         private const val PARALLEL = 6
 
         /** Auto-start when the scanner opens only if the previous scan of that horizon is older than this. */
-        const val AUTO_START_AFTER_MS = 30L * 60_000L
     }
 }

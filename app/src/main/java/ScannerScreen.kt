@@ -431,11 +431,12 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, isTracked:
             Box(Modifier.fillMaxHeight().fillMaxWidth(remaining).clip(RoundedCornerShape(50)).background(timeColor))
         }
         val grade = ReliabilityEngine.gradeOf(h.reliability)
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Tag("🕒 ${h.horizon.label(ru)}", Accent)
             Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
             if (h.watch) Tag(if (ru) "Только направление" else "Direction only", Warning)
             if (h.isTop) Tag("★ ТОП", Positive)
+            if (h.setupType.isNotEmpty()) Tag(SetupDetector.label(h.setupType, if (h.signal == "LONG") 1 else -1, ru), Accent)
         }
         if (h.watch) {
             Text(
@@ -612,16 +613,6 @@ private fun durationText(ms: Long, ru: Boolean): String {
     }
 }
 
-private fun leftText(ms: Long, ru: Boolean): String {
-    val min = ms / 60_000L
-    return when {
-        ms <= 0L -> if (ru) "истёк" else "expired"
-        min < 1L -> if (ru) "меньше минуты" else "under a minute"
-        min < 60L -> if (ru) "ещё $min мин" else "$min min left"
-        min < 1440L -> if (ru) "ещё ${min / 60} ч ${min % 60} мин" else "${min / 60} h ${min % 60} min left"
-        else -> if (ru) "ещё ${min / 1440} д ${(min % 1440) / 60} ч" else "${min / 1440} d ${(min % 1440) / 60} h left"
-    }
-}
 
 /** What the last scan really covered, so "the whole market" is a number and not a promise. */
 @Composable

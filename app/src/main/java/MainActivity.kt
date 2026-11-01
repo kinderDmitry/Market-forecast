@@ -575,7 +575,7 @@ fun MarketForecastApp(ctx: Context) {
         else { notifications = true; prefs.edit().putBoolean("notifications_enabled", true).apply(); createNotificationChannel(ctx); if (!prefs.getBoolean("popup_prompt_done", false)) showPopupPermissionPrompt = true }
     }
     LaunchedEffect(Unit) { requestStartupNotifications() }
-    LaunchedEffect(tokenVersion) { ScanScheduler.apply(ctx.applicationContext, prefs) }
+    LaunchedEffect(tokenVersion) { ScanScheduler.apply(ctx.applicationContext, prefs); CatalogScheduler.apply(ctx.applicationContext, prefs) }
 
     val scheme = darkColorScheme(
         primary = Accent,
@@ -951,7 +951,6 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
     }
 }
 
-@Composable private fun MarketPickCard(x: MarketPick, ru:Boolean, onOpen:()->Unit) { GradientCard(Modifier.width(190.dp).tapCard(onClick=onOpen)) { Text(x.name.ifBlank{x.symbol},fontWeight=FontWeight.Black,fontSize=12.sp); Text(x.symbol.removeSuffix(".ME"),fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant); Text(fmt(x.price),fontSize=18.sp,fontWeight=FontWeight.Black,color=Accent,modifier=Modifier.padding(top=4.dp)); Text(String.format(Locale.US, "%+.2f%%", x.changePct), color = if (x.changePct >= 0) Positive else Negative, fontSize = 11.sp, fontWeight = FontWeight.Bold); Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){SignalPill(x.signal,signalColor(x.signal));Text("${x.confidence}%",color=Accent,fontWeight=FontWeight.Black,fontSize=12.sp)} } }
 @Composable private fun IndexCard(x: MarketIndex) {
     val up = x.changePct >= 0
     GradientCard(Modifier.width(150.dp)) {
@@ -1012,7 +1011,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 else -> {
                     if (f.signal == "NO TRADE") item { LeanCard(f, ru) }
                     item { Button({ track() }, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(17.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(8.dp)); Text(if (ru) "Отслеживать прогноз" else "Track forecast", fontWeight = FontWeight.Black) } }
-                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru, fxPairLabel(state.symbol) != null) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { EdgeCard(f, ru) }; item { TradePlanCard(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
+                    item { ConfluenceCard(tf, f, tfForecasts, ru) }; item { ReliabilityCard(f, state.candles, ru, fxPairLabel(state.symbol) != null) }; item { Levels(f, ru, prefs, state.meta.currency) }; item { SetupCard(f, ru) }; item { EdgeCard(f, ru) }; item { TradePlanCard(f, ru) }; item { MaxIntelligenceCard(f, ru) }; item { Scenario(f, ru) }; item { RiskCard(f, ru, prefs) }; item { ProfitPreview(f, ru) }; item { Explanation(f, ru) }; item { DataQuality(f, ru) }; item { IndicatorCoverage(f, ru) }; item { TrackedForSymbol(tracked, state.symbol, ru) }
                 }
             }
         } else item { ErrorCard(state.error ?: "Нет данных", ru) }
@@ -1116,7 +1115,6 @@ private fun regimeRu(regime: String): String = when (regime) {
 
 @Composable private fun Explanation(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Почему такой прогноз" else "Why this forecast", if (ru) "EMA • RSI • MACD • ATR • ADX • Стохастик • Объём • Структура • Таймфреймы" else "EMA • RSI • MACD • ATR • ADX • Stochastic • Volume • Structure • MTF"); f.explanation.forEach { Text("• $it", fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)) } } }
 @Composable private fun DataQuality(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { Text(if (ru) "Качество данных" else "Data quality", fontWeight = FontWeight.Black); LinearProgressIndicator(progress = { f.dataQuality / 100f }, modifier = Modifier.fillMaxWidth().padding(top = 9.dp), color = Positive); Text("${f.dataQuality}/100", fontWeight = FontWeight.Black, color = Positive, modifier = Modifier.padding(top = 5.dp)) } }
-@Composable private fun AccuracyCard(c: List<Candle>, ru: Boolean) { var r by remember(c) { mutableStateOf<Pair<Int, Int>?>(null) }; LaunchedEffect(c) { r = withContext(Dispatchers.Default) { AnalyticsEngine.backtest(c) } }; GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Backtest" else "Backtest", if (ru) "Только на доступной фактической истории" else "Only on available market history"); r?.let { Text(if (it.second == 0) "—" else "${it.first * 100 / it.second}%", fontSize = 28.sp, fontWeight = FontWeight.Black, color = Accent); Text("${it.first} / ${it.second}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } } }
 @Composable private fun IndicatorCoverage(f: Forecast, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Состав модели" else "Model coverage", if (ru) "Ансамбль + адаптивные веса" else "Ensemble + adaptive weights"); Text("EMA 20/50/200 • RSI и его наклон • дивергенции RSI • MACD • ATR • ADX/DMI (режим рынка) • Stochastic • Bollinger • VWAP • объём и давление свечи • денежный поток CMF • Supertrend • свечные паттерны • структура HH/HL/BOS • уровни • снятие ликвидности • многотаймфреймное согласование • walk-forward статистика", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant);
         Text("${if (ru) "Адаптивный режим" else "Adaptive regime"}: ${f.regime} • Edge ${String.format(Locale.US, "%.0f", f.historicalEdge * 100)}% • Gap ${String.format(Locale.US, "%.1f", f.edgeGap * 100)} п.п. • Confirm ${f.confirmation}/5", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (f.highConviction) Positive else Warning, modifier = Modifier.padding(top = 5.dp)) } }
 @Composable private fun NewsPreview(news: List<NewsItem>, ru: Boolean) { GradientCard(Modifier.fillMaxWidth()) { SectionHeader(if (ru) "Новости инструмента" else "Instrument news", ""); news.take(5).forEach { NewsRow(it) } } }
