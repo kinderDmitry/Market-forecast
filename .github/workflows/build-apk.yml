@@ -94,9 +94,11 @@ jobs:
           test -f app/src/main/java/AnalyticsEngine.kt
           test -f app/src/main/java/Models.kt
           test -f app/src/main/AndroidManifest.xml
-          grep -q 'longScore' app/src/main/java/Models.kt
-          grep -q 'shortScore' app/src/main/java/Models.kt
-          grep -q 'sampleSize' app/src/main/java/Models.kt
+          # Direction scores are calculated by AnalyticsEngine; the reliability
+          # sample count is exposed by Forecast and consumed by the UI.
+          grep -q 'longScore' app/src/main/java/AnalyticsEngine.kt
+          grep -q 'shortScore' app/src/main/java/AnalyticsEngine.kt
+          grep -q 'sampleSize' app/src/main/java/MainActivity.kt
           grep -q 'fun backtest' app/src/main/java/AnalyticsEngine.kt
           test -f app/src/main/java/MarketScanner.kt
           test -f app/src/main/java/ScannerScreen.kt
