@@ -21,6 +21,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
             prefs = p,
             context = applicationContext
         )
+        runCatching { PriceAlertEngine.check(applicationContext, p, { repo.quote(it) }, ru) }
         val tracked = readTracked(p).toMutableList()
         val history = readHistory(p).toMutableList()
         val trackedOriginal = tracked.toList()

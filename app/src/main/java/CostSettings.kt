@@ -29,6 +29,7 @@ internal fun CostSettings(ru: Boolean, prefs: SharedPreferences) {
     var stock by remember { mutableFloatStateOf(prefs.getFloat("cost_stock_pct", 0.08f)) }
     var fx by remember { mutableFloatStateOf(prefs.getFloat("cost_fx_pct", 0.04f)) }
     var style by remember { mutableIntStateOf(prefs.getInt("plan_style", 1)) }
+    var sensitivity by remember { mutableIntStateOf(prefs.getInt("scan_sensitivity", 2)) }
     GradientCard(Modifier.fillMaxWidth()) {
         SectionHeader(
             if (ru) "Издержки сделки" else "Trading costs",
@@ -70,6 +71,24 @@ internal fun CostSettings(ru: Boolean, prefs: SharedPreferences) {
         Text(
             if (ru) "«Надёжнее» ставит первую цель ближе: она достигается заметно чаще (на моделируемых рынках около 54% прибыльных сделок против 46% при «Балансе»), но каждая победа меньше, и среднее ожидание ниже. «Прибыльнее» наоборот. Повысить шанс бесплатно нельзя: за каждый процент вероятности платит размер результата."
             else "\"Safer\" puts the first target closer: it is reached noticeably more often (on simulated markets about 54% winning trades against 46% for \"Balanced\"), but each win is smaller and the average expectation is lower. \"More profit\" is the opposite. A higher chance is never free: every point of probability is paid for with the size of the result.",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
+        )
+        Text(
+            if (ru) "Чувствительность сканера" else "Scanner sensitivity",
+            fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp)
+        )
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(0 to (if (ru) "Строго" else "Strict"), 1 to (if (ru) "Обычно" else "Normal"), 2 to (if (ru) "Высокая" else "High")).forEach { (value, label) ->
+                FilterChip(
+                    selected = sensitivity == value,
+                    onClick = { sensitivity = value; prefs.edit().putInt("scan_sensitivity", value).apply(); CostModel.load(prefs) },
+                    label = { Text(label, fontSize = 12.sp) }
+                )
+            }
+        }
+        Text(
+            if (ru) "Чем выше чувствительность, тем легче условия сигнала (перевес направления, качество входа, порог ожидания, пороги конкретных движений), и тем больше прогнозов на коротких сроках. Часть из них будет слабее: смотрите надёжность и пометку «Только направление»."
+            else "The higher the sensitivity, the easier the signal conditions (direction edge, entry quality, expectation bar, thresholds of the concrete moves), and the more forecasts on short horizons. Some of them will be weaker: look at the reliability and the \"Direction only\" label.",
             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
         )
         Text(

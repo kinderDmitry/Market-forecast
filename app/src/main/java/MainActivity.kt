@@ -1,5 +1,6 @@
 package com.marketforecast.prox
 
+import androidx.activity.compose.BackHandler
 import android.Manifest
 import android.content.Context
 import android.graphics.Paint
@@ -354,6 +355,15 @@ fun MarketForecastApp(ctx: Context) {
             }
         }
     }
+    // Back goes to the home screen first; only from there it leaves the app.
+    BackHandler(enabled = screen != Screen.HOME) { screen = if (screen == Screen.NEWS_DETAIL) Screen.NEWS else Screen.HOME }
+    // Price alerts are checked while the app is open too (the background monitor and the periodic worker do it when it is closed).
+    LaunchedEffect(repo) {
+        while (true) {
+            if (PriceAlertStore.hasActive(prefs)) withContext(Dispatchers.IO) { runCatching { PriceAlertEngine.check(ctx.applicationContext, prefs, { repo.quote(it) }, ru) } }
+            delay(20_000L)
+        }
+    }
     // A notification tapped while the app is open: go straight to the right screen.
     val routed = NotificationRoute.pending
     LaunchedEffect(routed) {
@@ -436,7 +446,11 @@ fun MarketForecastApp(ctx: Context) {
         lifecycle?.addObserver(observer)
         onDispose { lifecycle?.removeObserver(observer) }
     }
-    SideEffect { scanner.ru = ru; scanner.isForeground = { inForeground } }
+    SideEffect {
+        scanner.ru = ru
+        scanner.isForeground = { inForeground }
+        RefreshSettings.intervalMs = if (refreshUnit == "SEC") refreshValue * 1000L else refreshValue * 60_000L
+    }
     // One foreground refresh clock is the source of truth. Fast live work (quote/tracking)
     // is deliberately executed before slower news/market-ranking feeds so a slow source can
     // never make the chart appear frozen. Tracking candles are cached; every tick refreshes
@@ -780,10 +794,11 @@ data class FavoriteTfResult(val forecast: Forecast?, val candles: List<Candle>)
 @Composable
 private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepository, onOpen: (String) -> Unit) {
     val tfs = listOf("15M", "1H", "4H", "1D", "1W")
-    var price by remember(symbol) { mutableStateOf(0.0) }
-    var results by remember(symbol) { mutableStateOf<Map<String, FavoriteTfResult>>(emptyMap()) }
-    var loading by remember(symbol) { mutableStateOf(true) }
-    var updatedAt by remember(symbol) { mutableLongStateOf(0L) }
+    val cachedSnap = remember(symbol) { FavoriteCache.get(symbol) }
+    var price by remember(symbol) { mutableStateOf(cachedSnap?.price ?: 0.0) }
+    var results by remember(symbol) { mutableStateOf<Map<String, FavoriteTfResult>>(cachedSnap?.results ?: emptyMap()) }
+    var loading by remember(symbol) { mutableStateOf(cachedSnap == null) }
+    var updatedAt by remember(symbol) { mutableLongStateOf(cachedSnap?.at ?: 0L) }
     var loadError by remember(symbol) { mutableStateOf<String?>(null) }
 
     suspend fun refreshAnalysis() {
@@ -809,30 +824,23 @@ private fun FavoriteAnalyticsCard(symbol: String, ru: Boolean, repo: MarketRepos
         price = quote?.takeIf { it.isFinite() && it > 0.0 } ?: computed.lastOrNull()?.second?.candles?.lastOrNull()?.close ?: price
         updatedAt = now
         loading = false
+        if (results.values.any { it.forecast != null }) FavoriteCache.put(symbol, FavoriteSnapshot(price, results, now))
     }
+    // One refresh per interval chosen in Settings and nothing in between. The last result lives in a process-wide cache, so
+    // scrolling the card out of sight and back (or leaving the screen and returning) does not trigger a reload.
     LaunchedEffect(symbol) {
-        refreshAnalysis()
-        // Nothing came back (rate limit, network hiccup): retry quickly instead of waiting a whole minute.
-        var attempt = 0
-        while (attempt < 3 && results.values.none { it.forecast != null }) {
-            delay(8_000L * (attempt + 1))
+        val interval = RefreshSettings.intervalMs.coerceAtLeast(10_000L)
+        if (cachedSnap == null || System.currentTimeMillis() - updatedAt >= interval) {
             refreshAnalysis()
-            attempt++
-        }
-    }
-    LaunchedEffect(symbol) {
-        while (true) {
-            delay(10_000)
-            val live = withContext(Dispatchers.IO) { runCatching { repo.quote(symbol) }.getOrNull() }
-            if (live != null && live > 0.0) {
-                price = live
-                updatedAt = System.currentTimeMillis()
+            var attempt = 0
+            while (attempt < 3 && results.values.none { it.forecast != null }) {
+                delay(8_000L * (attempt + 1))
+                refreshAnalysis()
+                attempt += 1
             }
         }
-    }
-    LaunchedEffect(symbol) {
         while (true) {
-            delay(60_000)
+            delay((RefreshSettings.intervalMs.coerceAtLeast(10_000L) - (System.currentTimeMillis() - updatedAt)).coerceAtLeast(1_000L))
             refreshAnalysis()
         }
     }
@@ -1002,7 +1010,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 FilterChip(selected = tf == timeframe, onClick = { onTf(timeframe) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = tc.copy(alpha = .18f), selectedLabelColor = tc, containerColor = Color.Transparent, labelColor = tc.copy(alpha = .82f), disabledContainerColor = Color.Transparent), label = { Text(label, fontSize = 11.sp, fontWeight = FontWeight.Black) })
             }
         } }
-        item { PriceChartCard(state.candles, state.forecast, tf, ru, state.loading, state.error, refresh) }
+        item { PriceChartCard(state.candles, state.forecast, tf, ru, state.loading, state.error, refresh) }; item { PriceAlertCard(state.symbol, state.meta.shortName, state.livePrice, state.forecast, ru, prefs) }
         if (state.loading) item { Loading(ru) } else if (state.forecast != null) {
             val f = state.forecast
             when (tab) {
@@ -1574,7 +1582,7 @@ private fun historyPnl(h: HistoryEntry): HistoryPnl? {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp),contentPadding=PaddingValues(top=12.dp,bottom=30.dp)){
         item{Column{Text(if(ru)"Настройки" else "Settings",fontSize=28.sp,fontWeight=FontWeight.Black,color=MaterialTheme.colorScheme.onSurface,style=LocalTextStyle.current.copy(shadow=Shadow(Accent.copy(alpha=.68f),blurRadius=10f)));Text(if(ru)"Управление рынком, обновлением, уведомлениями и внешним видом" else "Market, refresh, notifications and appearance",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=3.dp))}}
         item{SettingGroup(if(ru)"Основные" else "General"){SettingCard(Icons.Default.Language,if(ru)"Язык" else "Language",if(ru)"Русский" else "English",toggleLang);AlertToggle(if(ru)"Анимации интерфейса" else "Interface animations",UiPrefs.animations){UiPrefs.animations=it;prefs.edit().putBoolean("ui_animations",it).apply()};AlertToggle(if(ru)"Логотипы компаний (из интернета)" else "Company logos (from the internet)",UiPrefs.logos){UiPrefs.logos=it;prefs.edit().putBoolean("ui_logos",it).apply()};LogoDiagnosticsRow(ru)}}
-        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)};item{CostSettings(ru,prefs)}
+        item{BcsConnectionSettings(ru,prefs,repo,onTokenSaved)};item{BackgroundScannerSettings(ru,prefs)};item{CostSettings(ru,prefs)};item{PriceAlertsSettings(ru,prefs)}
         item{SettingGroup(if(ru)"Валюта отображения" else "Display currency"){Text(if(ru)"Все денежные значения и прибыль/убыток показываются в выбранной валюте. Конвертация выполняется по актуальным FX-котировкам БКС." else "All monetary values and P/L are shown in the selected currency using live BCS FX rates.",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Row(Modifier.horizontalScroll(rememberScrollState()).padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){CurrencyDisplay.supported.forEach{c->FilterChip(selected=displayCurrency==c,onClick={setDisplayCurrency(c)},label={Text("${CurrencyDisplay.symbol(c)} $c",fontSize=11.sp)})}};Text(if(ru)"Текущая: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency" else "Selected: ${CurrencyDisplay.symbol(displayCurrency)} $displayCurrency",fontSize=12.sp,fontWeight=FontWeight.Bold,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{GradientCard(Modifier.fillMaxWidth()){Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Speed,null,tint=Accent);Column(Modifier.weight(1f).padding(start=11.dp)){Text(if(ru)"Обновление данных" else "Data refresh",fontWeight=FontWeight.Black);Text(if(ru)"Единый интервал для открытых разделов" else "One interval for open sections",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}};Spacer(Modifier.height(10.dp));Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(refreshValue.toString(),{setRefreshValue(it.filter(Char::isDigit).toIntOrNull()?.coerceAtLeast(1)?:refreshValue)},Modifier.weight(1f),singleLine=true,label={Text(if(ru)"Интервал" else "Interval")});Spacer(Modifier.width(8.dp));FilterChip(selected=refreshUnit=="SEC",onClick={setRefreshUnit("SEC")},label={Text(if(ru)"сек" else "sec")});Spacer(Modifier.width(4.dp));FilterChip(selected=refreshUnit=="MIN",onClick={setRefreshUnit("MIN")},label={Text(if(ru)"мин" else "min")})};Spacer(Modifier.height(7.dp));Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){listOf(1,5,10,30,60).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="SEC",onClick={setRefreshValue(v);setRefreshUnit("SEC")},label={Text("${v}с",fontSize=11.sp)})};listOf(1,5,15,30).forEach{v->FilterChip(selected=refreshValue==v&&refreshUnit=="MIN",onClick={setRefreshValue(v);setRefreshUnit("MIN")},label={Text("${v}м",fontSize=11.sp)})}};Text(if(ru)"Активно: каждые ${refreshValue}${if(refreshUnit=="SEC")" сек" else " мин"}. График, текущая цена, прогноз и отслеживание используют этот же цикл." else "Active: every ${refreshValue}${if(refreshUnit=="SEC")" sec" else " min"}. Live price, forecast and tracking use the same cycle.",fontSize=11.sp,color=Accent,modifier=Modifier.padding(top=7.dp))}}
         item{SettingGroup(if(ru)"Уведомления" else "Notifications"){AlertToggle(if(ru)"Разрешить уведомления" else "Allow notifications",notifications){toggleNotif(it)};Spacer(Modifier.height(5.dp));AlertToggle(if(ru)"Новая новость" else "New news",alertNews){alertNews=it;prefs.edit().putBoolean("alert_news",it).apply()};AlertToggle(if(ru)"Новый дивиденд" else "New dividend",alertDividends){alertDividends=it;prefs.edit().putBoolean("alert_dividends",it).apply()};AlertToggle(if(ru)"Новый/изменившийся сигнал" else "New/changed signal",alertSignal){alertSignal=it;prefs.edit().putBoolean("alert_signal",it).apply()};AlertToggle("TP1",alertTp1){alertTp1=it;prefs.edit().putBoolean("alert_tp1",it).apply()};AlertToggle("TP2",alertTp2){alertTp2=it;prefs.edit().putBoolean("alert_tp2",it).apply()};AlertToggle("TP3",alertTp3){alertTp3=it;prefs.edit().putBoolean("alert_tp3",it).apply()};AlertToggle("Stop Loss",alertSl){alertSl=it;prefs.edit().putBoolean("alert_sl",it).apply()};AlertToggle(if(ru)"Результат прогноза" else "Forecast result",alertResult){alertResult=it;prefs.edit().putBoolean("alert_result",it).apply()};AlertToggle(if(ru)"Резкое изменение цены" else "Large price move",alertPrice){alertPrice=it;prefs.edit().putBoolean("alert_price",it).apply()};Spacer(Modifier.height(8.dp));OutlinedButton(onClick={val i=Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS).apply{putExtra(AndroidSettings.EXTRA_APP_PACKAGE,ctx.packageName)};ctx.startActivity(i)},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Notifications,null);Spacer(Modifier.width(6.dp));Text(if(ru)"Открыть системные настройки уведомлений" else "Open system notification settings")}}}
@@ -1690,3 +1698,18 @@ private fun sendTrackedNotification(ctx: Context, text: String) {
     NotificationHelper.notifyTracking(ctx, "legacy|${text.hashCode()}", true, "Market Forecast", text)
 }
 private fun sendTestNotification(ctx:Context,ru:Boolean){ NotificationHelper.sendTest(ctx, ru) }
+
+
+/** The refresh interval chosen in Settings, readable from any card. */
+internal object RefreshSettings {
+    @Volatile var intervalMs: Long = 60_000L
+}
+
+private class FavoriteSnapshot(val price: Double, val results: Map<String, FavoriteTfResult>, val at: Long)
+
+/** Last analysis of every favourite, kept for the whole life of the process (not of the card on screen). */
+private object FavoriteCache {
+    private val map = java.util.concurrent.ConcurrentHashMap<String, FavoriteSnapshot>()
+    fun get(symbol: String): FavoriteSnapshot? = map[symbol.uppercase(java.util.Locale.US)]
+    fun put(symbol: String, snapshot: FavoriteSnapshot) { map[symbol.uppercase(java.util.Locale.US)] = snapshot }
+}

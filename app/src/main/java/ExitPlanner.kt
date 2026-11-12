@@ -33,6 +33,9 @@ internal object ExitPlanner {
 
     /** 0 safer (more trades reach the first target), 1 balanced (best expected result), 2 more profit per winning trade. */
     @Volatile var style: Int = 1
+
+    /** How readily the scanner turns what it sees into a forecast: 0 strict, 1 normal, 2 high (the default). */
+    @Volatile var sensitivity: Int = 2
     private const val SHRINK = 15.0
     private const val MARGIN = 0.02
 
@@ -277,5 +280,7 @@ internal object CostModel {
         stock = (prefs.getFloat("cost_stock_pct", 0.08f) / 100.0).coerceIn(0.0001, 0.01)
         fx = (prefs.getFloat("cost_fx_pct", 0.04f) / 100.0).coerceIn(0.0001, 0.01)
         ExitPlanner.style = prefs.getInt("plan_style", 1).coerceIn(0, 2)
+        ExitPlanner.sensitivity = prefs.getInt("scan_sensitivity", 2).coerceIn(0, 2)
+        SetupDetector.relax = when (ExitPlanner.sensitivity) { 0 -> 0.9; 2 -> 1.2; else -> 1.0 }
     }
 }

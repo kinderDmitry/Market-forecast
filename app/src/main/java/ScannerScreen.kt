@@ -266,6 +266,8 @@ internal fun ScannerScreen(
             }
         }
 
+        item { MonitorControl(ru) }
+
         c.coverage?.takeIf { !c.running }?.let { cov ->
             item { CoverageCard(cov, c.horizon, ru) }
         }

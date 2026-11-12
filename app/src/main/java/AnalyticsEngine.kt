@@ -490,7 +490,7 @@ object AnalyticsEngine {
         var h = 17L
         val points = intArrayOf(0, c.size / 3, c.size * 2 / 3, c.lastIndex).distinct().filter { it in c.indices }
         for (i in points) { val x = c[i]; h = h * 31 + x.time; h = h * 31 + java.lang.Double.doubleToLongBits(x.close) }
-        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}:${ExitPlanner.style}"
+        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}:${ExitPlanner.style}:${ExitPlanner.sensitivity}"
     }
 
     /** Analyze one timeframe. All probabilities are empirical/model estimates, never guarantees. */
@@ -604,24 +604,29 @@ object AnalyticsEngine {
         val srPenalty = if (dominant > 0) (1.0 / (1.0 + nearResistance)).coerceIn(0.0,1.0)*2.8 else (1.0/(1.0+nearSupport)).coerceIn(0.0,1.0)*2.8
         val calibrationQuality = ((min(longHist.sample,shortHist.sample) / 250.0).coerceIn(0.0,1.0)*.65 + reg.confidence*.35)
         val dataQuality = (55 + min(35, c.size/8) + if (c.all { it.close > 0 && it.high >= it.low }) 10 else 0).coerceIn(0,100)
-        val directionOk = directionalGap >= .10 && entryQuality >= .35 && stability >= .35 && dataQuality >= 70
+        val sens = ExitPlanner.sensitivity
+        val gapBar = when (sens) { 0 -> .12; 1 -> .10; else -> .07 }
+        val entryBar = when (sens) { 0 -> .40; 1 -> .35; else -> .28 }
+        val evBar = when (sens) { 0 -> .05; 1 -> .03; else -> .0 }
+        val tacticalBar = when (sens) { 0 -> .65; 1 -> .55; else -> .45 }
+        val directionOk = directionalGap >= gapBar && entryQuality >= entryBar && stability >= entryBar && dataQuality >= 70
         // A quiet or transitional market is no reason to stay out when a concrete event points the same way as the evidence.
-        val tacticalAligned = tactical != null && tactical.strength >= .55 && (tactical.direction > 0) == (dominant > 0)
-        val gate = directionOk && evR >= .03 && (tacticalAligned || reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION"))
+        val tacticalAligned = tactical != null && tactical.strength >= tacticalBar && (tactical.direction > 0) == (dominant > 0)
+        val gate = directionOk && evR >= evBar && (tacticalAligned || reg.name !in setOf("UNCERTAIN", "TRANSITION", "COMPRESSION"))
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
         // A lean is NOT a signal: the direction is visible, but after costs the plan does not pay (or the market is squeezing).
         // The lean has softer entry conditions than a signal (it is only a direction, clearly labelled and never notified).
-        val leanOk = directionalGap >= .06 && entryQuality >= .25 && stability >= .25 && dataQuality >= 60
+        val leanOk = directionalGap >= gapBar * .6 && entryQuality >= entryBar * .7 && stability >= entryBar * .7 && dataQuality >= 60
         val lean = if (signal == "NO TRADE" && leanOk && (tacticalAligned || reg.name != "UNCERTAIN")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
         // The first thing that stands between the market and a signal, in the order the gate checks it.
         val why = when {
             signal != "NO TRADE" -> ""
             (reg.name == "UNCERTAIN" || reg.name == "TRANSITION") && !tacticalAligned -> "REGIME"
-            directionalGap < .10 -> "GAP"
-            entryQuality < .35 -> "ENTRY"
-            stability < .35 -> "STABILITY"
+            directionalGap < gapBar -> "GAP"
+            entryQuality < entryBar -> "ENTRY"
+            stability < entryBar -> "STABILITY"
             dataQuality < 70 -> "DATA"
-            evR < .03 -> "EV"
+            evR < evBar -> "EV"
             else -> "COMPRESSION"
         }
         val confidence = ((40 + directionalGap*65 + reg.confidence*22 + stability*10 + calibrationQuality*8 - conflict*18 - srPenalty*2).coerceIn(0.0,100.0)).roundToInt()

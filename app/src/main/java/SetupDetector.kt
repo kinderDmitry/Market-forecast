@@ -20,6 +20,9 @@ internal object SetupDetector {
 
     class Setup(val type: String, val direction: Int, val strength: Double)
 
+    /** 1.0 = the tested thresholds; above 1 every threshold is a bit easier to meet (higher scanner sensitivity). */
+    @Volatile var relax: Double = 1.0
+
     class Series(
         val open: DoubleArray, val high: DoubleArray, val low: DoubleArray, val close: DoubleArray, val volume: DoubleArray,
         val atr: DoubleArray, val ema20: DoubleArray, val ema50: DoubleArray, val rsi: DoubleArray,
@@ -146,14 +149,15 @@ internal object SetupDetector {
         }
 
         // 1. Squeeze released: the bands were narrow for several candles and a strong candle closes outside them.
+        val k = relax
         var narrow = true
-        for (j in i - 5 until i) if (s.widthPct[j] > 0.30) narrow = false
-        if (narrow && range >= 1.3 * a) {
+        for (j in i - 5 until i) if (s.widthPct[j] > 0.30 * k) narrow = false
+        if (narrow && range >= 1.3 * a / k) {
             if (c > s.bbUpper[i - 1]) offer(SQUEEZE, 1, min(1.0, 0.5 + 0.2 * max(0.0, volRatio - 1.0) + 0.3 * max(0.0, closeHigh - 0.6) / 0.4))
             if (c < s.bbLower[i - 1]) offer(SQUEEZE, -1, min(1.0, 0.5 + 0.2 * max(0.0, volRatio - 1.0) + 0.3 * max(0.0, closeLow - 0.6) / 0.4))
         }
         // 2. Range breakout: a close beyond the 20-candle high / low on a wide candle, before a trend was in place.
-        if (s.efficiency[i - 1] < 0.5 && range >= 1.0 * a && (volRatio >= 1.2 || volumeUnknown)) {
+        if (s.efficiency[i - 1] < 0.5 && range >= 1.0 * a / k && (volRatio >= 1.2 / k || volumeUnknown)) {
             if (c > s.donchHigh[i]) offer(BREAKOUT, 1, min(0.95, 0.5 + 0.15 * max(0.0, volRatio - 1.2) + 0.25 * closeHigh))
             if (c < s.donchLow[i]) offer(BREAKOUT, -1, min(0.95, 0.5 + 0.15 * max(0.0, volRatio - 1.2) + 0.25 * closeLow))
         }
@@ -161,9 +165,9 @@ internal object SetupDetector {
         if (s.efficiency[i] < 0.30) {
             val lowerWick = (min(o, c) - l) / range
             val upperWick = (h - max(o, c)) / range
-            if (l <= s.bbLower[i] && c > s.bbLower[i] && s.rsi[i] < 40.0 && lowerWick >= 0.4)
+            if (l <= s.bbLower[i] && c > s.bbLower[i] && s.rsi[i] < 40.0 + (k - 1.0) * 25.0 && lowerWick >= 0.4 / k)
                 offer(REVERSION, 1, min(0.9, 0.5 + 0.3 * lowerWick + 0.2 * (40.0 - s.rsi[i]) / 20.0))
-            if (h >= s.bbUpper[i] && c < s.bbUpper[i] && s.rsi[i] > 60.0 && upperWick >= 0.4)
+            if (h >= s.bbUpper[i] && c < s.bbUpper[i] && s.rsi[i] > 60.0 - (k - 1.0) * 25.0 && upperWick >= 0.4 / k)
                 offer(REVERSION, -1, min(0.9, 0.5 + 0.3 * upperWick + 0.2 * (s.rsi[i] - 60.0) / 20.0))
         }
         // 4. Pullback to the 20 average inside a trend, confirmed by a close beyond the previous candle.
@@ -177,7 +181,7 @@ internal object SetupDetector {
         }
         // 5. Momentum candle: a big body that closes at its extreme, with volume.
         val body = abs(c - o)
-        if (body >= 1.4 * a && (volRatio >= 1.3 || volumeUnknown)) {
+        if (body >= 1.4 * a / k && (volRatio >= 1.3 / k || volumeUnknown)) {
             if (c > o && closeHigh >= 0.75) offer(BURST, 1, min(0.85, 0.5 + 0.15 * (body / a - 1.4) + 0.1 * max(0.0, volRatio - 1.3)))
             if (c < o && closeLow >= 0.75) offer(BURST, -1, min(0.85, 0.5 + 0.15 * (body / a - 1.4) + 0.1 * max(0.0, volRatio - 1.3)))
         }
