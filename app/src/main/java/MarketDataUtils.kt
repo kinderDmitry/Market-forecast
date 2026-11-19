@@ -13,7 +13,7 @@ internal fun mergeRealtimeCandle(raw: List<Candle>, live: Double, timeframe: Str
         "15M" -> 15L * 60_000L
         "1H" -> 60L * 60_000L
         "4H" -> 4L * 60L * 60_000L
-        "1W" -> 7L * 24L * 60L * 60_000L
+        "1W" -> 7L * 24L * 60L * 60_000L; "1M" -> 30L * 24L * 60L * 60_000L; "1Y" -> 365L * 24L * 60L * 60_000L
         else -> 24L * 60L * 60_000L
     }
     val bucket = (now / step) * step

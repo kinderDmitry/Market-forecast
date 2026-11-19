@@ -210,7 +210,7 @@ class MarketMonitorWorker(appContext: Context, params: WorkerParameters) : Corou
         "15M" -> "60d" to "15m"
         "1H" -> "2y" to "1h"
         "4H" -> "2y" to "4h"
-        "1W" -> "10y" to "1wk"
+        "1W" -> "10y" to "1wk"; "1M" -> "40y" to "1mo"; "1Y" -> "40y" to "1y"
         else -> "5y" to "1d"
     }
 

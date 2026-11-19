@@ -44,7 +44,7 @@ import java.util.concurrent.TimeUnit
 internal object ScanNotify {
     fun post(context: Context, h: ScanHorizon, fresh: List<ScanHit>, ru: Boolean, minConf: Int) {
         val good = fresh
-            .filter { it.confidence >= minConf && !it.watch }
+            .filter { it.confidence >= minConf && !it.watch && !it.closed }
             .sortedWith(compareByDescending<ScanHit> { it.reliability }.thenByDescending { it.confidence })
         if (good.isEmpty()) return
         val top = good.take(3).joinToString("  •  ") {
@@ -73,6 +73,7 @@ internal object ScanScheduler {
         ScanHorizon.H4 -> 60L
         ScanHorizon.D1 -> 180L
         ScanHorizon.W1 -> 720L
+        ScanHorizon.MN1 -> 1440L
     }
 
     fun horizonOf(prefs: SharedPreferences): ScanHorizon =

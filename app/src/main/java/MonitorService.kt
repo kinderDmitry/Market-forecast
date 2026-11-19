@@ -273,7 +273,7 @@ class MonitorService : Service() {
         val scanned = outcomes.filter { it.second.status != ScanCore.FAILED }.map { it.first.symbol }.toSet()
         val hits = outcomes.mapNotNull { it.second.hit }
         withContext(Dispatchers.IO) { ScannerStore.saveRun(applicationContext, tf, scanScope.name, now, scanned, hits, markFinished = true) }
-        val fresh = hits.filter { it.isNew && !it.watch }
+        val fresh = hits.filter { it.isNew && !it.watch && !it.closed }
         if (baseline && fresh.isNotEmpty() && p.getBoolean("alert_signal", true)) {
             ScanNotify.post(applicationContext, horizon, fresh, ru, p.getInt("alert_min_confidence", 60).coerceIn(0, 100))
         }

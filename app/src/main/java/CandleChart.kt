@@ -146,7 +146,7 @@ private fun CandleChart(candles: List<Candle>, f: Forecast?, timeframe: String, 
     val ema50 = remember(candles) { emaSeries(candles, 50) }
     val levels = remember(f, ru) { chartLevels(f, ru) }
     val dateFormat = remember(timeframe) {
-        SimpleDateFormat(if (timeframe == "1D" || timeframe == "1W") "dd.MM.yy" else "dd.MM HH:mm", Locale.getDefault())
+        SimpleDateFormat(when (timeframe) { "1Y" -> "yyyy"; "1M" -> "MM.yyyy"; "1D", "1W" -> "dd.MM.yy"; else -> "dd.MM HH:mm" }, Locale.getDefault())
     }
     val active = f != null && (f.signal == "LONG" || f.signal == "SHORT")
     val signalTone = if (f?.signal == "SHORT") Negative else Positive

@@ -437,8 +437,16 @@ private fun HitCard(h: ScanHit, fav: Boolean, ru: Boolean, now: Long, isTracked:
             Tag("🕒 ${h.horizon.label(ru)}", Accent)
             Tag((if (ru) "Надёжность " else "Reliability ") + "$grade ${h.reliability}", gradeColor(grade))
             if (h.watch) Tag(if (ru) "Только направление" else "Direction only", Warning)
+            if (h.closed) Tag(if (ru) "Рынок закрыт" else "Market closed", Warning)
             if (h.isTop) Tag("★ ТОП", Positive)
             if (h.setupType.isNotEmpty()) Tag(SetupDetector.label(h.setupType, if (h.signal == "LONG") 1 else -1, ru), Accent)
+        }
+        if (h.closed) {
+            Text(
+                if (ru) "Торги закрыты: прогноз построен по данным последней сессии и действует до открытия. Уведомлений по нему не будет."
+                else "The market is closed: the forecast is built on the last session and holds until the open. No notification will be sent for it.",
+                fontSize = 11.sp, color = Warning, modifier = Modifier.padding(top = 4.dp)
+            )
         }
         if (h.watch) {
             Text(

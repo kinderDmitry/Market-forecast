@@ -220,7 +220,7 @@ fun MarketForecastApp(ctx: Context) {
         state = MarketState(selected, loading = true, timeframe = time, dataSource = repo.forecastSource(selected))
         loadJob?.cancel()
         loadJob = scope.launch {
-            val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; else -> "5y" to "1d" }
+            val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; "1M" -> "40y" to "1mo"; "1Y" -> "40y" to "1y"; else -> "5y" to "1d" }
             var loadError: String? = null
             val candlesRaw = withContext(Dispatchers.IO) {
                 runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse { err ->
@@ -998,7 +998,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
         item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { InstrumentIcon(state.symbol, state.meta.shortName, "", 50.dp); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(state.meta.shortName.ifBlank { state.symbol }, fontSize = 22.sp, fontWeight = FontWeight.Black); Text("${fxPairLabel(state.symbol) ?: state.symbol} • ${state.meta.currency}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text(if (state.livePrice > 0) CurrencyDisplay.format(state.livePrice, state.meta.currency, prefs) else "—", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Accent); SourceBadge(state.dataSource.ifBlank { "БКС • единственный источник" }, state.dataSource.startsWith("БКС •")) }; IconButton({ save(if (favorite) favs - state.symbol else favs + state.symbol) }) { Icon(if (favorite) Icons.Default.Star else Icons.Default.StarBorder, null, tint = Warning) }; IconButton(refresh) { Icon(Icons.Default.Refresh, null, tint = Accent) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf("OVERVIEW", "FORECAST", "FINANCE").forEach { FilterChip(selected = tab == it, onClick = { tab = it }, label = { Text(if (ru) when (it) { "OVERVIEW" -> "Обзор"; "FORECAST" -> "Прогноз"; else -> "Финансы" } else it, fontSize = 11.sp) }) } } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("15M", "1H", "4H", "1D", "1W").forEach { timeframe ->
+            listOf("15M", "1H", "4H", "1D", "1W", "1M", "1Y").forEach { timeframe ->
                 val tfForecast = if (timeframe == tf && state.forecast != null) state.forecast else tfForecasts[timeframe]
                 val tc = forecastTimeframeColor(tfForecast)
                 val label = when (tfForecast?.signal) {
@@ -1674,8 +1674,8 @@ private fun typeLabel(type: String, ru: Boolean): String = when (type.uppercase(
 internal fun fmt(v:Double):String=when{abs(v)>=1000->String.format(Locale.US,"%,.2f",v);abs(v)>=1->String.format(Locale.US,"%.2f",v);else->String.format(Locale.US,"%.6f",v)}
 private fun formatElapsed(ms: Long): String { val s=ms/1000; val d=s/86400; val h=(s%86400)/3600; val m=(s%3600)/60; val sec=s%60; return when { d>0 -> "${d}д ${h}ч"; h>0 -> "${h}ч ${m}м"; m>0 -> "${m}м ${sec}с"; else -> "${sec}с" } }
 private fun dateTime(t:Long):String=SimpleDateFormat("dd.MM.yyyy HH:mm:ss",Locale.getDefault()).format(Date(t))
-private fun tfMillis(tf:String)=when(tf){"15M"->15*60_000L;"1H"->60*60_000L;"4H"->4*60*60_000L;"1W"->7*24*60*60_000L;else->24*60*60_000L}
-private fun timeframePair(tf:String): Pair<String,String> = when(tf.uppercase(Locale.US)){"15M"->"60d" to "15m";"1H"->"2y" to "1h";"4H"->"2y" to "4h";"1W"->"10y" to "1wk";else->"5y" to "1d"}
+private fun tfMillis(tf:String)=when(tf){"15M"->15*60_000L;"1H"->60*60_000L;"4H"->4*60*60_000L;"1W"->7*24*60*60_000L;"1M"->30*24*60*60_000L;"1Y"->365*24*60*60_000L;else->24*60*60_000L}
+private fun timeframePair(tf:String): Pair<String,String> = when(tf.uppercase(Locale.US)){"15M"->"60d" to "15m";"1H"->"2y" to "1h";"4H"->"2y" to "4h";"1W"->"10y" to "1wk";"1M"->"40y" to "1mo";"1Y"->"40y" to "1y";else->"5y" to "1d"}
 private fun encodeTracked(v:List<TrackedForecast>)=v.joinToString("\n"){listOf(it.id,it.symbol,it.signal,it.confidence,it.entry,it.timeframe,it.createdAt,it.checkAt,it.result,it.checkedPrice,it.stop,it.tp1,it.tp2,it.tp3,it.lastLivePrice,it.lastUpdated,it.tp1Hit,it.tp2Hit,it.tp3Hit,it.slHit).joinToString("|")}
 private fun loadCachedNews(p:Context)=loadCachedNews(p.getSharedPreferences("mfprefs",Context.MODE_PRIVATE))
 private fun loadCachedNews(p:android.content.SharedPreferences)=p.getString("news_cache","").orEmpty().split("\n").mapNotNull{val a=it.split("|",limit=7);if(a.size>=5)NewsItem(a[0],a[1],a[2],a[3].toLongOrNull()?:0,a[4],body=a.getOrNull(5).orEmpty(),instrument=a.getOrNull(6).orEmpty())else null}

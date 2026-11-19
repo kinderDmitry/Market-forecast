@@ -374,7 +374,7 @@ class MarketRepository(
     fun load(symbol: String, range: String = "1y", interval: String = "1d"): List<Candle> {
         val clean = symbol.trim().uppercase(Locale.US)
         val cacheKey = "${if (bcsRefreshToken.isNullOrBlank()) "LEGACY" else "BCS"}|$clean|$range|$interval"
-        val ttl = if (interval == "1d" || interval == "1wk") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
+        val ttl = if (interval == "1d" || interval == "1wk" || interval == "1mo" || interval == "1y") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
         val cached = candleCache[cacheKey]
         if (cached != null && System.currentTimeMillis() - cached.first <= ttl && cached.second.isNotEmpty()) {
             return cached.second
@@ -407,7 +407,7 @@ class MarketRepository(
             }
             if (incremental.isFailure) {
                 // Temporary trouble: keep serving the loaded history and look again in 15 s instead of re-downloading everything.
-                val ttl = if (interval == "1d" || interval == "1wk") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
+                val ttl = if (interval == "1d" || interval == "1wk" || interval == "1mo" || interval == "1y") LONG_CANDLE_CACHE_MS else CANDLE_CACHE_MS
                 candleCache[cacheKey] = (System.currentTimeMillis() - ttl + 15_000L) to stale
                 return stale
             }
@@ -440,6 +440,8 @@ class MarketRepository(
                                 "1H" -> "2y" to "1h"
                                 "4H" -> "2y" to "4h"
                                 "1W" -> "10y" to "1wk"
+        "1M" -> "40y" to "1mo"
+        "1Y" -> "40y" to "1y"
                                 else -> "5y" to "1d"
                             }
                             load(symbol, pair.first, pair.second)
@@ -487,7 +489,7 @@ class MarketRepository(
                 "15M" -> "M15" to 20
                 "1H" -> "H1" to 100
                 "4H" -> "H4" to 400
-                "1W" -> "W" to 2600
+                "1W" -> "W" to 2600; "1M" -> "MN" to 12000
                 else -> "D" to 430
             }
             val end = System.currentTimeMillis()
@@ -993,16 +995,40 @@ class MarketRepository(
     }
 
     private fun loadBcs(symbol: String, range: String, interval: String): List<Candle> {
+        val raw = loadBcsRaw(symbol, range, interval)
+        return if (interval == "1y") aggregateYears(raw) else raw
+    }
+
+    /** One candle per calendar year, built from month candles (BCS has no yearly timeframe). */
+    private fun aggregateYears(months: List<Candle>): List<Candle> {
+        val calendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        val out = ArrayList<Candle>()
+        var year = Int.MIN_VALUE
+        for (c in months.sortedBy { it.time }) {
+            calendar.timeInMillis = c.time
+            val y = calendar.get(java.util.Calendar.YEAR)
+            if (y != year || out.isEmpty()) {
+                out.add(c)
+                year = y
+            } else {
+                val last = out.last()
+                out[out.size - 1] = Candle(last.time, last.open, maxOf(last.high, c.high), minOf(last.low, c.low), c.close, last.volume + c.volume)
+            }
+        }
+        return out
+    }
+
+    private fun loadBcsRaw(symbol: String, range: String, interval: String): List<Candle> {
         val (ticker, classCode) = bcsInstrument(symbol)
-        val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
+        val tf = when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; "1mo" -> "MN"; "1y" -> "MN"; else -> "D" }
         // History per timeframe: plenty for every indicator, the multi-timeframe context and the backtest,
         // but few requests (M15 4, H1 4, H4 3, D 1, W 1 instead of 25 in total before).
         val days = when (tf) {
-            "M15" -> 60; "H1" -> 240; "H4" -> 720; "D" -> 1400; "W" -> 3650
+            "M15" -> 60; "H1" -> 240; "H4" -> 720; "D" -> 1400; "W" -> 3650; "MN" -> 15000
             else -> when (range) { "60d" -> 60; "2y" -> 730; else -> 3650 }
         }
         // BCS limits a single candle response to 1440 bars. Keep requests bounded.
-        val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D" -> 1440; "W" -> 10080; else -> 43200 }
+        val maxSpan = when (tf) { "M1" -> 1; "M5" -> 5; "M15" -> 15; "M30" -> 30; "H1" -> 60; "H4" -> 240; "D" -> 1440; "W" -> 10080; "MN" -> 43200; else -> 43200 }
         val end = System.currentTimeMillis()
         val total = days * 86_400_000L
         val chunkMs = maxOf(86_400_000L, (1440L * maxSpan) * 60_000L)
@@ -1030,13 +1056,13 @@ class MarketRepository(
     }
 
     private fun bcsTimeFrame(interval: String): String =
-        when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; else -> "D" }
+        when (interval) { "1m" -> "M1"; "5m" -> "M5"; "15m" -> "M15"; "30m" -> "M30"; "1h" -> "H1"; "4h" -> "H4"; "1wk" -> "W"; "1mo" -> "MN"; "1y" -> "MN"; else -> "D" }
 
     /** Only the bars newer than the cached series (with a small overlap for the still-forming bar). Null = a full download is needed. */
     private fun loadBcsIncremental(symbol: String, interval: String, stale: List<Candle>): List<Candle>? {
         val barMs = when (interval) {
             "1m" -> 60_000L; "5m" -> 300_000L; "15m" -> 900_000L; "30m" -> 1_800_000L
-            "1h" -> 3_600_000L; "4h" -> 14_400_000L; "1wk" -> 7 * 86_400_000L; else -> 86_400_000L
+            "1h" -> 3_600_000L; "4h" -> 14_400_000L; "1wk" -> 7 * 86_400_000L; "1mo" -> 30 * 86_400_000L; "1y" -> 365 * 86_400_000L; else -> 86_400_000L
         }
         val now = System.currentTimeMillis()
         val from = stale.last().time - barMs * 3

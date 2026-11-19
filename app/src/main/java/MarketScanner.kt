@@ -47,7 +47,8 @@ internal enum class ScanHorizon(
     H1("1H", "1 час", "1 hour", "Час", "Hour", 60 * 60_000L, 4 * 3_600_000L),
     H4("4H", "4 часа", "4 hours", "4 часа", "4 hours", 4 * 3_600_000L, 10 * 3_600_000L),
     D1("1D", "1 день", "1 day", "День", "Day", 24 * 3_600_000L, 10 * 86_400_000L),
-    W1("1W", "1 неделя", "1 week", "Неделя", "Week", 7 * 86_400_000L, 30 * 86_400_000L);
+    W1("1W", "1 неделя", "1 week", "Неделя", "Week", 7 * 86_400_000L, 30 * 86_400_000L),
+    MN1("1M", "1 месяц", "1 month", "Месяц", "Month", 30 * 86_400_000L, 75 * 86_400_000L);
 
     fun label(isRu: Boolean): String = if (isRu) ruName else enName
     fun moveLabel(isRu: Boolean): String = if (isRu) ruMove else enMove
@@ -98,7 +99,9 @@ internal data class ScanHit(
     val edgeZ: Double = 0.0,
     val ev: Double = 0.0,
     /** Concrete event behind the forecast (SetupDetector type), empty when there is none. */
-    val setupType: String = ""
+    val setupType: String = "",
+    /** Built on the last session while the exchange is closed: valid until the next open, never announced by a notification. */
+    val closed: Boolean = false
 ) {
     /**
      * The best the engine can offer, nothing less: a real signal (not just a direction), reliability B or better, a plan that
@@ -177,7 +180,8 @@ internal object ScannerStore {
                     watch = o.optBoolean("watch", false),
                     edgeZ = o.optDouble("edgeZ", 0.0),
                     ev = o.optDouble("ev", 0.0),
-                    setupType = o.optString("setupType", "")
+                    setupType = o.optString("setupType", ""),
+                    closed = o.optBoolean("closed", false)
                 )
             )
         }
@@ -212,7 +216,7 @@ internal object ScannerStore {
                     put("tp1", fin(h.tp1)); put("tp2", fin(h.tp2)); put("rr", fin(h.rr)); put("regime", h.regime)
                     put("scannedAt", h.scannedAt); put("isNew", h.isNew); put("prevSignal", h.prevSignal)
                     put("timeframe", h.timeframe); put("expiresAt", h.expiresAt); put("reliability", h.reliability)
-                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch); put("edgeZ", fin(h.edgeZ)); put("ev", fin(h.ev)); put("setupType", h.setupType)
+                    put("tp3", fin(h.tp3)); put("tp1p", fin(h.tp1p)); put("tp2p", fin(h.tp2p)); put("tp3p", fin(h.tp3p)); put("stopProb", fin(h.stopProb)); put("aligned", h.aligned); put("watch", h.watch); put("edgeZ", fin(h.edgeZ)); put("ev", fin(h.ev)); put("setupType", h.setupType); put("closed", h.closed)
                 }
             )
         }
@@ -263,7 +267,9 @@ internal object ScanCore {
 
     class Outcome(val status: Int, val hit: ScanHit?, val lastTime: Long = 0L, val why: String = "")
 
-    private fun minBars(h: ScanHorizon): Int = if (h == ScanHorizon.W1) 40 else 60
+    private const val CLOSED_WINDOW_MS = 10L * 86_400_000L
+
+    private fun minBars(h: ScanHorizon): Int = when (h) { ScanHorizon.W1 -> 40; ScanHorizon.MN1 -> 36; else -> 60 }
 
     /** An answer that retrying will not change (unknown instrument, bad request). */
     private fun permanent(t: Throwable): Boolean {
@@ -284,7 +290,11 @@ internal object ScanCore {
         val last = candles.last()
         if (last.close <= 0.0) return Outcome(ILLIQUID, null)
         val now = System.currentTimeMillis()
-        if (now - last.time > h.staleMs) return Outcome(STALE, null, last.time)
+        val age = now - last.time
+        // Intraday data older than the horizon allows used to mean "no trading, nothing to say". At night, at the weekend and on
+        // holidays that silenced every short horizon. Now the last session (up to ten days old) is still analysed and labelled.
+        val closed = h.intraday && age > h.staleMs && age <= CLOSED_WINDOW_MS
+        if (age > h.staleMs && !closed) return Outcome(STALE, null, last.time)
         if (!isFx(item.type) && candles.takeLast(10).sumOf { it.volume } <= 0.0) return Outcome(ILLIQUID, null)
         val f = try {
             AnalyticsEngine.analyze(candles, null, fx = isFx(item.type) || item.classCode.equals("CETS", ignoreCase = true))
@@ -315,7 +325,7 @@ internal object ScanCore {
             isNew = baseline && previousSignal != view.signal,
             prevSignal = previousSignal,
             timeframe = h.tf,
-            expiresAt = now + h.validMs,
+            expiresAt = now + (if (closed) maxOf(h.validMs, 16L * 3_600_000L) else h.validMs),
             reliability = ReliabilityEngine.score(view, candles.size).let { if (watch) minOf(it, 55) else it },
             tp3 = f.tp3,
             tp1p = f.tp1Probability,
@@ -325,7 +335,8 @@ internal object ScanCore {
             watch = watch,
             edgeZ = f.edgeZ,
             ev = f.expectedValueR,
-            setupType = f.tacticalType
+            setupType = f.tacticalType,
+            closed = closed
         )
         return Outcome(HIT, hit, last.time)
     }
@@ -725,13 +736,15 @@ internal class ScannerController(
         }
 
         // 4. Report: what was covered, what is new.
-        val fresh = found.values.filter { it.isNew && !it.watch }
+        val fresh = found.values.filter { it.isNew && !it.watch && !it.closed }
         val newOnes = fresh.size
         if (baseline && newOnes > 0 && !isForeground() && prefs.getBoolean("alert_signal", true)) {
             ScanNotify.post(appContext, h, fresh, ru, prefs.getInt("alert_min_confidence", 60))
         }
         val failedNow = failedItems.size
         val percent = if (total > 0) (total - failedNow) * 100 / total else 0
+        val closedCount = found.values.count { it.closed }
+        val closedNote = if (closedCount > 0) tr(" Торги закрыты: $closedCount прогнозов построены по данным последней сессии и действуют до открытия.", " The market is closed: $closedCount forecasts are built on the last session and hold until the open.") else ""
         val catalogNote = if (ScanCore.needsFullCatalog(selected) && repo.lastCatalogError != null)
             tr(" Каталог БКС загружен не полностью: часть инструментов могла не попасть в охват.", " The BCS catalogue is incomplete: some instruments may be missing from the coverage.")
         else ""
@@ -740,13 +753,13 @@ internal class ScannerController(
             failedNow > 0 && failedNow * 2 >= total ->
                 tr("Не удалось получить данные по $failedNow из $total инструментов. ${repo.lastBcsError ?: "Проверьте токен и сеть."}", "Could not get data for $failedNow of $total instruments. ${repo.lastBcsError ?: "Check the token and the network."}")
             failedNow > 0 ->
-                tr("Охват $percent%: не удалось проверить $failedNow из $total инструментов (лимит или сеть). Запустите сканер ещё раз.$catalogNote", "Coverage $percent%: could not check $failedNow of $total instruments (rate limit or network). Run the scanner again.$catalogNote")
+                tr("Охват $percent%: не удалось проверить $failedNow из $total инструментов (лимит или сеть). Запустите сканер ещё раз.$catalogNote$closedNote", "Coverage $percent%: could not check $failedNow of $total instruments (rate limit or network). Run the scanner again.$catalogNote$closedNote")
             !baseline ->
-                tr("Первое сканирование на срок «$hz» завершено: охват 100% ($total из $total), сигналов: ${found.size}. Со следующего запуска новые прогнозы будут отмечены.$catalogNote", "First \"$hz\" scan finished: coverage 100% ($total of $total), signals: ${found.size}. New forecasts will be flagged from the next run.$catalogNote")
+                tr("Первое сканирование на срок «$hz» завершено: охват 100% ($total из $total), сигналов: ${found.size}. Со следующего запуска новые прогнозы будут отмечены.$catalogNote$closedNote", "First \"$hz\" scan finished: coverage 100% ($total of $total), signals: ${found.size}. New forecasts will be flagged from the next run.$catalogNote$closedNote")
             newOnes > 0 ->
-                tr("Охват 100% ($total из $total). Новых прогнозов на срок «$hz»: $newOnes.$catalogNote", "Coverage 100% ($total of $total). New \"$hz\" forecasts: $newOnes.$catalogNote")
+                tr("Охват 100% ($total из $total). Новых прогнозов на срок «$hz»: $newOnes.$catalogNote$closedNote", "Coverage 100% ($total of $total). New \"$hz\" forecasts: $newOnes.$catalogNote$closedNote")
             else ->
-                tr("Охват 100% ($total из $total). Новых прогнозов нет, активных сигналов: ${found.size}.$catalogNote", "Coverage 100% ($total of $total). No new forecasts, active signals: ${found.size}.$catalogNote")
+                tr("Охват 100% ($total из $total). Новых прогнозов нет, активных сигналов: ${found.size}.$catalogNote$closedNote", "Coverage 100% ($total of $total). No new forecasts, active signals: ${found.size}.$catalogNote$closedNote")
         }
     }
 
