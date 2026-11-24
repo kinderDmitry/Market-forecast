@@ -269,7 +269,54 @@ internal object ScanCore {
 
     private const val CLOSED_WINDOW_MS = 10L * 86_400_000L
 
-    private fun minBars(h: ScanHorizon): Int = when (h) { ScanHorizon.W1 -> 40; ScanHorizon.MN1 -> 36; else -> 60 }
+    /** Step-by-step answer to "why is there no forecast for this instrument on this horizon", with the real numbers. */
+    fun diagnose(repo: MarketRepository, symbol: String, h: ScanHorizon): String {
+        val lines = ArrayList<String>()
+        val clean = symbol.trim().uppercase(java.util.Locale.US)
+        val item = repo.searchLocal(clean, "ALL").firstOrNull { it.symbol.equals(clean, ignoreCase = true) }
+            ?: SearchResult(clean, clean, "", "STOCK", "", "TQBR")
+        lines.add("Инструмент: ${item.name} (${item.symbol}, площадка ${item.classCode.ifBlank { "?" }}), срок ${h.label(true)}")
+        val candles = try {
+            repo.loadScanCandles(item.symbol, item.classCode, h.tf)
+        } catch (t: Throwable) {
+            lines.add("✗ Свечи не загрузились: ${t.message ?: t.javaClass.simpleName}")
+            return lines.joinToString("\n")
+        }
+        val time = java.text.SimpleDateFormat("dd.MM HH:mm", java.util.Locale.getDefault())
+        if (candles.isEmpty()) {
+            lines.add("✗ БКС вернул 0 свечей на этом сроке")
+            return lines.joinToString("\n")
+        }
+        val last = candles.last()
+        val ageMin = (System.currentTimeMillis() - last.time) / 60_000L
+        lines.add("✓ Свечей: ${candles.size} (нужно не меньше ${minBars(h)}), последняя от ${time.format(java.util.Date(last.time))}, ей ${ageMin} мин")
+        lines.add("Объём последних 10 свечей: ${candles.takeLast(10).sumOf { it.volume }.toLong()}")
+        val fresh = ageMin * 60_000L <= h.staleMs
+        lines.add(if (fresh) "✓ Свеча свежая (допустимо до ${h.staleMs / 60_000L} мин)" else if (h.intraday && ageMin * 60_000L <= CLOSED_WINDOW_MS) "• Торги закрыты: прогноз будет по данным последней сессии" else "✗ Свеча слишком старая: бумага не торгуется")
+        if (candles.size < minBars(h)) {
+            lines.add("✗ Мало свечей для анализа")
+            return lines.joinToString("\n")
+        }
+        val f = try {
+            AnalyticsEngine.analyze(candles, null, fx = isFx(item.type) || item.classCode.equals("CETS", ignoreCase = true), horizonBars = ExitPlanner.horizonBarsFor(h.tf))
+        } catch (t: Throwable) {
+            lines.add("✗ Движок отказался: ${t.message ?: t.javaClass.simpleName}")
+            return lines.joinToString("\n")
+        }
+        lines.add("Чувствительность: ${listOf("строго", "обычно", "высокая")[ExitPlanner.sensitivity.coerceIn(0, 2)]}, издержки ${String.format(java.util.Locale.US, "%.2f", ExitPlanner.currentCost() * 100)}%")
+        lines.add("Сигнал: ${f.signal}, перекос: ${f.lean.ifBlank { "нет" }}, причина отсутствия сигнала: ${f.why.ifBlank { "—" }}")
+        lines.add("Ожидание плана ${String.format(java.util.Locale.US, "%+.2f", f.expectedValueR)}R, шанс первой цели ${(f.tp1Probability * 100).toInt()}%, сетап: ${f.tacticalType.ifBlank { "нет" }}")
+        lines.add(
+            when {
+                f.signal != "NO TRADE" -> "→ Сканер покажет это как сигнал"
+                f.lean.isNotEmpty() -> "→ Сканер покажет это как «Только направление»"
+                else -> "→ Сканер НЕ покажет инструмент: нет даже перекоса направления"
+            }
+        )
+        return lines.joinToString("\n")
+    }
+
+    private fun minBars(h: ScanHorizon): Int = when (h) { ScanHorizon.W1 -> 40; ScanHorizon.MN1 -> 36; else -> if (h.intraday) 40 else 60 }
 
     /** An answer that retrying will not change (unknown instrument, bad request). */
     private fun permanent(t: Throwable): Boolean {
@@ -295,7 +342,7 @@ internal object ScanCore {
         // holidays that silenced every short horizon. Now the last session (up to ten days old) is still analysed and labelled.
         val closed = h.intraday && age > h.staleMs && age <= CLOSED_WINDOW_MS
         if (age > h.staleMs && !closed) return Outcome(STALE, null, last.time)
-        if (!isFx(item.type) && candles.takeLast(10).sumOf { it.volume } <= 0.0) return Outcome(ILLIQUID, null)
+        if (!h.intraday && !isFx(item.type) && candles.takeLast(10).sumOf { it.volume } <= 0.0) return Outcome(ILLIQUID, null)
         val f = try {
             AnalyticsEngine.analyze(candles, null, fx = isFx(item.type) || item.classCode.equals("CETS", ignoreCase = true))
         } catch (t: Throwable) {
@@ -511,6 +558,9 @@ internal class ScannerController(
     }
 
     /** Old = more than half of the forecast's life is gone (or it is already over). Only the selected horizon is touched. */
+    /** Used by the "check one instrument" button of the scanner screen. */
+    suspend fun diagnose(symbol: String): String = withContext(Dispatchers.IO) { ScanCore.diagnose(repo, symbol, horizon) }
+
     suspend fun clearOld() {
         val now = System.currentTimeMillis()
         val tf = horizon.tf

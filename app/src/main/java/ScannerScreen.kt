@@ -1,5 +1,6 @@
 package com.marketforecast.prox
 
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material.icons.filled.NotificationsActive
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
@@ -267,6 +268,28 @@ internal fun ScannerScreen(
         }
 
         item { MonitorControl(ru) }
+
+        item {
+            var diagSymbol by remember { mutableStateOf(favorites.firstOrNull() ?: "SBER") }
+            var report by remember { mutableStateOf<String?>(null) }
+            var busy by remember { mutableStateOf(false) }
+            GradientCard(Modifier.fillMaxWidth()) {
+                SectionHeader(
+                    if (ru) "Почему нет прогноза?" else "Why is there no forecast?",
+                    if (ru) "Пошаговая проверка одного инструмента на выбранном сроке" else "Step-by-step check of one instrument on the chosen horizon"
+                )
+                OutlinedTextField(
+                    value = diagSymbol, onValueChange = { diagSymbol = it.filter { ch -> ch.isLetterOrDigit() || ch == '_' }.take(24) },
+                    singleLine = true, label = { Text(if (ru) "Тикер" else "Ticker") },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                OutlinedButton(
+                    onClick = { if (!busy && diagSymbol.isNotBlank()) { busy = true; scope.launch { report = c.diagnose(diagSymbol); busy = false } } },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                ) { Text(if (busy) (if (ru) "Проверяю…" else "Checking…") else (if (ru) "Проверить" else "Check")) }
+                report?.let { Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)) }
+            }
+        }
 
         c.coverage?.takeIf { !c.running }?.let { cov ->
             item { CoverageCard(cov, c.horizon, ru) }

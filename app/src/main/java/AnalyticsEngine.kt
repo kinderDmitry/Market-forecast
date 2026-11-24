@@ -352,7 +352,7 @@ object AnalyticsEngine {
 
     private fun sigmoid(x: Double): Double = 1.0 / (1.0 + exp(-x.coerceIn(-8.0, 8.0)))
 
-    private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, series: SetupDetector.Series, tactical: SetupDetector.Setup?, horizon: Int = 8): Historical {
+    private fun historical(c: List<Candle>, direction: Int, regimeName: String, stopMult: Double, series: SetupDetector.Series, tactical: SetupDetector.Setup?, horizon: Int = ExitPlanner.currentHorizon()): Historical {
         val fallback = Historical(.5, 0, .45, .28, .15, .38, 1.0, 1.0, stopMult, 1.0, 0.0)
         if (c.size < 150) return fallback
         val end = c.lastIndex - 2
@@ -490,13 +490,13 @@ object AnalyticsEngine {
         var h = 17L
         val points = intArrayOf(0, c.size / 3, c.size * 2 / 3, c.lastIndex).distinct().filter { it in c.indices }
         for (i in points) { val x = c[i]; h = h * 31 + x.time; h = h * 31 + java.lang.Double.doubleToLongBits(x.close) }
-        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}:${ExitPlanner.style}:${ExitPlanner.sensitivity}"
+        return "${c.size}:$h:${entry ?: Double.NaN}:${ExitPlanner.currentCost()}:${ExitPlanner.style}:${ExitPlanner.sensitivity}:${ExitPlanner.currentHorizon()}"
     }
 
     /** Analyze one timeframe. All probabilities are empirical/model estimates, never guarantees. */
-    fun analyze(c: List<Candle>, entryOverride: Double? = null, fx: Boolean = false): Forecast {
+    fun analyze(c: List<Candle>, entryOverride: Double? = null, fx: Boolean = false, horizonBars: Int = 8): Forecast {
         require(c.size >= 30) { "Недостаточно исторических данных" }
-        return ExitPlanner.withCost(CostModel.fraction(fx)) {
+        return ExitPlanner.withCost(CostModel.fraction(fx), horizonBars) {
             val key = cacheKey(c, entryOverride)
             val cached = synchronized(cache) { cache[key] }
             if (cached != null) {
@@ -513,8 +513,8 @@ object AnalyticsEngine {
     }
 
     /** Optional real-MTF entry point. Contexts are expected to contain actual BCS candles per TF. */
-    fun analyze(c: List<Candle>, entryOverride: Double?, mtfContexts: Map<String, List<Candle>>, fx: Boolean = false): Forecast {
-        val base = analyze(c, entryOverride, fx)
+    fun analyze(c: List<Candle>, entryOverride: Double?, mtfContexts: Map<String, List<Candle>>, fx: Boolean = false, horizonBars: Int = 8): Forecast {
+        val base = analyze(c, entryOverride, fx, horizonBars)
         if (mtfContexts.isEmpty()) return base
         val local = mtfContexts.mapNotNull { (tf, candles) ->
             if (candles.size < 40) null else tf to directionalRaw(candles, candles.lastOrNull()?.close)
@@ -616,8 +616,9 @@ object AnalyticsEngine {
         val signal = if (gate && longDirection > shortDirection) "LONG" else if (gate && shortDirection > longDirection) "SHORT" else "NO TRADE"
         // A lean is NOT a signal: the direction is visible, but after costs the plan does not pay (or the market is squeezing).
         // The lean has softer entry conditions than a signal (it is only a direction, clearly labelled and never notified).
-        val leanOk = directionalGap >= gapBar * .6 && entryQuality >= entryBar * .7 && stability >= entryBar * .7 && dataQuality >= 60
-        val lean = if (signal == "NO TRADE" && leanOk && (tacticalAligned || reg.name != "UNCERTAIN")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
+        val leanOk = if (sens == 2) directionalGap >= .02 && entryQuality >= .10 && stability >= .10 && dataQuality >= 50
+            else directionalGap >= gapBar * .6 && entryQuality >= entryBar * .7 && stability >= entryBar * .7 && dataQuality >= 60
+        val lean = if (signal == "NO TRADE" && leanOk && (sens == 2 || tacticalAligned || reg.name != "UNCERTAIN")) (if (longDirection > shortDirection) "LONG" else "SHORT") else ""
         // The first thing that stands between the market and a signal, in the order the gate checks it.
         val why = when {
             signal != "NO TRADE" -> ""
@@ -670,25 +671,26 @@ object AnalyticsEngine {
     }
 
     /** Walk-forward validation: every decision sees only the candles before it. */
-    fun backtest(c: List<Candle>, fx: Boolean = false): Pair<Int, Int> =
-        ExitPlanner.withCost(CostModel.fraction(fx)) { backtestInternal(c) }
+    fun backtest(c: List<Candle>, fx: Boolean = false, horizonBars: Int = 8): Pair<Int, Int> =
+        ExitPlanner.withCost(CostModel.fraction(fx), horizonBars) { backtestInternal(c) }
 
     private fun backtestInternal(c: List<Candle>): Pair<Int, Int> {
         if (c.size < 180) return 0 to 0
+        val horizon = ExitPlanner.currentHorizon()
         var wins = 0; var total = 0
         var i = 120
-        while (i < c.size - 10) {
+        while (i < c.size - horizon - 2) {
             val prefix = c.subList(0, i)
             val f = runCatching { analyzeInternal(prefix, null) }.getOrNull()
             if (f != null && f.signal != "NO TRADE") {
                 val dir = if (f.signal == "LONG") 1 else -1
                 // The whole plan is played on the candles that follow: a third at every target, stop to break-even, costs paid.
-                val bars = c.subList(i, min(i + 8, c.size))
+                val bars = c.subList(i, min(i + horizon, c.size))
                 val r = ExitPlanner.simulateLevels(bars, dir, f.entry, f.stop, f.tp1, f.tp2, f.tp3)
                 if (r.r > 0.0) wins++
                 total++
             }
-            i += 8
+            i += horizon
         }
         return wins to total
     }

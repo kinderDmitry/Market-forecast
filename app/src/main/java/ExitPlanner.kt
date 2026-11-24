@@ -183,13 +183,27 @@ internal object ExitPlanner {
     /** Round-trip cost in force for the analysis running on this thread (stocks and currencies cost differently). */
     fun currentCost(): Double = costContext.get() ?: COST_FRACTION
 
-    fun <T> withCost(fraction: Double, block: () -> T): T {
+    private val horizonContext = ThreadLocal<Int>()
+
+    /** How many candles ahead a forecast is judged: 8 normally, 6 for the monthly and 12 for the yearly outlook (built on month candles). */
+    fun currentHorizon(): Int = horizonContext.get() ?: 8
+
+    fun horizonBarsFor(timeframe: String): Int = when (timeframe) {
+        "1Y" -> 12
+        "1M" -> 6
+        else -> 8
+    }
+
+    fun <T> withCost(fraction: Double, horizon: Int = 8, block: () -> T): T {
         val previous = costContext.get()
+        val previousHorizon = horizonContext.get()
         costContext.set(fraction)
+        horizonContext.set(horizon)
         try {
             return block()
         } finally {
             if (previous == null) costContext.remove() else costContext.set(previous)
+            if (previousHorizon == null) horizonContext.remove() else horizonContext.set(previousHorizon)
         }
     }
 

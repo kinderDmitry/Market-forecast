@@ -110,7 +110,7 @@ private val DarkText = Color(0xFFFFFFFF)
 private val LightMuted = Color(0xFF5E5A68)
 internal val DarkMuted = Color(0xFF8FA7B8)
 
-private enum class Screen { HOME, SEARCH, SCANNER, HEATMAP, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
+private enum class Screen { HOME, SEARCH, SCANNER, HEATMAP, LEARN, FAVORITES, HISTORY, SETTINGS, ANALYSIS, NEWS, NEWS_DETAIL, DIVIDENDS, FINANCE, STATS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -220,7 +220,7 @@ fun MarketForecastApp(ctx: Context) {
         state = MarketState(selected, loading = true, timeframe = time, dataSource = repo.forecastSource(selected))
         loadJob?.cancel()
         loadJob = scope.launch {
-            val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; "1M" -> "40y" to "1mo"; "1Y" -> "40y" to "1y"; else -> "5y" to "1d" }
+            val pair = when (time) { "15M" -> "60d" to "15m"; "1H" -> "2y" to "1h"; "4H" -> "2y" to "4h"; "1W" -> "10y" to "1wk"; "1M" -> "40y" to "1mo"; "1Y" -> "40y" to "1mo"; else -> "5y" to "1d" }
             var loadError: String? = null
             val candlesRaw = withContext(Dispatchers.IO) {
                 runCatching { repo.load(selected, pair.first, pair.second) }.getOrElse { err ->
@@ -249,7 +249,7 @@ fun MarketForecastApp(ctx: Context) {
                 val requests = listOf("15M" to ("60d" to "15m"), "1H" to ("2y" to "1h"), "4H" to ("2y" to "4h"), "1D" to ("5y" to "1d"), "1W" to ("10y" to "1wk"))
                 coroutineScope { requests.map { (name, pair) -> async { name to runCatching { repo.load(selected, pair.first, pair.second) }.getOrDefault(emptyList()) } }.awaitAll().toMap().filterValues { it.size >= 40 } }
             }
-            val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live, mtfContexts, fx = fxPairLabel(selected) != null) }.getOrNull() } else null
+            val f = if (live > 0.0 && candles.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(candles, live, mtfContexts, fx = fxPairLabel(selected) != null, horizonBars = ExitPlanner.horizonBarsFor(time)) }.getOrNull() } else null
             state = MarketState(selected, candles, f, false, if (f != null) null else when {
                 candles.isEmpty() -> if (ru) "Не удалось получить свечи БКС${loadError?.let { ": " + it.take(140) }.orEmpty()}. Данные запрашиваются повторно." else "Could not get BCS candles${loadError?.let { ": " + it.take(140) }.orEmpty()}. Retrying."
                 live <= 0.0 -> if (ru) "БКС не вернул актуальную цену инструмента. Возможно, торги закрыты." else "BCS returned no live price. Trading may be closed."
@@ -472,7 +472,7 @@ fun MarketForecastApp(ctx: Context) {
                     canonicalQuotes[selected] = live
                     val reconciled = reconcileLivePrice(selected, state.candles, live)
                     val merged = mergeRealtimeCandle(state.candles, reconciled, tf, now, selected)
-                    val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled, fx = fxPairLabel(selected) != null) }.getOrNull() } else state.forecast
+                    val refreshed = if (merged.size >= 30) withContext(Dispatchers.Default) { runCatching { AnalyticsEngine.analyze(merged, reconciled, fx = fxPairLabel(selected) != null, horizonBars = ExitPlanner.horizonBarsFor(tf)) }.getOrNull() } else state.forecast
                     state = state.copy(candles = merged, forecast = refreshed, livePrice = reconciled, updated = now)
                 }
             }
@@ -655,7 +655,7 @@ fun MarketForecastApp(ctx: Context) {
                 Box(Modifier.fillMaxSize()) {
                 AnimatedContent(targetState = screen, transitionSpec = { screenTransition(targetState.ordinal >= initialState.ordinal) }, label = "screen") { s ->
                     when (s) {
-                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { screen = Screen.HEATMAP }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
+                        Screen.HOME -> Home(state, indices, favorites, favoriteOrder, marketNews, newsCategory, ru, repo, { screen = Screen.SEARCH }, { screen = Screen.NEWS }, { screen = Screen.DIVIDENDS }, { screen = Screen.FINANCE }, { screen = Screen.STATS }, scanner, { screen = Screen.SCANNER }, { startScanner() }, { screen = Screen.HEATMAP }, { screen = Screen.LEARN }, { newsCategory = it }, ::saveFav, ::load, { url -> newsDetailUrl = url; screen = Screen.NEWS_DETAIL })
                         Screen.SEARCH -> SearchScreen(query, { query = it }, results, searching, ru, favorites, searchFilter, { searchFilter = it; prefs.edit().putString("search_filter", it).apply() }, ::saveFav, { tokenVersion++ }) { load(it.symbol) }
                         Screen.FAVORITES -> Favorites(favoriteOrder, ru, repo, ::saveFav, ::load, refreshTick)
                         Screen.HISTORY -> History(history, tracked, ru, repo, prefs, ::load, { h -> history = history.filterNot { it.time == h.time && it.symbol == h.symbol }; saveHistory(prefs, history); tracked = tracked.filterNot { it.createdAt == h.time && it.symbol == h.symbol }; saveTracked(tracked) }, { screen = Screen.STATS }, historyTab, { historyTab = it }, refreshTick)
@@ -668,6 +668,7 @@ fun MarketForecastApp(ctx: Context) {
                             { trackScanHit(it) }
                         )
                         Screen.HEATMAP -> HeatmapScreen(repo, favorites, ru) { load(it) }
+                        Screen.LEARN -> LearnScreen(ru, prefs)
                         Screen.ANALYSIS -> Analysis(state, ru, tf, favorites.contains(selected), favorites, ::saveFav, { load(selected, it) }, { load(selected, tf) }, ::addTracked, tracked, prefs)
                         Screen.NEWS -> NewsScreen(marketNews, ru, refreshTick) { newsDetailUrl = it; screen = Screen.NEWS_DETAIL }
                         Screen.NEWS_DETAIL -> NewsDetailScreen(newsDetailUrl.orEmpty(), ru) { screen = Screen.NEWS }
@@ -711,7 +712,7 @@ private fun CosmicBackground() {
 }
 
 private fun screenTitle(s: Screen, ru: Boolean) = when (s) {
-    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; Screen.SCANNER -> if (ru) "📡 Сканер прогнозов" else "📡 Forecast scanner"; Screen.HEATMAP -> if (ru) "🗺 Карта рынка" else "🗺 Market map"; else -> "Market Forecast"
+    Screen.SEARCH -> if (ru) "🔎 Поиск" else "🔎 Search"; Screen.FAVORITES -> if (ru) "⭐ Избранное" else "⭐ Favorites"; Screen.HISTORY -> if (ru) "🕘 История прогнозов" else "🕘 Forecast history"; Screen.SETTINGS -> if (ru) "Настройки" else "Settings"; Screen.ANALYSIS -> if (ru) "Прогноз" else "Forecast"; Screen.NEWS -> if (ru) "📰 Новости" else "📰 News"; Screen.NEWS_DETAIL -> if (ru) "Новость" else "Article"; Screen.DIVIDENDS -> if (ru) "Дивиденды" else "Dividends"; Screen.FINANCE -> if (ru) "Финансы и прибыль" else "Finance & profit"; Screen.STATS -> if (ru) "Статистика" else "Statistics"; Screen.SCANNER -> if (ru) "📡 Сканер прогнозов" else "📡 Forecast scanner"; Screen.HEATMAP -> if (ru) "🗺 Карта рынка" else "🗺 Market map"; Screen.LEARN -> if (ru) "🎓 Обучение" else "🎓 Learn"; else -> "Market Forecast"
 }
 
 @Composable
@@ -742,12 +743,13 @@ private fun BrandHero(ru: Boolean) {
 }
 
 @Composable
-private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, scanner: ScannerController, openScanner: () -> Unit, startScan: () -> Unit, openHeatmap: () -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
+private fun Home(state: MarketState, indices: List<MarketIndex>, favs: Set<String>, favOrder: List<String>, news: List<NewsItem>, newsCategory: NewsCategory, ru: Boolean, repo: MarketRepository, search: () -> Unit, openNews: () -> Unit, openDiv: () -> Unit, openFinance: () -> Unit, openStats: () -> Unit, scanner: ScannerController, openScanner: () -> Unit, startScan: () -> Unit, openHeatmap: () -> Unit, openLearn: () -> Unit, setNewsCategory: (NewsCategory) -> Unit, save: (Set<String>) -> Unit, load: (String, String) -> Unit, openArticle: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
         item { BrandHero(ru) }
         item { SearchLauncher(ru, search) }
         item { ScannerEntryCard(scanner, ru, openScanner, startScan) }
         item { HeatmapEntryCard(ru, openHeatmap) }
+        item { LearnEntryCard(ru, openLearn) }
         item {
             SectionHeader(
                 if (ru) "АНАЛИТИЧЕСКИЙ ЦЕНТР" else "ANALYTICS CENTER",
@@ -989,7 +991,7 @@ private fun AnalyticsHeroCard(state: MarketState, ru: Boolean, onOpen: () -> Uni
                 val c = runCatching { tfRepo.load(state.symbol, pair.first, pair.second) }.getOrNull()
                 val live = currentLive ?: c?.lastOrNull()?.close
                 val merged = if (c != null && live != null && live > 0.0) mergeRealtimeCandle(c, live, timeframe, System.currentTimeMillis(), state.symbol) else c.orEmpty()
-                val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live, fx = fxPairLabel(state.symbol) != null) }.getOrNull() else null
+                val f = if (merged.size >= 30) runCatching { AnalyticsEngine.analyze(merged, live, fx = fxPairLabel(state.symbol) != null, horizonBars = ExitPlanner.horizonBarsFor(tf)) }.getOrNull() else null
                 timeframe to f
             }.toMap()
         }
@@ -1675,7 +1677,7 @@ internal fun fmt(v:Double):String=when{abs(v)>=1000->String.format(Locale.US,"%,
 private fun formatElapsed(ms: Long): String { val s=ms/1000; val d=s/86400; val h=(s%86400)/3600; val m=(s%3600)/60; val sec=s%60; return when { d>0 -> "${d}д ${h}ч"; h>0 -> "${h}ч ${m}м"; m>0 -> "${m}м ${sec}с"; else -> "${sec}с" } }
 private fun dateTime(t:Long):String=SimpleDateFormat("dd.MM.yyyy HH:mm:ss",Locale.getDefault()).format(Date(t))
 private fun tfMillis(tf:String)=when(tf){"15M"->15*60_000L;"1H"->60*60_000L;"4H"->4*60*60_000L;"1W"->7*24*60*60_000L;"1M"->30*24*60*60_000L;"1Y"->365*24*60*60_000L;else->24*60*60_000L}
-private fun timeframePair(tf:String): Pair<String,String> = when(tf.uppercase(Locale.US)){"15M"->"60d" to "15m";"1H"->"2y" to "1h";"4H"->"2y" to "4h";"1W"->"10y" to "1wk";"1M"->"40y" to "1mo";"1Y"->"40y" to "1y";else->"5y" to "1d"}
+private fun timeframePair(tf:String): Pair<String,String> = when(tf.uppercase(Locale.US)){"15M"->"60d" to "15m";"1H"->"2y" to "1h";"4H"->"2y" to "4h";"1W"->"10y" to "1wk";"1M"->"40y" to "1mo";"1Y"->"40y" to "1mo";else->"5y" to "1d"}
 private fun encodeTracked(v:List<TrackedForecast>)=v.joinToString("\n"){listOf(it.id,it.symbol,it.signal,it.confidence,it.entry,it.timeframe,it.createdAt,it.checkAt,it.result,it.checkedPrice,it.stop,it.tp1,it.tp2,it.tp3,it.lastLivePrice,it.lastUpdated,it.tp1Hit,it.tp2Hit,it.tp3Hit,it.slHit).joinToString("|")}
 private fun loadCachedNews(p:Context)=loadCachedNews(p.getSharedPreferences("mfprefs",Context.MODE_PRIVATE))
 private fun loadCachedNews(p:android.content.SharedPreferences)=p.getString("news_cache","").orEmpty().split("\n").mapNotNull{val a=it.split("|",limit=7);if(a.size>=5)NewsItem(a[0],a[1],a[2],a[3].toLongOrNull()?:0,a[4],body=a.getOrNull(5).orEmpty(),instrument=a.getOrNull(6).orEmpty())else null}

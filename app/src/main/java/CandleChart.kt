@@ -98,7 +98,7 @@ internal fun PriceChartCard(candles: List<Candle>, f: Forecast?, timeframe: Stri
             Text(if (ru) "График и уровни" else "Chart and levels", fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.weight(1f))
             Text(timeframe, fontSize = 12.sp, fontWeight = FontWeight.Black, color = Accent)
         }
-        if (candles.size < 5) {
+        if (candles.size < 2) {
             if (loading) {
                 Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     PulseDot(Accent, 8.dp)
