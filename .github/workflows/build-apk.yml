@@ -114,6 +114,7 @@ jobs:
           test -f app/src/main/java/CatalogWorker.kt
           test -f app/src/main/java/PriceAlerts.kt
           test -f app/src/main/java/MonitorService.kt
+          test -f app/src/main/java/Learn.kt
           test -f app/src/main/java/TradePlanCard.kt
           test -f app/src/main/java/ReliabilityEngine.kt
           # The refresh token must only ever be touched through SecureTokenStore.
