@@ -594,11 +594,11 @@ class MarketRepository(
         var last: Throwable? = null
         for (attempt in 0..2) {
             try {
-                val root = JSONObject(getTextAuth(
+                val root = asObject(getTextAuth(
                     "https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-type?type=${enc(type)}&page=$page&size=$size",
                     20000, bcsHeaders()
                 ))
-                val items = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: JSONArray()
+                val items = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: root.optJSONArray("content") ?: root.optJSONArray("data") ?: JSONArray()
                 // Optional paging metadata: when the server reports it, no empty trailing pages are requested.
                 var pages = -1
                 for (k in listOf("totalPages", "total_pages", "pages")) if (root.has(k)) { pages = root.optInt(k, -1); break }
@@ -926,11 +926,20 @@ class MarketRepository(
             ?: boards.optJSONObject(0)
     }
 
+    /**
+     * The BCS information service answers either with {"instruments": [...]} or with a bare array [...]. The code used to accept only
+     * the first form, so a bare array ("Value [{...}] of type JSONArray cannot be converted to JSONObject") left the whole catalogue empty.
+     */
+    private fun asObject(text: String): JSONObject {
+        val t = text.trim()
+        return if (t.startsWith("[")) JSONObject().put("instruments", JSONArray(t)) else JSONObject(t)
+    }
+
     private fun bcsInstrumentInfo(symbol: String): JSONObject {
         val ticker = canonicalSymbol(symbol).substringBefore("@")
         val body = JSONObject().put("tickers", JSONArray().put(ticker)).toString()
-        val root = JSONObject(postJson("https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-tickers", body, 12000, bcsHeaders()))
-        val arr = root.optJSONArray("instruments") ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
+        val root = asObject(postJson("https://be.broker.ru/trade-api-information-service/api/v1/instruments/by-tickers", body, 12000, bcsHeaders()))
+        val arr = root.optJSONArray("instruments") ?: root.optJSONArray("items") ?: root.optJSONArray("content") ?: root.optJSONArray("data") ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
         return arr.optJSONObject(0) ?: throw IllegalStateException("БКС: инструмент $ticker не найден")
     }
 
